@@ -1,5 +1,6 @@
 const WebSocket = require("ws");
 
+// MODIFICATION RENDER : Utilisation du port dynamique
 const PORT = process.env.PORT || 8080;
 
 
@@ -9,66 +10,36 @@ const PORT = process.env.PORT || 8080;
 
 const wss = new WebSocket.Server({
     port: PORT,
-    host: "0.0.0.0" // <-- AJOUTEZ CETTE LIGNE
+    host: "0.0.0.0" 
 });
 
 
 //INITIALISATION FIREBASE notification firebase
 
-
-// REMPLACEZ PAR CECI :
 const { initializeApp, cert } = require("firebase-admin/app");
 const { getMessaging } = require("firebase-admin/messaging");
-const serviceAccount = require("./firebase-key.json"); // Votre fichier téléchargé
+const serviceAccount = require("./firebase-key.json"); 
 
 // Initialisation de Firebase Admin (Nouvelle syntaxe)
 initializeApp({
     credential: cert(serviceAccount)
 });
+
 // ======================================================
 // TOKENS DE NOTIFICATION FCM
 // ======================================================
-// Structure : fcmTokens = { "quentin": "epsk5az...", "paul": "fghj4kl..." }
 const fcmTokens = new Map();
-
-
-
-
-
-
-
 
 
 // ======================================================
 // UTILISATEURS CONNECTÉS
 // ======================================================
-//
-// Structure :
-//
-// utilisateurs = {
-//     "quentin": websocket,
-//     "paul": websocket
-// }
-//
-
 const utilisateurs = new Map();
 
 
 // ======================================================
 // APPELS ACTIFS
 // ======================================================
-//
-// Structure :
-//
-// appels = {
-//     "quentin": "paul",
-//     "paul": "quentin"
-// }
-//
-// Cela permet de savoir immédiatement si
-// un utilisateur est déjà en appel.
-//
-
 const appels = new Map();
 
 
@@ -86,18 +57,9 @@ console.log(
 // ======================================================
 
 function envoyer(ws, message) {
-
-    if (
-        ws &&
-        ws.readyState === WebSocket.OPEN
-    ) {
-
-        ws.send(
-            JSON.stringify(message)
-        );
-
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify(message));
     }
-
 }
 
 
@@ -105,38 +67,16 @@ function envoyer(ws, message) {
 // UTILITAIRE : ENVOYER À UN UTILISATEUR
 // ======================================================
 
-function envoyerAUtilisateur(
-    identifiant,
-    message
-) {
+function envoyerAUtilisateur(identifiant, message) {
+    const ws = utilisateurs.get(identifiant);
 
-    const ws =
-        utilisateurs.get(
-            identifiant
-        );
-
-
-    if (
-        !ws
-    ) {
-
-        console.log(
-            `Utilisateur introuvable : ${identifiant}`
-        );
-
+    if (!ws) {
+        console.log(`Utilisateur introuvable : ${identifiant}`);
         return false;
-
     }
 
-
-    envoyer(
-        ws,
-        message
-    );
-
-
+    envoyer(ws, message);
     return true;
-
 }
 
 
@@ -144,14 +84,8 @@ function envoyerAUtilisateur(
 // UTILITAIRE : UTILISATEUR DISPONIBLE
 // ======================================================
 
-function utilisateurExiste(
-    identifiant
-) {
-
-    return utilisateurs.has(
-        identifiant
-    );
-
+function utilisateurExiste(identifiant) {
+    return utilisateurs.has(identifiant);
 }
 
 
@@ -159,14 +93,8 @@ function utilisateurExiste(
 // UTILITAIRE : UTILISATEUR OCCUPÉ
 // ======================================================
 
-function utilisateurOccupe(
-    identifiant
-) {
-
-    return appels.has(
-        identifiant
-    );
-
+function utilisateurOccupe(identifiant) {
+    return appels.has(identifiant);
 }
 
 
@@ -174,27 +102,10 @@ function utilisateurOccupe(
 // UTILITAIRE : CRÉER UN APPEL
 // ======================================================
 
-function creerAppel(
-    utilisateurA,
-    utilisateurB
-) {
-
-    appels.set(
-        utilisateurA,
-        utilisateurB
-    );
-
-
-    appels.set(
-        utilisateurB,
-        utilisateurA
-    );
-
-
-    console.log(
-        `APPEL CRÉÉ : ${utilisateurA} <--> ${utilisateurB}`
-    );
-
+function creerAppel(utilisateurA, utilisateurB) {
+    appels.set(utilisateurA, utilisateurB);
+    appels.set(utilisateurB, utilisateurA);
+    console.log(`APPEL CRÉÉ : ${utilisateurA} <--> ${utilisateurB}`);
 }
 
 
@@ -202,37 +113,14 @@ function creerAppel(
 // UTILITAIRE : SUPPRIMER UN APPEL
 // ======================================================
 
-function supprimerAppel(
-    utilisateurA,
-    utilisateurB
-) {
-
-    if (
-        utilisateurA
-    ) {
-
-        appels.delete(
-            utilisateurA
-        );
-
+function supprimerAppel(utilisateurA, utilisateurB) {
+    if (utilisateurA) {
+        appels.delete(utilisateurA);
     }
-
-
-    if (
-        utilisateurB
-    ) {
-
-        appels.delete(
-            utilisateurB
-        );
-
+    if (utilisateurB) {
+        appels.delete(utilisateurB);
     }
-
-
-    console.log(
-        `APPEL TERMINÉ : ${utilisateurA} <--> ${utilisateurB}`
-    );
-
+    console.log(`APPEL TERMINÉ : ${utilisateurA} <--> ${utilisateurB}`);
 }
 
 
@@ -244,17 +132,9 @@ wss.on(
     "connection",
     (ws) => {
 
-        console.log(
-            "Nouveau client connecté."
-        );
+        console.log("Nouveau client connecté.");
 
-
-        // Identifiant associé à cette connexion
-
-        let identifiant =
-            null;
-
-
+        let identifiant = null;
 
         // ==================================================
         // MESSAGE
@@ -263,54 +143,20 @@ wss.on(
         ws.on(
             "message",
             (data) => {
-
                 try {
-
-                    const message =
-                        JSON.parse(
-                            data.toString()
-                        );
-
-
-                    console.log(
-                        "\nMESSAGE REÇU :",
-                        message
-                    );
-
-
-                    traiterMessage(
-                        ws,
-                        message
-                    );
-
+                    const message = JSON.parse(data.toString());
+                    console.log("\nMESSAGE REÇU :", message);
+                    traiterMessage(ws, message);
                 }
                 catch (error) {
-
-                    console.error(
-                        "Message JSON invalide :",
-                        error
-                    );
-
-
-                    envoyer(
-                        ws,
-                        {
-
-                            type:
-                                "ERROR",
-
-                            message:
-                                "Message invalide."
-
-                        }
-                    );
-
+                    console.error("Message JSON invalide :", error);
+                    envoyer(ws, {
+                        type: "ERROR",
+                        message: "Message invalide."
+                    });
                 }
-
             }
         );
-
-
 
         // ==================================================
         // DÉCONNEXION
@@ -319,26 +165,12 @@ wss.on(
         ws.on(
             "close",
             () => {
-
-                console.log(
-                    `Client déconnecté : ${identifiant || "inconnu"}`
-                );
-
-
-                if (
-                    identifiant
-                ) {
-
-                    gererDeconnexion(
-                        identifiant
-                    );
-
+                console.log(`Client déconnecté : ${identifiant || "inconnu"}`);
+                if (identifiant) {
+                    gererDeconnexion(identifiant);
                 }
-
             }
         );
-
-
 
         // ==================================================
         // ERREUR
@@ -347,564 +179,220 @@ wss.on(
         ws.on(
             "error",
             (error) => {
-
-                console.error(
-                    `Erreur WebSocket ${identifiant || ""} :`,
-                    error
-                );
-
+                console.error(`Erreur WebSocket ${identifiant || ""} :`, error);
             }
         );
-
-
 
         // ==================================================
         // TRAITEMENT DES MESSAGES
         // ==================================================
 
-        function traiterMessage(
-            wsClient,
-            message
-        ) {
+        function traiterMessage(wsClient, message) {
 
-            const type =
-                message.type;
+            // --- NOUVEAU : TRADUCTEUR CLIENT -> SERVEUR ---
+            // On adapte le vocabulaire de l'application mobile pour le serveur
+            if (message.targetId) message.to = message.targetId;
+            
+            if (message.type === "call-user") message.type = "CALLING";
+            if (message.type === "answer-call") message.type = "CALL_ACCEPTED";
+            if (message.type === "ice-candidate") message.type = "ICE_CANDIDATE";
+            if (message.type === "hang-up") message.type = "CALL_ENDED";
+            if (message.type === "call-refused") message.type = "CALL_REJECTED";
 
-
+            const type = message.type;
 
             // ==================================================
             // REGISTER
             // ==================================================
 
-            if (
-                type ===
-                "REGISTER"
-            ) {
-
-                enregistrerUtilisateur(
-                    wsClient,
-                    message
-                );
-
+            if (type === "REGISTER") {
+                enregistrerUtilisateur(wsClient, message);
                 return;
-
             }
-
-
 
             // ==================================================
             // VÉRIFICATION CONNEXION
             // ==================================================
 
-            if (
-                !identifiant
-            ) {
-
-                envoyer(
-                    wsClient,
-                    {
-
-                        type:
-                            "ERROR",
-
-                        message:
-                            "Vous devez être enregistré avant d'envoyer des messages."
-
-                    }
-                );
-
-
+            if (!identifiant) {
+                envoyer(wsClient, {
+                    type: "ERROR",
+                    message: "Vous devez être enregistré avant d'envoyer des messages."
+                });
                 return;
-
             }
-
-
 
             // ==================================================
             // APPEL
             // ==================================================
 
-            if (
-                type ===
-                "CALLING"
-            ) {
-
-                traiterCalling(
-                    message
-                );
-
+            if (type === "CALLING") {
+                traiterCalling(message);
                 return;
-
             }
-
-
 
             // ==================================================
             // APPEL ACCEPTÉ
             // ==================================================
 
-            if (
-                type ===
-                "CALL_ACCEPTED"
-            ) {
-
-                traiterCallAccepted(
-                    message
-                );
-
+            if (type === "CALL_ACCEPTED") {
+                traiterCallAccepted(message);
                 return;
-
             }
-
-
 
             // ==================================================
             // APPEL REFUSÉ
             // ==================================================
 
-            if (
-                type ===
-                "CALL_REJECTED"
-            ) {
-
-                traiterCallRejected(
-                    message
-                );
-
+            if (type === "CALL_REJECTED") {
+                traiterCallRejected(message);
                 return;
-
             }
-
-
 
             // ==================================================
             // APPEL TERMINÉ
             // ==================================================
 
-            if (
-                type ===
-                "CALL_ENDED"
-            ) {
-
-                traiterCallEnded(
-                    message
-                );
-
+            if (type === "CALL_ENDED") {
+                traiterCallEnded(message);
                 return;
-
             }
-
-
 
             // ==================================================
             // WEBRTC OFFER
             // ==================================================
 
-            if (
-                type ===
-                "WEBRTC_OFFER"
-            ) {
-
-                relayerSignalisation(
-                    message
-                );
-
+            if (type === "WEBRTC_OFFER") {
+                relayerSignalisation(message);
                 return;
-
             }
-
-
 
             // ==================================================
             // WEBRTC ANSWER
             // ==================================================
 
-            if (
-                type ===
-                "WEBRTC_ANSWER"
-            ) {
-
-                relayerSignalisation(
-                    message
-                );
-
+            if (type === "WEBRTC_ANSWER") {
+                relayerSignalisation(message);
                 return;
-
             }
-
-
 
             // ==================================================
             // ICE CANDIDATE
             // ==================================================
 
-            if (
-                type ===
-                "ICE_CANDIDATE"
-            ) {
-
-                relayerSignalisation(
-                    message
-                );
-
+            if (type === "ICE_CANDIDATE") {
+                relayerSignalisation(message);
                 return;
-
             }
-
-
 
             // ==================================================
             // TYPE INCONNU
             // ==================================================
 
-            envoyer(
-                wsClient,
-                {
-
-                    type:
-                        "ERROR",
-
-                    message:
-                        `Type de message inconnu : ${type}`
-
-                }
-            );
-
+            envoyer(wsClient, {
+                type: "ERROR",
+                message: `Type de message inconnu : ${type}`
+            });
         }
-
-
 
         // ==================================================
         // ENREGISTRER UTILISATEUR
         // ==================================================
 
-        function enregistrerUtilisateur(
-            wsClient,
-            message
-        ) {
+        function enregistrerUtilisateur(wsClient, message) {
 
-            const nouvelIdentifiant =
-                String(
-                    message.id || ""
-                ).trim();
+            const nouvelIdentifiant = String(message.id || "").trim();
 
-
-            if (
-                nouvelIdentifiant === ""
-            ) {
-
-                envoyer(
-                    wsClient,
-                    {
-
-                        type:
-                            "ERROR",
-
-                        message:
-                            "Identifiant obligatoire."
-
-                    }
-                );
-
-
+            if (nouvelIdentifiant === "") {
+                envoyer(wsClient, {
+                    type: "ERROR",
+                    message: "Identifiant obligatoire."
+                });
                 return;
-
             }
 
-
-
             // ==============================================
-            // IDENTIFIANT DÉJÀ UTILISÉ
+            // IDENTIFIANT DÉJÀ UTILISÉ (NOUVEAU: Écrasement du fantôme)
             // ==============================================
 
-            if (
-                utilisateurs.has(
-                    nouvelIdentifiant
-                )
-            ) {
-
-                envoyer(
-                    wsClient,
-                    {
-
-                        type:
-                            "ERROR",
-
-                        message:
-                            "Cet identifiant est déjà connecté."
-
-                    }
-                );
-
-
-                console.log(
-                    `IDENTIFIANT REFUSÉ : ${nouvelIdentifiant}`
-                );
-
-
-                return;
-
+            if (utilisateurs.has(nouvelIdentifiant)) {
+                console.log(`🔄 Reconnexion : nettoyage de l'ancienne session pour ${nouvelIdentifiant}`);
+                
+                const ancienneWs = utilisateurs.get(nouvelIdentifiant);
+                if (ancienneWs && ancienneWs !== wsClient) {
+                    try { ancienneWs.close(); } catch (e) {}
+                }
+                // On laisse la suite écraser l'enregistrement dans la Map
             }
-
-
 
             // ==============================================
             // ENREGISTREMENT
             // ==============================================
 
-            identifiant =
-                nouvelIdentifiant;
+            identifiant = nouvelIdentifiant;
 
+            utilisateurs.set(identifiant, wsClient);
 
-            utilisateurs.set(
-                identifiant,
-                wsClient
-            );
-
-
-            // NOUVEAU : Sauvegarder le token s'il est fourni lors de l'enregistrement
             if (message.fcmToken) {
                 fcmTokens.set(identifiant, message.fcmToken);
             }
 
+            console.log(`UTILISATEUR ENREGISTRÉ : ${identifiant}`);
 
-                
-
-            console.log(
-                `UTILISATEUR ENREGISTRÉ : ${identifiant}`
-            );
-
-
-            envoyer(
-                wsClient,
-                {
-
-                    type:
-                        "REGISTERED",
-
-                    id:
-                        identifiant
-
-                }
-            );
-
+            envoyer(wsClient, {
+                type: "REGISTERED",
+                id: identifiant
+            });
         }
-
-
 
         // ==================================================
         // TRAITER CALLING
         // ==================================================
 
-        function traiterCalling(
-            message
-        ) {
+        function traiterCalling(message) {
 
-            const from =
-                identifiant;
+            const from = identifiant;
+            const to = String(message.to || "").trim();
 
-
-            const to =
-                String(
-                    message.to || ""
-                ).trim();
-
-
-
-            // ==============================================
-            // DESTINATAIRE MANQUANT
-            // ==============================================
-
-            if (
-                to === ""
-            ) {
-
-                envoyer(
-                    ws,
-                    {
-
-                        type:
-                            "ERROR",
-
-                        message:
-                            "Destinataire manquant."
-
-                    }
-                );
-
-
+            if (to === "") {
+                envoyer(ws, { type: "ERROR", message: "Destinataire manquant." });
                 return;
-
             }
 
-
-
-            // ==============================================
-            // S'APPELER SOI-MÊME
-            // ==============================================
-
-            if (
-                from === to
-            ) {
-
-                envoyer(
-                    ws,
-                    {
-
-                        type:
-                            "ERROR",
-
-                        message:
-                            "Vous ne pouvez pas vous appeler vous-même."
-
-                    }
-                );
-
-
+            if (from === to) {
+                envoyer(ws, { type: "ERROR", message: "Vous ne pouvez pas vous appeler vous-même." });
                 return;
-
             }
 
-
-
-            // ==============================================
-            // DESTINATAIRE INEXISTANT
-            // ==============================================
-
-            if (
-                !utilisateurExiste(
-                    to
-                )
-            ) {
-
-                envoyer(
-                    ws,
-                    {
-
-                        type:
-                            "ERROR",
-
-                        message:
-                            "Le correspondant est hors ligne ou introuvable."
-
-                    }
-                );
-
-
+            if (!utilisateurExiste(to)) {
+                envoyer(ws, { type: "ERROR", message: "Le correspondant est hors ligne ou introuvable." });
                 return;
-
             }
 
-
-
-            // ==============================================
-            // APPELANT DÉJÀ OCCUPÉ
-            // ==============================================
-
-            if (
-                utilisateurOccupe(
-                    from
-                )
-            ) {
-
-                envoyer(
-                    ws,
-                    {
-
-                        type:
-                            "BUSY",
-
-                        from:
-                            to,
-
-                        message:
-                            "Vous êtes déjà en appel."
-
-                    }
-                );
-
-
+            if (utilisateurOccupe(from)) {
+                envoyer(ws, { type: "BUSY", from: to, message: "Vous êtes déjà en appel." });
                 return;
-
             }
 
-
-
-            // ==============================================
-            // DESTINATAIRE DÉJÀ OCCUPÉ
-            // ==============================================
-
-            if (
-                utilisateurOccupe(
-                    to
-                )
-            ) {
-
-                envoyer(
-                    ws,
-                    {
-
-                        type:
-                            "BUSY",
-
-                        from:
-                            to,
-
-                        to:
-                            from
-
-                    }
-                );
-
-
-                console.log(
-                    `APPEL REFUSÉ : ${to} est occupé.`
-                );
-
-
+            if (utilisateurOccupe(to)) {
+                envoyer(ws, { type: "BUSY", from: to, to: from });
+                console.log(`APPEL REFUSÉ : ${to} est occupé.`);
                 return;
-
             }
 
-
-
-            // ==============================================
-            // CRÉATION DE L'APPEL
-            // ==============================================
-
-            creerAppel(
-                from,
-                to
-            );
-
-
-            // ==============================================
-            // TRANSMETTRE CALLING
-            // ==============================================
-
+            creerAppel(from, to);
 
             // ==============================================
             // 1. TENTATIVE VIA WEBSOCKET (En direct)
             // ==============================================
-            const transmis =
-                envoyerAUtilisateur(
-                    to,
-                    {
+            const transmis = envoyerAUtilisateur(to, {
+                type: "CALLING",
+                from: from,
+                to: to,
+                offer: message.offer // NOUVEAU : Transmission de l'offre vidéo WebRTC
+            });
 
-                        type:
-                            "CALLING",
-
-                        from:
-                            from,
-
-                        to:
-                            to
-
-                    }
-                );
-
-
-               // ==============================================
+            // ==============================================
             // 2. TENTATIVE VIA FIREBASE PUSH (En arrière-plan)
             // ==============================================
             const tokenDestinataire = fcmTokens.get(to);
@@ -932,398 +420,128 @@ wss.on(
             // ==============================================
             // 3. VÉRIFICATION DE L'ÉCHEC TOTAL
             // ==============================================
-            // Si le message n'est pas passé en direct ET qu'on n'a pas de moyen de le réveiller par Push
             if (!transmis && !tokenDestinataire) {
-                
                 supprimerAppel(from, to);
-
                 envoyer(ws, {
                     type: "ERROR",
                     message: "Impossible de joindre le correspondant (hors ligne)."
                 });
-
                 return;
             }
 
             console.log(`CALLING traité : ${from} -> ${to}`);
-        
         }
-
-
-    
-        
-        
-        
-        
-
-
 
         // ==================================================
         // CALL ACCEPTED
         // ==================================================
 
-        function traiterCallAccepted(
-            message
-        ) {
+        function traiterCallAccepted(message) {
 
-            const from =
-                identifiant;
+            const from = identifiant;
+            const to = String(message.to || "").trim();
 
+            if (to === "") return;
 
-            const to =
-                String(
-                    message.to || ""
-                ).trim();
-
-
-            if (
-                to === ""
-            ) {
-
+            if (appels.get(from) !== to) {
+                console.log(`CALL_ACCEPTED ignoré : aucun appel entre ${from} et ${to}`);
                 return;
-
             }
 
+            envoyerAUtilisateur(to, {
+                type: "CALL_ACCEPTED",
+                from: from,
+                to: to,
+                answer: message.answer // NOUVEAU : Transmission de la réponse vidéo WebRTC
+            });
 
-
-            // ==============================================
-            // VÉRIFICATION APPEL
-            // ==============================================
-
-            if (
-                appels.get(
-                    from
-                ) !== to
-            ) {
-
-                console.log(
-                    `CALL_ACCEPTED ignoré : aucun appel entre ${from} et ${to}`
-                );
-
-
-                return;
-
-            }
-
-
-
-            // ==============================================
-            // TRANSMISSION
-            // ==============================================
-
-            envoyerAUtilisateur(
-                to,
-                {
-
-                    type:
-                        "CALL_ACCEPTED",
-
-                    from:
-                        from,
-
-                    to:
-                        to
-
-                }
-            );
-
-
-            console.log(
-                `CALL_ACCEPTED : ${from} -> ${to}`
-            );
-
+            console.log(`CALL_ACCEPTED : ${from} -> ${to}`);
         }
-
-
 
         // ==================================================
         // CALL REJECTED
         // ==================================================
 
-        function traiterCallRejected(
-            message
-        ) {
+        function traiterCallRejected(message) {
+            const from = identifiant;
+            const to = String(message.to || "").trim();
 
-            const from =
-                identifiant;
+            if (to === "") return;
 
-
-            const to =
-                String(
-                    message.to || ""
-                ).trim();
-
-
-            if (
-                to === ""
-            ) {
-
-                return;
-
-            }
-
-
-
-            envoyerAUtilisateur(
-                to,
-                {
-
-                    type:
-                        "CALL_REJECTED",
-
-                    from:
-                        from,
-
-                    to:
-                        to
-
-                }
-            );
-
-
-            supprimerAppel(
-                from,
-                to
-            );
-
-
-            console.log(
-                `CALL_REJECTED : ${from} -> ${to}`
-            );
-
+            envoyerAUtilisateur(to, { type: "CALL_REJECTED", from: from, to: to });
+            supprimerAppel(from, to);
+            console.log(`CALL_REJECTED : ${from} -> ${to}`);
         }
-
-
 
         // ==================================================
         // CALL ENDED
         // ==================================================
 
-        function traiterCallEnded(
-            message
-        ) {
+        function traiterCallEnded(message) {
+            const from = identifiant;
+            const to = String(message.to || "").trim();
 
-            const from =
-                identifiant;
+            if (to === "") return;
 
-
-            const to =
-                String(
-                    message.to || ""
-                ).trim();
-
-
-            if (
-                to === ""
-            ) {
-
-                return;
-
-            }
-
-
-
-            envoyerAUtilisateur(
-                to,
-                {
-
-                    type:
-                        "CALL_ENDED",
-
-                    from:
-                        from,
-
-                    to:
-                        to
-
-                }
-            );
-
-
-            supprimerAppel(
-                from,
-                to
-            );
-
-
-            console.log(
-                `CALL_ENDED : ${from} -> ${to}`
-            );
-
+            envoyerAUtilisateur(to, { type: "CALL_ENDED", from: from, to: to });
+            supprimerAppel(from, to);
+            console.log(`CALL_ENDED : ${from} -> ${to}`);
         }
-
-
 
         // ==================================================
         // SIGNALISATION WEBRTC
         // ==================================================
 
-        function relayerSignalisation(
-            message
-        ) {
+        function relayerSignalisation(message) {
+            const from = identifiant;
+            const to = String(message.to || "").trim();
 
-            const from =
-                identifiant;
-
-
-            const to =
-                String(
-                    message.to || ""
-                ).trim();
-
-
-            if (
-                to === ""
-            ) {
-
-                console.log(
-                    "Signalisation sans destinataire."
-                );
-
-
+            if (to === "") {
+                console.log("Signalisation sans destinataire.");
                 return;
-
             }
 
-
-
-            // ==============================================
-            // VÉRIFIER QUE LES DEUX UTILISATEURS
-            // SONT BIEN ENSEMBLE
-            // ==============================================
-
-            if (
-                appels.get(
-                    from
-                ) !== to
-            ) {
-
-                console.log(
-                    `Signalisation refusée : ${from} -> ${to}`
-                );
-
-
+            if (appels.get(from) !== to) {
+                console.log(`Signalisation refusée : ${from} -> ${to}`);
                 return;
-
             }
 
+            const signal = {
+                ...message,
+                from: from,
+                to: to
+            };
 
-
-            // ==============================================
-            // COPIE DU MESSAGE
-            // ==============================================
-
-            const signal =
-                {
-                    ...message,
-
-                    from:
-                        from,
-
-                    to:
-                        to
-                };
-
-
-
-            // ==============================================
-            // TRANSMISSION
-            // ==============================================
-
-            envoyerAUtilisateur(
-                to,
-                signal
-            );
-
-
-            console.log(
-                `${message.type} : ${from} -> ${to}`
-            );
-
+            envoyerAUtilisateur(to, signal);
+            console.log(`${message.type} : ${from} -> ${to}`);
         }
-
-
 
         // ==================================================
         // DÉCONNEXION
         // ==================================================
 
-        function gererDeconnexion(
-            id
-        ) {
+        function gererDeconnexion(id) {
+            const correspondant = appels.get(id);
 
-            const correspondant =
-                appels.get(
-                    id
-                );
+            if (correspondant) {
+                envoyerAUtilisateur(correspondant, {
+                    type: "CALL_ENDED",
+                    from: id,
+                    to: correspondant,
+                    reason: "disconnected"
+                });
 
-
-
-            // ==============================================
-            // SI APPEL EN COURS
-            // ==============================================
-
-            if (
-                correspondant
-            ) {
-
-                envoyerAUtilisateur(
-                    correspondant,
-                    {
-
-                        type:
-                            "CALL_ENDED",
-
-                        from:
-                            id,
-
-                        to:
-                            correspondant,
-
-                        reason:
-                            "disconnected"
-
-                    }
-                );
-
-
-                supprimerAppel(
-                    id,
-                    correspondant
-                );
-
+                supprimerAppel(id, correspondant);
             }
 
-
-
-            // ==============================================
-            // SUPPRIMER UTILISATEUR
-            // ==============================================
-
-            if (
-                utilisateurs.get(
-                    id
-                ) === ws
-            ) {
-
-                utilisateurs.delete(
-                    id
-                );
-
+            if (utilisateurs.get(id) === ws) {
+                utilisateurs.delete(id);
             }
 
-
-            console.log(
-                `UTILISATEUR SUPPRIMÉ : ${id}`
-            );
-
+            console.log(`UTILISATEUR SUPPRIMÉ : ${id}`);
         }
-
     }
-
 );
-
-
 
 // ======================================================
 // GESTION ERREUR SERVEUR
@@ -1332,11 +550,6 @@ wss.on(
 wss.on(
     "error",
     error => {
-
-        console.error(
-            "ERREUR SERVEUR WEBSOCKET :",
-            error
-        );
-
+        console.error("ERREUR SERVEUR WEBSOCKET :", error);
     }
 );
