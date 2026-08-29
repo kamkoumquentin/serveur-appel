@@ -1,27 +1,28 @@
 const http = require("http");
 const WebSocket = require("ws");
 
-// MODIFICATION RENDER : Utilisation du port dynamique
+// Port dynamique pour Render
 const PORT = process.env.PORT || 8080;
 
 // ======================================================
-// SERVEUR HTTP (Pour le reveil Render & Health Check)
+// SERVEUR HTTP (Pour le réveil Render & Health Check)
 // ======================================================
 const server = http.createServer((req, res) => {
+    // Répondre 200 OK aux requêtes HTTP de réveil du client
     res.writeHead(200, {
         "Content-Type": "application/json",
         "Access-Control-Allow-Origin": "*"
     });
-    res.end(JSON.stringify({ status: "ok", message: "Serveur d'appel operationnel" }));
+    res.end(JSON.stringify({ status: "ok", message: "Serveur d'appel opérationnel" }));
 });
 
 // ======================================================
-// SERVEUR WEBSOCKET
+// SERVEUR WEBSOCKET ATTACHÉ AU SERVEUR HTTP
 // ======================================================
 const wss = new WebSocket.Server({ server });
 
 // ======================================================
-// INITIALISATION FIREBASE notification firebase
+// INITIALISATION FIREBASE ADMIN
 // ======================================================
 const { initializeApp, cert } = require("firebase-admin/app");
 const { getMessaging } = require("firebase-admin/messaging");
@@ -33,40 +34,28 @@ try {
         credential: cert(serviceAccount)
     });
     messaging = getMessaging();
-    console.log("🔥 Firebase Admin initialise avec succes.");
+    console.log("🔥 Firebase Admin initialisé avec succès.");
 } catch (err) {
     console.error("⚠️ Impossible d'initialiser Firebase Admin :", err.message);
 }
 
 // ======================================================
-// TOKENS DE NOTIFICATION FCM
+// ÉTATS EN MÉMOIRE
 // ======================================================
-const fcmTokens = new Map();
+const fcmTokens = new Map();      // ID -> Token FCM
+const utilisateurs = new Map();   // ID -> WebSocket
+const appels = new Map();         // ID -> ID Correspondant
+const pendingOffers = new Map();  // ID -> { from, offer }
 
 // ======================================================
-// UTILISATEURS CONNECTES
-// ======================================================
-const utilisateurs = new Map();
-
-// ======================================================
-// APPELS ACTIFS
-// ======================================================
-const appels = new Map();
-
-// ======================================================
-// OFFRES EN ATTENTE (Pour reveil Push FCM hors-ligne)
-// ======================================================
-const pendingOffers = new Map();
-
-// ======================================================
-// DEMARRAGE
+// DÉMARRAGE
 // ======================================================
 server.listen(PORT, "0.0.0.0", () => {
-    console.log(`Serveur WebSocket & HTTP demarre sur le port ${PORT}`);
+    console.log(`🚀 Serveur HTTP & WebSocket démarré sur le port ${PORT}`);
 });
 
 // ======================================================
-// UTILITAIRE : ENVOYER UN MESSAGE
+// UTILITAIRES
 // ======================================================
 function envoyer(ws, message) {
     if (ws && ws.readyState === WebSocket.OPEN) {
@@ -74,9 +63,6 @@ function envoyer(ws, message) {
     }
 }
 
-// ======================================================
-// UTILITAIRE : ENVOYER A UN UTILISATEUR
-// ======================================================
 function envoyerAUtilisateur(identifiant, message) {
     const ws = utilisateurs.get(identifiant);
     if (!ws) {
@@ -87,32 +73,20 @@ function envoyerAUtilisateur(identifiant, message) {
     return true;
 }
 
-// ======================================================
-// UTILITAIRE : UTILISATEUR DISPONIBLE
-// ======================================================
 function utilisateurExiste(identifiant) {
     return utilisateurs.has(identifiant);
 }
 
-// ======================================================
-// UTILITAIRE : UTILISATEUR OCCUPE
-// ======================================================
 function utilisateurOccupe(identifiant) {
     return appels.has(identifiant);
 }
 
-// ======================================================
-// UTILITAIRE : CREER UN APPEL
-// ======================================================
 function creerAppel(utilisateurA, utilisateurB) {
     appels.set(utilisateurA, utilisateurB);
     appels.set(utilisateurB, utilisateurA);
-    console.log(`APPEL CREE : ${utilisateurA} <--> ${utilisateurB}`);
+    console.log(`📞 APPEL CRÉÉ : ${utilisateurA} <--> ${utilisateurB}`);
 }
 
-// ======================================================
-// UTILITAIRE : SUPPRIMER UN APPEL
-// ======================================================
 function supprimerAppel(utilisateurA, utilisateurB) {
     if (utilisateurA) {
         appels.delete(utilisateurA);
@@ -122,29 +96,25 @@ function supprimerAppel(utilisateurA, utilisateurB) {
         appels.delete(utilisateurB);
         pendingOffers.delete(utilisateurB);
     }
-    console.log(`APPEL TERMINE : ${utilisateurA} <--> ${utilisateurB}`);
+    console.log(`📴 APPEL TERMINÉ : ${utilisateurA} <--> ${utilisateurB}`);
 }
 
 // ======================================================
-// CONNEXION CLIENT
+// GESTION DES CONNEXIONS WEBSOCKET
 // ======================================================
 wss.on("connection", (ws) => {
-    console.log("Nouveau client connecte.");
+    console.log("Nouveau client connecté.");
     let identifiant = null;
 
-    // HEARTBEAT / KEEP-ALIVE : Marquer la connexion comme active
     ws.isAlive = true;
     ws.on("pong", () => {
         ws.isAlive = true;
     });
 
-    // ==================================================
-    // MESSAGE
-    // ==================================================
     ws.on("message", (data) => {
         try {
             const message = JSON.parse(data.toString());
-            console.log("\nMESSAGE RECU :", message);
+            console.log("\nMESSAGE REÇU :", message);
             traiterMessage(ws, message);
         } catch (error) {
             console.error("Message JSON invalide :", error);
@@ -155,19 +125,13 @@ wss.on("connection", (ws) => {
         }
     });
 
-    // ==================================================
-    // DECONNEXION
-    // ==================================================
     ws.on("close", () => {
-        console.log(`Client deconnecte : ${identifiant || "inconnu"}`);
+        console.log(`Client déconnecté : ${identifiant || "inconnu"}`);
         if (identifiant) {
             gererDeconnexion(identifiant);
         }
     });
 
-    // ==================================================
-    // ERREUR
-    // ==================================================
     ws.on("error", (error) => {
         console.error(`Erreur WebSocket ${identifiant || ""} :`, error);
     });
@@ -176,9 +140,10 @@ wss.on("connection", (ws) => {
     // TRAITEMENT DES MESSAGES
     // ==================================================
     function traiterMessage(wsClient, message) {
-        // --- TRADUCTEUR CLIENT -> SERVEUR ---
+        // Normalisation de la cible
         if (message.targetId) message.to = message.targetId;
 
+        // Normalisation des types de messages entrants
         if (message.type === "call-user") message.type = "CALLING";
         if (message.type === "answer-call") message.type = "CALL_ACCEPTED";
         if (message.type === "ice-candidate") message.type = "ICE_CANDIDATE";
@@ -187,77 +152,36 @@ wss.on("connection", (ws) => {
 
         const type = message.type;
 
-        // ==================================================
-        // PING / PONG (Heartbeat applicatif)
-        // ==================================================
+        // PING / PONG applicatif
         if (type === "PING" || type === "ping") {
-            ws.isAlive = true;
+            wsClient.isAlive = true;
             envoyer(wsClient, { type: "PONG" });
             return;
         }
 
-        // ==================================================
         // REGISTER
-        // ==================================================
         if (type === "REGISTER") {
             enregistrerUtilisateur(wsClient, message);
             return;
         }
 
-        // ==================================================
-        // VERIFICATION CONNEXION
-        // ==================================================
+        // Vérification de connexion préalable
         if (!identifiant) {
             envoyer(wsClient, {
                 type: "ERROR",
-                message: "Vous devez etre enregistre avant d'envoyer des messages."
+                message: "Vous devez être enregistré avant d'envoyer des messages."
             });
             return;
         }
 
-        // ==================================================
-        // APPEL
-        // ==================================================
-        if (type === "CALLING") {
-            traiterCalling(message);
-            return;
+        if (type === "CALLING") return traiterCalling(message);
+        if (type === "CALL_ACCEPTED") return traiterCallAccepted(message);
+        if (type === "CALL_REJECTED") return traiterCallRejected(message);
+        if (type === "CALL_ENDED") return traiterCallEnded(message);
+        if (type === "ICE_CANDIDATE" || type === "WEBRTC_OFFER" || type === "WEBRTC_ANSWER") {
+            return relayerSignalisation(message);
         }
 
-        // ==================================================
-        // APPEL ACCEPTE
-        // ==================================================
-        if (type === "CALL_ACCEPTED") {
-            traiterCallAccepted(message);
-            return;
-        }
-
-        // ==================================================
-        // APPEL REFUSE
-        // ==================================================
-        if (type === "CALL_REJECTED") {
-            traiterCallRejected(message);
-            return;
-        }
-
-        // ==================================================
-        // APPEL TERMINE
-        // ==================================================
-        if (type === "CALL_ENDED") {
-            traiterCallEnded(message);
-            return;
-        }
-
-        // ==================================================
-        // WEBRTC OFFER / ANSWER / ICE CANDIDATE
-        // ==================================================
-        if (type === "WEBRTC_OFFER" || type === "WEBRTC_ANSWER" || type === "ICE_CANDIDATE") {
-            relayerSignalisation(message);
-            return;
-        }
-
-        // ==================================================
-        // TYPE INCONNU
-        // ==================================================
         envoyer(wsClient, {
             type: "ERROR",
             message: `Type de message inconnu : ${type}`
@@ -265,7 +189,7 @@ wss.on("connection", (ws) => {
     }
 
     // ==================================================
-    // ENREGISTRER UTILISATEUR
+    // ENREGISTREMENT DE L'UTILISATEUR
     // ==================================================
     function enregistrerUtilisateur(wsClient, message) {
         const nouvelIdentifiant = String(message.id || "").trim();
@@ -278,7 +202,7 @@ wss.on("connection", (ws) => {
             return;
         }
 
-        // Nettoyage de l'ancienne session en doublon
+        // Nettoyage de l'ancienne session si existante
         if (utilisateurs.has(nouvelIdentifiant)) {
             console.log(`Reconnexion : nettoyage de l'ancienne session pour ${nouvelIdentifiant}`);
             const ancienneWs = utilisateurs.get(nouvelIdentifiant);
@@ -294,18 +218,19 @@ wss.on("connection", (ws) => {
             fcmTokens.set(identifiant, message.fcmToken);
         }
 
-        console.log(`UTILISATEUR ENREGISTRE : ${identifiant}`);
+        console.log(`UTILISATEUR ENREGISTRÉ : ${identifiant}`);
 
         envoyer(wsClient, {
             type: "REGISTERED",
             id: identifiant
         });
 
-        // Si un appel etait en attente (reveil suite au push FCM)
+        // Transmission de l'offre en attente (si réveil Push)
         if (pendingOffers.has(identifiant)) {
             const pending = pendingOffers.get(identifiant);
             if (appels.get(identifiant) === pending.from) {
-                console.log(`Transmission de l'offre en attente a ${identifiant} de la part de ${pending.from}`);
+                console.log(`Transmission de l'offre en attente à ${identifiant} de la part de ${pending.from}`);
+                // ✅ FORMAT ATTENDU PAR LE CLIENT : "incoming-call"
                 envoyer(wsClient, {
                     type: "incoming-call",
                     from: pending.from,
@@ -317,7 +242,7 @@ wss.on("connection", (ws) => {
     }
 
     // ==================================================
-    // TRAITER CALLING
+    // TRAITER L'APPEL (OFFRE)
     // ==================================================
     function traiterCalling(message) {
         const from = identifiant;
@@ -329,43 +254,40 @@ wss.on("connection", (ws) => {
         }
 
         if (from === to) {
-            envoyer(ws, { type: "ERROR", message: "Vous ne pouvez pas vous appeler vous-meme." });
+            envoyer(ws, { type: "ERROR", message: "Vous ne pouvez pas vous appeler vous-même." });
             return;
         }
 
         const destinataireEnLigne = utilisateurExiste(to);
         const tokenDestinataire = fcmTokens.get(to);
 
-        // Si le correspondant n'est ni connecte en direct, ni joignable par Push FCM
         if (!destinataireEnLigne && !tokenDestinataire) {
             envoyer(ws, { type: "ERROR", message: "Le correspondant est hors ligne ou introuvable." });
             return;
         }
 
         if (utilisateurOccupe(from)) {
-            envoyer(ws, { type: "BUSY", from: to, message: "Vous etes deja en appel." });
+            envoyer(ws, { type: "BUSY", from: to, message: "Vous êtes déjà en appel." });
             return;
         }
 
         if (utilisateurOccupe(to)) {
-            envoyer(ws, { type: "BUSY", from: to, to: from, message: "Le correspondant est occupe." });
-            console.log(`APPEL REFUSE : ${to} est occupe.`);
+            envoyer(ws, { type: "BUSY", from: to, to: from, message: "Le correspondant est occupé." });
+            console.log(`APPEL REFUSÉ : ${to} est occupé.`);
             return;
         }
 
         creerAppel(from, to);
 
-        // Memoriser l'offre en attente pour le reveil par push
         if (message.offer) {
             pendingOffers.set(to, { from: from, offer: message.offer });
         }
 
         let transmisWs = false;
 
-        // ==============================================
-        // 1. TENTATIVE VIA WEBSOCKET (En direct)
-        // ==============================================
+        // 1. Envoi direct par WebSocket
         if (destinataireEnLigne) {
+            // ✅ FORMAT ATTENDU PAR LE CLIENT : "incoming-call"
             transmisWs = envoyerAUtilisateur(to, {
                 type: "incoming-call",
                 from: from,
@@ -374,11 +296,8 @@ wss.on("connection", (ws) => {
             });
         }
 
-        // ==============================================
-        // 2. TENTATIVE VIA FIREBASE PUSH (En arriere-plan)
-        // ==============================================
+        // 2. Envoi par Push FCM en arrière-plan
         let pushTente = false;
-
         if (tokenDestinataire && messaging) {
             pushTente = true;
             const payload = {
@@ -398,23 +317,16 @@ wss.on("connection", (ws) => {
             };
 
             messaging.send(payload)
-                .then(response => console.log("Push envoye avec succes :", response))
+                .then(response => console.log("Push FCM envoyé avec succès :", response))
                 .catch(error => {
-                    console.error("Erreur Push :", error);
-                    if (error.code === "messaging/registration-token-not-registered" || 
+                    console.error("Erreur Push FCM :", error);
+                    if (error.code === "messaging/registration-token-not-registered" ||
                         error.code === "messaging/invalid-registration-token") {
                         fcmTokens.delete(to);
                     }
                 });
-        } else if (tokenDestinataire) {
-            console.log("Firebase Messaging non disponible.");
-        } else {
-            console.log(`Aucun token FCM pour ${to}.`);
         }
 
-        // ==============================================
-        // 3. VERIFICATION DE L'ECHEC TOTAL
-        // ==============================================
         if (!transmisWs && !pushTente) {
             supprimerAppel(from, to);
             envoyer(ws, {
@@ -424,27 +336,22 @@ wss.on("connection", (ws) => {
             return;
         }
 
-        console.log(`CALLING traite : ${from} -> ${to} (WS direct: ${transmisWs}, Push: ${pushTente})`);
+        console.log(`CALLING traité : ${from} -> ${to} (WS direct: ${transmisWs}, Push: ${pushTente})`);
     }
 
     // ==================================================
-    // CALL ACCEPTED
+    // TRAITER L'ACCEPTATION (RÉPONSE)
     // ==================================================
     function traiterCallAccepted(message) {
         const from = identifiant;
         const to = String(message.to || "").trim();
 
-        if (to === "") return;
+        if (to === "" || appels.get(from) !== to) return;
 
-        if (appels.get(from) !== to) {
-            console.log(`CALL_ACCEPTED ignore : aucun appel entre ${from} et ${to}`);
-            return;
-        }
-
-        // Nettoyage de l'offre en attente une fois accepte
         pendingOffers.delete(from);
         pendingOffers.delete(to);
 
+        // ✅ FORMAT ATTENDU PAR LE CLIENT : "call-answered"
         envoyerAUtilisateur(to, {
             type: "call-answered",
             from: from,
@@ -456,7 +363,7 @@ wss.on("connection", (ws) => {
     }
 
     // ==================================================
-    // CALL REJECTED
+    // TRAITER LE REFUS
     // ==================================================
     function traiterCallRejected(message) {
         const from = identifiant;
@@ -464,13 +371,14 @@ wss.on("connection", (ws) => {
 
         if (to === "") return;
 
+        // ✅ FORMAT ATTENDU PAR LE CLIENT : "call-refused"
         envoyerAUtilisateur(to, { type: "call-refused", from: from, to: to });
         supprimerAppel(from, to);
         console.log(`CALL_REJECTED : ${from} -> ${to}`);
     }
 
     // ==================================================
-    // CALL ENDED
+    // TRAITER LA FIN D'APPEL (RACCROCHER)
     // ==================================================
     function traiterCallEnded(message) {
         const from = identifiant;
@@ -478,35 +386,27 @@ wss.on("connection", (ws) => {
 
         if (to === "") return;
 
+        // ✅ FORMAT ATTENDU PAR LE CLIENT : "hang-up"
         envoyerAUtilisateur(to, { type: "hang-up", from: from, to: to });
         supprimerAppel(from, to);
         console.log(`CALL_ENDED : ${from} -> ${to}`);
     }
 
     // ==================================================
-    // SIGNALISATION WEBRTC (ICE CANDIDATES / SDP)
+    // RELAIS SIGNALISATION (ICE CANDIDATES / SDP)
     // ==================================================
     function relayerSignalisation(message) {
         const from = identifiant;
         const to = String(message.to || "").trim();
 
-        if (to === "") {
-            console.log("Signalisation sans destinataire.");
-            return;
-        }
+        if (to === "" || appels.get(from) !== to) return;
 
-        if (appels.get(from) !== to) {
-            console.log(`Signalisation refusee : ${from} -> ${to}`);
-            return;
-        }
-
+        // ✅ FORMAT ATTENDU PAR LE CLIENT : "ice-candidate"
         const eventType = (message.type === "ICE_CANDIDATE") ? "ice-candidate" : message.type;
 
         const signal = {
             type: eventType,
             candidate: message.candidate,
-            offer: message.offer,
-            answer: message.answer,
             from: from,
             to: to
         };
@@ -516,19 +416,19 @@ wss.on("connection", (ws) => {
     }
 
     // ==================================================
-    // DECONNEXION
+    // GESTION DE LA DÉCONNEXION
     // ==================================================
     function gererDeconnexion(id) {
         const correspondant = appels.get(id);
 
         if (correspondant) {
+            // ✅ FORMAT ATTENDU PAR LE CLIENT : "hang-up"
             envoyerAUtilisateur(correspondant, {
                 type: "hang-up",
                 from: id,
                 to: correspondant,
                 reason: "disconnected"
             });
-
             supprimerAppel(id, correspondant);
         }
 
@@ -536,17 +436,17 @@ wss.on("connection", (ws) => {
             utilisateurs.delete(id);
         }
 
-        console.log(`UTILISATEUR SUPPRIME : ${id}`);
+        console.log(`UTILISATEUR SUPPRIMÉ : ${id}`);
     }
 });
 
 // ======================================================
-// HEARTBEAT SERVEUR (PING / PONG PERIODIQUE - 30 SECONDES)
+// HEARTBEAT SERVEUR (PING PÉRIODIQUE - 30 SECONDES)
 // ======================================================
 const intervalKeepAlive = setInterval(() => {
     wss.clients.forEach((ws) => {
         if (ws.isAlive === false) {
-            console.log("Connexion inactive terminee (timeout keep-alive)");
+            console.log("Connexion inactive fermée (timeout keep-alive)");
             return ws.terminate();
         }
         ws.isAlive = false;
@@ -558,9 +458,6 @@ wss.on("close", () => {
     clearInterval(intervalKeepAlive);
 });
 
-// ======================================================
-// GESTION ERREUR SERVEUR
-// ======================================================
 wss.on("error", (error) => {
     console.error("ERREUR SERVEUR WEBSOCKET :", error);
 });
