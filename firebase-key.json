@@ -1,0 +1,13 @@
+{
+  "type": "service_account",
+  "project_id": "appele-cabac",
+  "private_key_id": "8d8780f24cbfaba23827b5bf182b0ac2a4f6d213",
+  "private_key": "-----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDcVd1iY0U7RJQf\ncoeU77SpRQl4TgCcGJ65CaeC3r4L5hE/C9rBgyICjM8YsC2j5MURFfRFijh16u9J\nTZjfcqFMd9rfA6W3b1geLo3lQMINxtFngfb7OZqOfTs00Fu59/shMrymp6VxyCUt\n3G93X4df/tWYT1m5OlUt+/yJ8oIUMtJONASwleWtYC37qmuRaGrd/9w+h7grjIf7\n39SO8pi8fqkkbFY4EkHwUqhLayrJadNx0hf2B7wDGjN1kpvNIL4j1qLDr7a5rx16\nHpD0rNE8F6W3hCEvaudGLF1HtZAEuqXWohoFpt/KUNZBrmQdtAaVd84tjz1Mrkpw\nOJ+f3QkDAgMBAAECggEAHv+u65EJ2XfMMHcdih+wrCvmqYKtOp41c9UJjd5RSz1C\nvzr8u5hREvNv44pN3C7AZvykEZs2Vv4G96ovetMWzGUEabc1UQ8c4kosc8zeQFqb\ndX48cEXqGmfrX4J86ozFS9C75+UoNU+Ho4x4MN7uHdxYKAXp7/xmpYHmmsXVSoqa\nYQzoAI0ZSmc/IwWfGP62Od3oym/Yjjguz3IZk9NhOle0MaAV9jQ9Kre7cF+rXoWF\n+Y3ZzWvebkNt/PUvwFMd5jYGrwE/pzJTJIefUhOAybzFol/tgnXpa5rjV3rwh7Uy\n4910D+5ueTQqEog2Wen6pvhTfzTtFgi+ioUNpYidQQKBgQDzQ8uwe+peftbNchcT\n4GS+zjyGdobj+73PpyF/6IzbnFCqKRlPve2AUaIybuKo/J6m43cZk4cWkTatwSmi\np8WKmCaTpTfS0LBN3UQ/atDqSbPd+5LKJE8AijDfaKkHs7f42JgxAQGx5/VZxDCG\nJjgZ8oFgyHemDOyR2zhmelFY4wKBgQDn3sWgTi7Zr0HqChPQ26zt0fR6mNA0KuaB\nG6llOkOmxgeOBDXkn7aCxWCrY48v3Gjfhnv+/PBk5cE8MQXEyTV0IGXM9G81m/7B\nWtzSTRieO816vQ5k9hRTKOK1YZmh7OE/uiT5PZYSv+uwR6OCj8+JNmc0NAnlCaOD\n+qPpAFopYQKBgF5lhWnze8u1XncUeZ4N6iocb2IiJk/bhRlKGna+78HcU3TkQ90s\nrzem9dCqNKwscwgBplq3Y6k/Kj+cgCKNBdu1FOsgJpxYvMFKRkxxj6YKeZB/KcPk\n+P8VoMdgno7Nj2sx6UTCxjyZ7RwrREUaGZUABHJg+AToaPhkX+tsNZrPAoGBAKW+\nsaggmw7SX5yrrXSLwzaQ8WC9YX8Y94Jswo7wsjFBt17GFbwiirU54BtDZLRCqti1\namdgaXrGXXXoWQZNCh/DlOGIDQLWSqnuiJDvuVxKxVwqTmLPIMI9JKmhZc/A41bJ\neeqMIn2uoQx2eSQ4JpMfx3AijrwhQrhx7r78mHahAoGBAJfaNZvnAZwbQ+k9tTDW\nQ9B+JQcHwKxbnkwlIHwoRo/u27NXQihq5FzSoUttOXpt58lFr8E3O+2+voiGNPPH\n79K+Alw6aJqxbPq4ntLnHz5NHSv9rsC1jAg+0jrVL/dAK8ffhJlL1O/zV0x+IrNf\n0piXyJS6RfbL0ktgKi/+2L67\n-----END PRIVATE KEY-----\n",
+  "client_email": "firebase-adminsdk-fbsvc@appele-cabac.iam.gserviceaccount.com",
+  "client_id": "116883576248647582814",
+  "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+  "token_uri": "https://oauth2.googleapis.com/token",
+  "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+  "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/firebase-adminsdk-fbsvc%40appele-cabac.iam.gserviceaccount.com",
+  "universe_domain": "googleapis.com"
+}
