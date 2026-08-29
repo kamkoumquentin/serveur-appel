@@ -1,61 +1,155 @@
 const http = require("http");
 const WebSocket = require("ws");
 
-// Port dynamique pour Render
+// MODIFICATION RENDER : Utilisation du port dynamique
 const PORT = process.env.PORT || 8080;
 
 // ======================================================
-// SERVEUR HTTP (Pour le réveil Render & Health Check)
+// TOKENS & SESSIONS EN MEMOIRE
 // ======================================================
-const server = http.createServer((req, res) => {
-    // Répondre 200 OK aux requêtes HTTP de réveil du client
-    res.writeHead(200, {
-        "Content-Type": "application/json",
-        "Access-Control-Allow-Origin": "*"
-    });
-    res.end(JSON.stringify({ status: "ok", message: "Serveur d'appel opérationnel" }));
-});
+const fcmTokens = new Map();
+const utilisateurs = new Map();
+const appels = new Map();
+const pendingOffers = new Map();
 
 // ======================================================
-// SERVEUR WEBSOCKET ATTACHÉ AU SERVEUR HTTP
-// ======================================================
-const wss = new WebSocket.Server({ server });
-
-// ======================================================
-// INITIALISATION FIREBASE ADMIN
+// INITIALISATION FIREBASE notification firebase
 // ======================================================
 const { initializeApp, cert } = require("firebase-admin/app");
 const { getMessaging } = require("firebase-admin/messaging");
 let messaging = null;
 
 try {
-    const serviceAccount = require("./firebase-key.json");
-    initializeApp({
-        credential: cert(serviceAccount)
-    });
-    messaging = getMessaging();
-    console.log("🔥 Firebase Admin initialisé avec succès.");
+    let serviceAccount = null;
+
+    if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+        try {
+            serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+            console.log("🔑 Cle Firebase chargee depuis la variable d'environnement FIREBASE_SERVICE_ACCOUNT");
+        } catch (e) {
+            console.error("❌ Erreur parsing FIREBASE_SERVICE_ACCOUNT JSON :", e.message);
+        }
+    } else if (process.env.FIREBASE_KEY) {
+        try {
+            serviceAccount = JSON.parse(process.env.FIREBASE_KEY);
+            console.log("🔑 Cle Firebase chargee depuis la variable d'environnement FIREBASE_KEY");
+        } catch (e) {
+            console.error("❌ Erreur parsing FIREBASE_KEY JSON :", e.message);
+        }
+    }
+
+    if (!serviceAccount) {
+        try {
+            serviceAccount = require("./firebase-key.json");
+            console.log("🔑 Cle Firebase chargee depuis firebase-key.json local");
+        } catch (e) {
+            console.warn("⚠️ Fichier firebase-key.json introuvable :", e.message);
+        }
+    }
+
+    if (serviceAccount) {
+        initializeApp({
+            credential: cert(serviceAccount)
+        });
+        messaging = getMessaging();
+        console.log("🔥 Firebase Admin initialise avec succes !");
+    } else {
+        console.error("⚠️ AUCUNE cle de service Firebase trouvee (ni fichier, ni variable d'environnement). Les notifications push FCM seront desactivees.");
+    }
 } catch (err) {
     console.error("⚠️ Impossible d'initialiser Firebase Admin :", err.message);
 }
 
 // ======================================================
-// ÉTATS EN MÉMOIRE
+// SERVEUR HTTP (Pour le reveil Render, Diagnostic & Health Check)
 // ======================================================
-const fcmTokens = new Map();      // ID -> Token FCM
-const utilisateurs = new Map();   // ID -> WebSocket
-const appels = new Map();         // ID -> ID Correspondant
-const pendingOffers = new Map();  // ID -> { from, offer }
+const server = http.createServer(async (req, res) => {
+    res.writeHead(200, {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*"
+    });
 
-// ======================================================
-// DÉMARRAGE
-// ======================================================
-server.listen(PORT, "0.0.0.0", () => {
-    console.log(`🚀 Serveur HTTP & WebSocket démarré sur le port ${PORT}`);
+    const parsedUrl = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+
+    // Endpoint de diagnostic
+    if (parsedUrl.pathname === "/status" || parsedUrl.pathname === "/") {
+        const tokensList = {};
+        fcmTokens.forEach((token, id) => {
+            tokensList[id] = token ? `${token.substring(0, 15)}...` : null;
+        });
+
+        return res.end(JSON.stringify({
+            status: "ok",
+            message: "Serveur d'appel operationnel",
+            firebaseAdminReady: messaging !== null,
+            connectedUsers: Array.from(utilisateurs.keys()),
+            registeredFcmTokensCount: fcmTokens.size,
+            registeredFcmTokens: tokensList
+        }, null, 2));
+    }
+
+    // Endpoint de test push FCM direct : /test-push?to=ID-123456
+    if (parsedUrl.pathname === "/test-push") {
+        const targetId = parsedUrl.searchParams.get("to");
+        if (!targetId) {
+            return res.end(JSON.stringify({ error: "Parametre 'to' manquant. Exemple: /test-push?to=ID-123456" }));
+        }
+
+        const token = fcmTokens.get(targetId);
+        if (!token) {
+            return res.end(JSON.stringify({ error: `Aucun token FCM enregistre pour l'ID ${targetId}` }));
+        }
+
+        if (!messaging) {
+            return res.end(JSON.stringify({ error: "Firebase Admin n'est pas initialise sur le serveur." }));
+        }
+
+        try {
+            const testPayload = {
+                token: token,
+                notification: {
+                    title: "Test de Notification",
+                    body: "Ceci est un test de notification push reussi !"
+                },
+                data: {
+                    type: "TEST",
+                    time: new Date().toISOString()
+                },
+                android: {
+                    priority: "high",
+                    notification: {
+                        channelId: "default",
+                        sound: "default",
+                        priority: "max",
+                        visibility: "public"
+                    }
+                }
+            };
+
+            const response = await messaging.send(testPayload);
+            return res.end(JSON.stringify({ success: true, messageId: response }));
+        } catch (pushErr) {
+            return res.end(JSON.stringify({ success: false, error: pushErr.message }));
+        }
+    }
+
+    res.end(JSON.stringify({ status: "ok" }));
 });
 
 // ======================================================
-// UTILITAIRES
+// SERVEUR WEBSOCKET
+// ======================================================
+const wss = new WebSocket.Server({ server });
+
+// ======================================================
+// DEMARRAGE DU SERVEUR
+// ======================================================
+server.listen(PORT, "0.0.0.0", () => {
+    console.log(`🚀 Serveur WebSocket & HTTP demarre sur le port ${PORT}`);
+});
+
+// ======================================================
+// UTILITAIRE : ENVOYER UN MESSAGE WEBSOCKET
 // ======================================================
 function envoyer(ws, message) {
     if (ws && ws.readyState === WebSocket.OPEN) {
@@ -63,16 +157,22 @@ function envoyer(ws, message) {
     }
 }
 
+// ======================================================
+// UTILITAIRE : ENVOYER A UN UTILISATEUR
+// ======================================================
 function envoyerAUtilisateur(identifiant, message) {
     const ws = utilisateurs.get(identifiant);
     if (!ws) {
-        console.log(`Utilisateur introuvable : ${identifiant}`);
+        console.log(`Utilisateur non connecte en WS : ${identifiant}`);
         return false;
     }
     envoyer(ws, message);
     return true;
 }
 
+// ======================================================
+// UTILITAIRES D'ETAT
+// ======================================================
 function utilisateurExiste(identifiant) {
     return utilisateurs.has(identifiant);
 }
@@ -84,7 +184,7 @@ function utilisateurOccupe(identifiant) {
 function creerAppel(utilisateurA, utilisateurB) {
     appels.set(utilisateurA, utilisateurB);
     appels.set(utilisateurB, utilisateurA);
-    console.log(`📞 APPEL CRÉÉ : ${utilisateurA} <--> ${utilisateurB}`);
+    console.log(`📞 APPEL CREE : ${utilisateurA} <--> ${utilisateurB}`);
 }
 
 function supprimerAppel(utilisateurA, utilisateurB) {
@@ -96,14 +196,14 @@ function supprimerAppel(utilisateurA, utilisateurB) {
         appels.delete(utilisateurB);
         pendingOffers.delete(utilisateurB);
     }
-    console.log(`📴 APPEL TERMINÉ : ${utilisateurA} <--> ${utilisateurB}`);
+    console.log(`📴 APPEL TERMINE : ${utilisateurA} <--> ${utilisateurB}`);
 }
 
 // ======================================================
-// GESTION DES CONNEXIONS WEBSOCKET
+// CONNEXION CLIENT WEBSOCKET
 // ======================================================
 wss.on("connection", (ws) => {
-    console.log("Nouveau client connecté.");
+    console.log("Nouveau client connecte.");
     let identifiant = null;
 
     ws.isAlive = true;
@@ -114,7 +214,7 @@ wss.on("connection", (ws) => {
     ws.on("message", (data) => {
         try {
             const message = JSON.parse(data.toString());
-            console.log("\nMESSAGE REÇU :", message);
+            console.log("\nMESSAGE RECU :", message);
             traiterMessage(ws, message);
         } catch (error) {
             console.error("Message JSON invalide :", error);
@@ -126,7 +226,7 @@ wss.on("connection", (ws) => {
     });
 
     ws.on("close", () => {
-        console.log(`Client déconnecté : ${identifiant || "inconnu"}`);
+        console.log(`Client deconnecte : ${identifiant || "inconnu"}`);
         if (identifiant) {
             gererDeconnexion(identifiant);
         }
@@ -140,10 +240,9 @@ wss.on("connection", (ws) => {
     // TRAITEMENT DES MESSAGES
     // ==================================================
     function traiterMessage(wsClient, message) {
-        // Normalisation de la cible
         if (message.targetId) message.to = message.targetId;
 
-        // Normalisation des types de messages entrants
+        // Normalisation
         if (message.type === "call-user") message.type = "CALLING";
         if (message.type === "answer-call") message.type = "CALL_ACCEPTED";
         if (message.type === "ice-candidate") message.type = "ICE_CANDIDATE";
@@ -152,24 +251,21 @@ wss.on("connection", (ws) => {
 
         const type = message.type;
 
-        // PING / PONG applicatif
         if (type === "PING" || type === "ping") {
-            wsClient.isAlive = true;
+            ws.isAlive = true;
             envoyer(wsClient, { type: "PONG" });
             return;
         }
 
-        // REGISTER
-        if (type === "REGISTER") {
+        if (type === "REGISTER" || type === "UPDATE_TOKEN") {
             enregistrerUtilisateur(wsClient, message);
             return;
         }
 
-        // Vérification de connexion préalable
         if (!identifiant) {
             envoyer(wsClient, {
                 type: "ERROR",
-                message: "Vous devez être enregistré avant d'envoyer des messages."
+                message: "Vous devez etre enregistre avant d'envoyer des messages."
             });
             return;
         }
@@ -189,10 +285,10 @@ wss.on("connection", (ws) => {
     }
 
     // ==================================================
-    // ENREGISTREMENT DE L'UTILISATEUR
+    // ENREGISTRER UTILISATEUR ET TOKEN FCM
     // ==================================================
     function enregistrerUtilisateur(wsClient, message) {
-        const nouvelIdentifiant = String(message.id || "").trim();
+        const nouvelIdentifiant = String(message.id || message.userId || "").trim();
 
         if (nouvelIdentifiant === "") {
             envoyer(wsClient, {
@@ -202,9 +298,7 @@ wss.on("connection", (ws) => {
             return;
         }
 
-        // Nettoyage de l'ancienne session si existante
         if (utilisateurs.has(nouvelIdentifiant)) {
-            console.log(`Reconnexion : nettoyage de l'ancienne session pour ${nouvelIdentifiant}`);
             const ancienneWs = utilisateurs.get(nouvelIdentifiant);
             if (ancienneWs && ancienneWs !== wsClient) {
                 try { ancienneWs.close(); } catch (e) {}
@@ -214,23 +308,28 @@ wss.on("connection", (ws) => {
         identifiant = nouvelIdentifiant;
         utilisateurs.set(identifiant, wsClient);
 
+        // Sauvegarde du token FCM
         if (message.fcmToken) {
             fcmTokens.set(identifiant, message.fcmToken);
+            console.log(`📲 TOKEN FCM ENREGISTRE pour ${identifiant} : ${message.fcmToken.substring(0, 20)}...`);
+        } else if (fcmTokens.has(identifiant)) {
+            console.log(`📲 Token FCM deja conserve en memoire pour ${identifiant}`);
+        } else {
+            console.log(`⚠️ Aucun token FCM fourni lors du REGISTER pour ${identifiant}`);
         }
 
-        console.log(`UTILISATEUR ENREGISTRÉ : ${identifiant}`);
+        console.log(`✅ UTILISATEUR ENREGISTRE : ${identifiant}`);
 
         envoyer(wsClient, {
             type: "REGISTERED",
             id: identifiant
         });
 
-        // Transmission de l'offre en attente (si réveil Push)
+        // Envoi d'une offre en attente suite a un reveil Push
         if (pendingOffers.has(identifiant)) {
             const pending = pendingOffers.get(identifiant);
             if (appels.get(identifiant) === pending.from) {
-                console.log(`Transmission de l'offre en attente à ${identifiant} de la part de ${pending.from}`);
-                // ✅ FORMAT ATTENDU PAR LE CLIENT : "incoming-call"
+                console.log(`📦 Transmission de l'offre en attente a ${identifiant} de la part de ${pending.from}`);
                 envoyer(wsClient, {
                     type: "incoming-call",
                     from: pending.from,
@@ -242,7 +341,7 @@ wss.on("connection", (ws) => {
     }
 
     // ==================================================
-    // TRAITER L'APPEL (OFFRE)
+    // TRAITER L'APPEL
     // ==================================================
     function traiterCalling(message) {
         const from = identifiant;
@@ -254,7 +353,7 @@ wss.on("connection", (ws) => {
         }
 
         if (from === to) {
-            envoyer(ws, { type: "ERROR", message: "Vous ne pouvez pas vous appeler vous-même." });
+            envoyer(ws, { type: "ERROR", message: "Vous ne pouvez pas vous appeler vous-meme." });
             return;
         }
 
@@ -262,18 +361,19 @@ wss.on("connection", (ws) => {
         const tokenDestinataire = fcmTokens.get(to);
 
         if (!destinataireEnLigne && !tokenDestinataire) {
+            console.log(`❌ Echec appel : ${to} n'est ni connecte en direct ni joignable via Push FCM.`);
             envoyer(ws, { type: "ERROR", message: "Le correspondant est hors ligne ou introuvable." });
             return;
         }
 
         if (utilisateurOccupe(from)) {
-            envoyer(ws, { type: "BUSY", from: to, message: "Vous êtes déjà en appel." });
+            envoyer(ws, { type: "BUSY", from: to, message: "Vous etes deja en appel." });
             return;
         }
 
         if (utilisateurOccupe(to)) {
-            envoyer(ws, { type: "BUSY", from: to, to: from, message: "Le correspondant est occupé." });
-            console.log(`APPEL REFUSÉ : ${to} est occupé.`);
+            envoyer(ws, { type: "BUSY", from: to, to: from, message: "Le correspondant est occupe." });
+            console.log(`APPEL REFUSE : ${to} est occupe.`);
             return;
         }
 
@@ -285,9 +385,8 @@ wss.on("connection", (ws) => {
 
         let transmisWs = false;
 
-        // 1. Envoi direct par WebSocket
+        // 1. Envoi direct via WebSocket si connecte
         if (destinataireEnLigne) {
-            // ✅ FORMAT ATTENDU PAR LE CLIENT : "incoming-call"
             transmisWs = envoyerAUtilisateur(to, {
                 type: "incoming-call",
                 from: from,
@@ -296,8 +395,9 @@ wss.on("connection", (ws) => {
             });
         }
 
-        // 2. Envoi par Push FCM en arrière-plan
+        // 2. Envoi via Push Firebase FCM
         let pushTente = false;
+
         if (tokenDestinataire && messaging) {
             pushTente = true;
             const payload = {
@@ -308,23 +408,44 @@ wss.on("connection", (ws) => {
                 },
                 data: {
                     type: "APPEL",
-                    appelant: from,
+                    appelant: String(from),
                     offer: message.offer ? JSON.stringify(message.offer) : ""
                 },
                 android: {
-                    priority: "high"
+                    priority: "high",
+                    notification: {
+                        channelId: "default",
+                        sound: "default",
+                        priority: "max",
+                        visibility: "public"
+                    }
+                },
+                apns: {
+                    payload: {
+                        aps: {
+                            sound: "default",
+                            contentAvailable: true
+                        }
+                    }
                 }
             };
 
+            console.log(`📡 Envoi de la notification Push FCM vers ${to}...`);
+
             messaging.send(payload)
-                .then(response => console.log("Push FCM envoyé avec succès :", response))
+                .then(response => console.log(`✅ Push FCM envoye avec succes a ${to} :`, response))
                 .catch(error => {
-                    console.error("Erreur Push FCM :", error);
-                    if (error.code === "messaging/registration-token-not-registered" ||
+                    console.error(`❌ Erreur envoi Push FCM a ${to} :`, error.message);
+                    if (error.code === "messaging/registration-token-not-registered" || 
                         error.code === "messaging/invalid-registration-token") {
+                        console.log(`🗑️ Suppression du token perime pour ${to}`);
                         fcmTokens.delete(to);
                     }
                 });
+        } else if (!tokenDestinataire) {
+            console.log(`⚠️ Aucun token FCM enregistre pour ${to}.`);
+        } else if (!messaging) {
+            console.error("⚠️ Firebase Messaging n'est pas configure sur le serveur.");
         }
 
         if (!transmisWs && !pushTente) {
@@ -336,11 +457,11 @@ wss.on("connection", (ws) => {
             return;
         }
 
-        console.log(`CALLING traité : ${from} -> ${to} (WS direct: ${transmisWs}, Push: ${pushTente})`);
+        console.log(`CALLING traite : ${from} -> ${to} (WS direct: ${transmisWs}, Push FCM: ${pushTente})`);
     }
 
     // ==================================================
-    // TRAITER L'ACCEPTATION (RÉPONSE)
+    // TRAITER CALL ACCEPTED
     // ==================================================
     function traiterCallAccepted(message) {
         const from = identifiant;
@@ -351,7 +472,6 @@ wss.on("connection", (ws) => {
         pendingOffers.delete(from);
         pendingOffers.delete(to);
 
-        // ✅ FORMAT ATTENDU PAR LE CLIENT : "call-answered"
         envoyerAUtilisateur(to, {
             type: "call-answered",
             from: from,
@@ -363,7 +483,7 @@ wss.on("connection", (ws) => {
     }
 
     // ==================================================
-    // TRAITER LE REFUS
+    // TRAITER CALL REJECTED
     // ==================================================
     function traiterCallRejected(message) {
         const from = identifiant;
@@ -371,14 +491,13 @@ wss.on("connection", (ws) => {
 
         if (to === "") return;
 
-        // ✅ FORMAT ATTENDU PAR LE CLIENT : "call-refused"
         envoyerAUtilisateur(to, { type: "call-refused", from: from, to: to });
         supprimerAppel(from, to);
         console.log(`CALL_REJECTED : ${from} -> ${to}`);
     }
 
     // ==================================================
-    // TRAITER LA FIN D'APPEL (RACCROCHER)
+    // TRAITER CALL ENDED
     // ==================================================
     function traiterCallEnded(message) {
         const from = identifiant;
@@ -386,14 +505,13 @@ wss.on("connection", (ws) => {
 
         if (to === "") return;
 
-        // ✅ FORMAT ATTENDU PAR LE CLIENT : "hang-up"
         envoyerAUtilisateur(to, { type: "hang-up", from: from, to: to });
         supprimerAppel(from, to);
         console.log(`CALL_ENDED : ${from} -> ${to}`);
     }
 
     // ==================================================
-    // RELAIS SIGNALISATION (ICE CANDIDATES / SDP)
+    // SIGNALISATION WEBRTC
     // ==================================================
     function relayerSignalisation(message) {
         const from = identifiant;
@@ -401,12 +519,13 @@ wss.on("connection", (ws) => {
 
         if (to === "" || appels.get(from) !== to) return;
 
-        // ✅ FORMAT ATTENDU PAR LE CLIENT : "ice-candidate"
         const eventType = (message.type === "ICE_CANDIDATE") ? "ice-candidate" : message.type;
 
         const signal = {
             type: eventType,
             candidate: message.candidate,
+            offer: message.offer,
+            answer: message.answer,
             from: from,
             to: to
         };
@@ -416,19 +535,19 @@ wss.on("connection", (ws) => {
     }
 
     // ==================================================
-    // GESTION DE LA DÉCONNEXION
+    // GESTION DECONNEXION
     // ==================================================
     function gererDeconnexion(id) {
         const correspondant = appels.get(id);
 
         if (correspondant) {
-            // ✅ FORMAT ATTENDU PAR LE CLIENT : "hang-up"
             envoyerAUtilisateur(correspondant, {
                 type: "hang-up",
                 from: id,
                 to: correspondant,
                 reason: "disconnected"
             });
+
             supprimerAppel(id, correspondant);
         }
 
@@ -436,17 +555,17 @@ wss.on("connection", (ws) => {
             utilisateurs.delete(id);
         }
 
-        console.log(`UTILISATEUR SUPPRIMÉ : ${id}`);
+        console.log(`UTILISATEUR DECONNECTE : ${id}`);
     }
 });
 
 // ======================================================
-// HEARTBEAT SERVEUR (PING PÉRIODIQUE - 30 SECONDES)
+// HEARTBEAT KEEP-ALIVE (30s)
 // ======================================================
 const intervalKeepAlive = setInterval(() => {
     wss.clients.forEach((ws) => {
         if (ws.isAlive === false) {
-            console.log("Connexion inactive fermée (timeout keep-alive)");
+            console.log("Connexion inactive terminee (timeout keep-alive)");
             return ws.terminate();
         }
         ws.isAlive = false;
