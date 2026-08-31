@@ -442,13 +442,16 @@ wss.on("connection", (ws) => {
                     appelant: String(from),
                     title: `${from}`,
                     message: "Appel vocal entrant",
+                    color: "#00A884",
                     actions: JSON.stringify([
                         {
+                            icon: "phone_hangup",
                             title: "Refuser",
                             callback: "rejectCallAction",
                             foreground: false
                         },
                         {
+                            icon: "phone",
                             title: "Répondre",
                             callback: "acceptCallAction",
                             foreground: true
