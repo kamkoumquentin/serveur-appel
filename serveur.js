@@ -440,19 +440,22 @@ wss.on("connection", (ws) => {
                 data: {
                     type: "APPEL",
                     appelant: String(from),
-                    title: `${from}`,
-                    message: "Appel vocal entrant",
+                    title: `📞 Appel entrant : ${from}`,
+                    message: "Appel audio entrant • Appuyez pour répondre",
+                    subText: "CallApp Vocal",
                     color: "#00A884",
+                    icon: "icon",
+                    smallIcon: "icon",
                     actions: JSON.stringify([
                         {
                             icon: "phone_hangup",
-                            title: "Refuser",
+                            title: "🔴 Refuser",
                             callback: "rejectCallAction",
                             foreground: false
                         },
                         {
                             icon: "phone",
-                            title: "Répondre",
+                            title: "🟢 Répondre",
                             callback: "acceptCallAction",
                             foreground: true
                         }
@@ -465,15 +468,30 @@ wss.on("connection", (ws) => {
                     sound: "default",
                     vibrate: "true",
                     category: "call",
-                    "content-available": "1",
-                    "force-start": "1"
+                    "content-available": "1"
                 },
                 android: {
-                    priority: "high"
+                    priority: "high",
+                    notification: {
+                        channelId: "calls_channel",
+                        title: `📞 Appel entrant : ${from}`,
+                        body: "Appel audio entrant • Appuyez pour répondre",
+                        color: "#00A884",
+                        sound: "default",
+                        priority: "max",
+                        visibility: "public",
+                        tag: "incoming_call",
+                        defaultSound: true,
+                        defaultVibrateTimings: true
+                    }
                 },
                 apns: {
                     payload: {
                         aps: {
+                            alert: {
+                                title: `📞 Appel entrant : ${from}`,
+                                body: "Appel audio entrant..."
+                            },
                             sound: "default",
                             contentAvailable: true
                         }
@@ -481,7 +499,7 @@ wss.on("connection", (ws) => {
                 }
             };
 
-            console.log(`📡 Envoi de la notification d'appel avec boutons [Refuser] / [Répondre] vers ${to}...`);
+            console.log(`📡 Envoi de la notification d'appel stylisée vers ${to}...`);
 
             messaging.send(payload)
                 .then(response => console.log(`✅ Push FCM envoye avec succes a ${to} :`, response))
