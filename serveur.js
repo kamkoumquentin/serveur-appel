@@ -129,12 +129,16 @@ const server = http.createServer(async (req, res) => {
                 },
                 data: {
                     type: "TEST",
-                    time: new Date().toISOString()
+                    time: new Date().toISOString(),
+                    android_channel_id: "calls_channel",
+                    channelId: "calls_channel",
+                    priority: "2",
+                    visibility: "1"
                 },
                 android: {
                     priority: "high",
                     notification: {
-                        channelId: "default",
+                        channelId: "calls_channel",
                         sound: "default",
                         priority: "max",
                         visibility: "public"
@@ -450,7 +454,15 @@ wss.on("connection", (ws) => {
                             foreground: true
                         }
                     ]),
-                    channelId: "default"
+                    android_channel_id: "calls_channel",
+                    channelId: "calls_channel",
+                    priority: "2",
+                    visibility: "1",
+                    importance: "4",
+                    sound: "default",
+                    vibrate: "true",
+                    "content-available": "1",
+                    "force-start": "1"
                 },
                 android: {
                     priority: "high"
