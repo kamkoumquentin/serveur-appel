@@ -19,42 +19,61 @@ const { initializeApp, cert } = require("firebase-admin/app");
 const { getMessaging } = require("firebase-admin/messaging");
 let messaging = null;
 
-
 try {
-    if (!process.env.FIREBASE_SERVICE_ACCOUNT) {
-        throw new Error(
-            "La variable FIREBASE_SERVICE_ACCOUNT n'est pas configurée sur Render."
-        );
+    let serviceAccount = null;
+
+    if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+        try {
+            serviceAccount = typeof process.env.FIREBASE_SERVICE_ACCOUNT === "string"
+                ? JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
+                : process.env.FIREBASE_SERVICE_ACCOUNT;
+            console.log("🔑 Clé Firebase chargée depuis FIREBASE_SERVICE_ACCOUNT");
+        } catch (e) {
+            console.error("❌ Erreur parsing FIREBASE_SERVICE_ACCOUNT JSON :", e.message);
+        }
+    } else if (process.env.FIREBASE_KEY) {
+        try {
+            serviceAccount = typeof process.env.FIREBASE_KEY === "string"
+                ? JSON.parse(process.env.FIREBASE_KEY)
+                : process.env.FIREBASE_KEY;
+            console.log("🔑 Clé Firebase chargée depuis FIREBASE_KEY");
+        } catch (e) {
+            console.error("❌ Erreur parsing FIREBASE_KEY JSON :", e.message);
+        }
     }
 
-    const serviceAccount = JSON.parse(
-        process.env.FIREBASE_SERVICE_ACCOUNT
-    );
-
-    // Important pour Render :
-    // transforme les \n stockés dans la variable en vrais retours à la ligne
-    if (
-        serviceAccount.private_key &&
-        typeof serviceAccount.private_key === "string"
-    ) {
-        serviceAccount.private_key =
-            serviceAccount.private_key.replace(/\\n/g, "\n");
+    if (!serviceAccount) {
+        try {
+            serviceAccount = require("./firebase-key.json");
+            console.log("🔑 Clé Firebase chargée depuis firebase-key.json local");
+        } catch (e) {
+            try {
+                serviceAccount = require("/etc/secrets/firebase-key.json");
+                console.log("🔑 Clé Firebase chargée depuis /etc/secrets/firebase-key.json");
+            } catch (e2) {
+                console.warn("⚠️ Fichier firebase-key.json introuvable :", e.message);
+            }
+        }
     }
 
-    initializeApp({
-        credential: cert(serviceAccount)
-    });
+    if (serviceAccount) {
+        // Important pour Render : transforme les \n échappés en vrais retours à la ligne
+        if (serviceAccount.private_key && typeof serviceAccount.private_key === "string") {
+            serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, "\n");
+        }
 
-    messaging = getMessaging();
+        initializeApp({
+            credential: cert(serviceAccount)
+        });
 
-    console.log("✅ Firebase Admin initialisé avec succès !");
-    console.log("🔥 Projet Firebase :", serviceAccount.project_id);
-
+        messaging = getMessaging();
+        console.log("✅ Firebase Admin initialisé avec succès !");
+        console.log("🔥 Projet Firebase :", serviceAccount.project_id);
+    } else {
+        console.warn("⚠️ Aucune clé de service Firebase trouvée. Les notifications push FCM seront désactivées.");
+    }
 } catch (err) {
-    console.error(
-        "❌ Impossible d'initialiser Firebase Admin :",
-        err.message
-    );
+    console.error("❌ Impossible d'initialiser Firebase Admin :", err.message);
 }
 
 // ======================================================
@@ -224,8 +243,11 @@ wss.on("connection", (ws) => {
 
     ws.on("close", () => {
         console.log(`Client deconnecte : ${identifiant || "inconnu"}`);
-        if (identifiant) {
-            gererDeconnexion(identifiant);
+        // ⚠️ CORRECTION CRITIQUE 1 :
+        // Si cette socket a été remplacée par une nouvelle socket active (isReplaced = true),
+        // NE PAS exécuter gererDeconnexion pour ne pas raccrocher l'appel !
+        if (identifiant && !ws.isReplaced) {
+            gererDeconnexion(identifiant, ws);
         }
     });
 
@@ -295,9 +317,14 @@ wss.on("connection", (ws) => {
             return;
         }
 
+        // ⚠️ CORRECTION CRITIQUE 2 :
+        // Marquer l'ancienne socket avec isReplaced = true AVANT de la fermer
+        // afin d'empêcher son gestionnaire on("close") d'annuler l'appel en cours
         if (utilisateurs.has(nouvelIdentifiant)) {
             const ancienneWs = utilisateurs.get(nouvelIdentifiant);
             if (ancienneWs && ancienneWs !== wsClient) {
+                console.log(`🔄 Remplacement de l'ancienne socket pour ${nouvelIdentifiant}`);
+                ancienneWs.isReplaced = true;
                 try { ancienneWs.close(); } catch (e) {}
             }
         }
@@ -322,17 +349,24 @@ wss.on("connection", (ws) => {
             id: identifiant
         });
 
-        // Envoi d'une offre en attente suite a un reveil Push
+        // ⚠️ CORRECTION CRITIQUE 3 :
+        // Envoi immédiat et fiable de l'offre en attente lors de la reconnexion / réveil push
         if (pendingOffers.has(identifiant)) {
             const pending = pendingOffers.get(identifiant);
-            if (appels.get(identifiant) === pending.from) {
-                console.log(`📦 Transmission de l'offre en attente a ${identifiant} de la part de ${pending.from}`);
-                envoyer(wsClient, {
-                    type: "incoming-call",
-                    from: pending.from,
-                    to: identifiant,
-                    offer: pending.offer
-                });
+            if (pending && pending.from) {
+                if (utilisateurExiste(pending.from) && appels.get(pending.from) === identifiant) {
+                    console.log(`📦 Transmission de l'offre en attente a ${identifiant} de la part de ${pending.from}`);
+                    envoyer(wsClient, {
+                        type: "incoming-call",
+                        from: pending.from,
+                        to: identifiant,
+                        offer: pending.offer
+                    });
+                } else {
+                    console.log(`⚠️ Offre en attente expiree pour ${identifiant} (l'appelant ${pending.from} a quitte)`);
+                    pendingOffers.delete(identifiant);
+                    appels.delete(identifiant);
+                }
             }
         }
     }
@@ -454,6 +488,21 @@ wss.on("connection", (ws) => {
             return;
         }
 
+        // Timeout de sécurité : si le destinataire ne répond pas après 60 secondes
+        setTimeout(() => {
+            if (pendingOffers.has(to) && pendingOffers.get(to).from === from) {
+                console.log(`⏰ Délai d'attente dépassé (60s) pour l'appel ${from} -> ${to}`);
+                pendingOffers.delete(to);
+                supprimerAppel(from, to);
+                envoyerAUtilisateur(from, {
+                    type: "hang-up",
+                    from: to,
+                    to: from,
+                    reason: "timeout"
+                });
+            }
+        }, 60000);
+
         console.log(`CALLING traite : ${from} -> ${to} (WS direct: ${transmisWs}, Push FCM: ${pushTente})`);
     }
 
@@ -534,10 +583,30 @@ wss.on("connection", (ws) => {
     // ==================================================
     // GESTION DECONNEXION
     // ==================================================
-    function gererDeconnexion(id) {
+    function gererDeconnexion(id, wsOrigine) {
+        // ⚠️ CORRECTION CRITIQUE 4 :
+        // 1. Si l'utilisateur est enregistré avec une AUTRE socket active plus récente, on ne touche à rien
+        if (utilisateurs.get(id) && utilisateurs.get(id) !== wsOrigine) {
+            console.log(`ℹ️ Fermeture d'une socket obsolète pour ${id}, session active préservée.`);
+            return;
+        }
+
+        // 2. Nettoyer la map utilisateurs si c'est bien la socket active qui a fermé
+        if (utilisateurs.get(id) === wsOrigine) {
+            utilisateurs.delete(id);
+        }
+
         const correspondant = appels.get(id);
 
         if (correspondant) {
+            // ⚠️ CORRECTION CRITIQUE 5 :
+            // Si un appel est en attente (sonnerie / réveil push) et que l'utilisateur déconnecté est le destinataire,
+            // on ne détruit PAS l'appel : le destinataire est probablement en train d'ouvrir l'application via le push !
+            if (pendingOffers.has(id)) {
+                console.log(`⏳ Destinataire ${id} déconnecté temporairement pendant la sonnerie/push. Appel maintenu.`);
+                return;
+            }
+
             envoyerAUtilisateur(correspondant, {
                 type: "hang-up",
                 from: id,
@@ -548,11 +617,7 @@ wss.on("connection", (ws) => {
             supprimerAppel(id, correspondant);
         }
 
-        if (utilisateurs.get(id) === ws) {
-            utilisateurs.delete(id);
-        }
-
-        console.log(`UTILISATEUR DECONNECTE : ${id}`);
+        console.log(`❌ UTILISATEUR DECONNECTE : ${id}`);
     }
 });
 
