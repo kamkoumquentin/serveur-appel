@@ -293,7 +293,7 @@ wss.on("connection", (ws) => {
         if (type === "CALL_ACCEPTED") return traiterCallAccepted(message);
         if (type === "CALL_REJECTED") return traiterCallRejected(message);
         if (type === "CALL_ENDED") return traiterCallEnded(message);
-        if (type === "ICE_CANDIDATE" || type === "WEBRTC_OFFER" || type === "WEBRTC_ANSWER") {
+        if (type === "ICE_CANDIDATE" || type === "WEBRTC_OFFER" || type === "WEBRTC_ANSWER" || type === "renegotiate-offer" || type === "renegotiate-answer") {
             return relayerSignalisation(message);
         }
 
