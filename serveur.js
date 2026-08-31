@@ -19,20 +19,25 @@ const { initializeApp, cert } = require("firebase-admin/app");
 const { getMessaging } = require("firebase-admin/messaging");
 let messaging = null;
 
+
 try {
     let serviceAccount = null;
 
     if (process.env.FIREBASE_SERVICE_ACCOUNT) {
         try {
-            serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-            console.log("🔑 Cle Firebase chargee depuis la variable d'environnement FIREBASE_SERVICE_ACCOUNT");
+            serviceAccount = typeof process.env.FIREBASE_SERVICE_ACCOUNT === "string"
+                ? JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
+                : process.env.FIREBASE_SERVICE_ACCOUNT;
+            console.log("🔑 Clé Firebase chargée depuis FIREBASE_SERVICE_ACCOUNT");
         } catch (e) {
             console.error("❌ Erreur parsing FIREBASE_SERVICE_ACCOUNT JSON :", e.message);
         }
     } else if (process.env.FIREBASE_KEY) {
         try {
-            serviceAccount = JSON.parse(process.env.FIREBASE_KEY);
-            console.log("🔑 Cle Firebase chargee depuis la variable d'environnement FIREBASE_KEY");
+            serviceAccount = typeof process.env.FIREBASE_KEY === "string"
+                ? JSON.parse(process.env.FIREBASE_KEY)
+                : process.env.FIREBASE_KEY;
+            console.log("🔑 Clé Firebase chargée depuis FIREBASE_KEY");
         } catch (e) {
             console.error("❌ Erreur parsing FIREBASE_KEY JSON :", e.message);
         }
@@ -41,23 +46,34 @@ try {
     if (!serviceAccount) {
         try {
             serviceAccount = require("./firebase-key.json");
-            console.log("🔑 Cle Firebase chargee depuis firebase-key.json local");
+            console.log("🔑 Clé Firebase chargée depuis firebase-key.json local");
         } catch (e) {
-            console.warn("⚠️ Fichier firebase-key.json introuvable :", e.message);
+            try {
+                serviceAccount = require("/etc/secrets/firebase-key.json");
+                console.log("🔑 Clé Firebase chargée depuis /etc/secrets/firebase-key.json (Render Secret File)");
+            } catch (e2) {
+                console.warn("⚠️ Fichier firebase-key.json introuvable :", e.message);
+            }
         }
     }
 
     if (serviceAccount) {
+        // 🔥 CORRECTION CRUCIALE POUR RENDER :
+        // Convertit les "\n" échappés en véritables retours à la ligne pour le chiffrement RSA
+        if (serviceAccount.private_key && typeof serviceAccount.private_key === "string") {
+            serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, "\n");
+        }
+
         initializeApp({
             credential: cert(serviceAccount)
         });
         messaging = getMessaging();
-        console.log("🔥 Firebase Admin initialise avec succes !");
+        console.log("✅ Firebase Admin initialisé avec succès !");
     } else {
-        console.error("⚠️ AUCUNE cle de service Firebase trouvee (ni fichier, ni variable d'environnement). Les notifications push FCM seront desactivees.");
+        console.error("⚠️ AUCUNE clé Firebase trouvée. Push FCM désactivé.");
     }
 } catch (err) {
-    console.error("⚠️ Impossible d'initialiser Firebase Admin :", err.message);
+    console.error("❌ Impossible d'initialiser Firebase Admin :", err.message);
 }
 
 // ======================================================
