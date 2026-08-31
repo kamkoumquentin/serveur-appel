@@ -433,23 +433,27 @@ wss.on("connection", (ws) => {
             pushTente = true;
             const payload = {
                 token: tokenDestinataire,
-                notification: {
-                    title: "Appel entrant",
-                    body: `${from} essaie de vous joindre !`
-                },
                 data: {
                     type: "APPEL",
                     appelant: String(from),
-                    offer: message.offer ? JSON.stringify(message.offer) : ""
+                    title: "📞 Appel entrant",
+                    message: `${from}`,
+                    actions: JSON.stringify([
+                        {
+                            title: "Refuser",
+                            callback: "rejectCallAction",
+                            foreground: false
+                        },
+                        {
+                            title: "Accepter",
+                            callback: "acceptCallAction",
+                            foreground: true
+                        }
+                    ]),
+                    channelId: "default"
                 },
                 android: {
-                    priority: "high",
-                    notification: {
-                        channelId: "default",
-                        sound: "default",
-                        priority: "max",
-                        visibility: "public"
-                    }
+                    priority: "high"
                 },
                 apns: {
                     payload: {
@@ -461,7 +465,7 @@ wss.on("connection", (ws) => {
                 }
             };
 
-            console.log(`📡 Envoi de la notification Push FCM vers ${to}...`);
+            console.log(`📡 Envoi de la notification d'appel avec boutons vers ${to}...`);
 
             messaging.send(payload)
                 .then(response => console.log(`✅ Push FCM envoye avec succes a ${to} :`, response))
