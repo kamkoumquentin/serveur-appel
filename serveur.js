@@ -247,8 +247,7 @@ wss.on("connection", (ws) => {
 
     ws.on("close", () => {
         console.log(`Client deconnecte : ${identifiant || "inconnu"}`);
-        // ⚠️ CORRECTION CRITIQUE 1 :
-        // Si cette socket a été remplacée par une nouvelle socket active (isReplaced = true),
+        // ⚠️ Si cette socket a été remplacée par une nouvelle socket active (isReplaced = true),
         // NE PAS exécuter gererDeconnexion pour ne pas raccrocher l'appel !
         if (identifiant && !ws.isReplaced) {
             gererDeconnexion(identifiant, ws);
@@ -321,9 +320,7 @@ wss.on("connection", (ws) => {
             return;
         }
 
-        // ⚠️ CORRECTION CRITIQUE 2 :
         // Marquer l'ancienne socket avec isReplaced = true AVANT de la fermer
-        // afin d'empêcher son gestionnaire on("close") d'annuler l'appel en cours
         if (utilisateurs.has(nouvelIdentifiant)) {
             const ancienneWs = utilisateurs.get(nouvelIdentifiant);
             if (ancienneWs && ancienneWs !== wsClient) {
@@ -353,18 +350,18 @@ wss.on("connection", (ws) => {
             id: identifiant
         });
 
-        // ⚠️ CORRECTION CRITIQUE 3 :
         // Envoi immédiat et fiable de l'offre en attente lors de la reconnexion / réveil push
         if (pendingOffers.has(identifiant)) {
             const pending = pendingOffers.get(identifiant);
             if (pending && pending.from) {
                 if (utilisateurExiste(pending.from) && appels.get(pending.from) === identifiant) {
-                    console.log(`📦 Transmission de l'offre en attente a ${identifiant} de la part de ${pending.from}`);
+                    console.log(`📦 Transmission de l'offre en attente a ${identifiant} de la part de ${pending.from} (callId: ${pending.callId || "n/a"})`);
                     envoyer(wsClient, {
                         type: "incoming-call",
                         from: pending.from,
                         to: identifiant,
-                        offer: pending.offer
+                        offer: pending.offer,
+                        callId: pending.callId
                     });
                 } else {
                     console.log(`⚠️ Offre en attente expiree pour ${identifiant} (l'appelant ${pending.from} a quitte)`);
@@ -381,6 +378,7 @@ wss.on("connection", (ws) => {
     function traiterCalling(message) {
         const from = identifiant;
         const to = String(message.to || "").trim();
+        const callId = message.callId || (Date.now().toString() + "-" + Math.random().toString(36).substring(2, 9));
 
         if (to === "") {
             envoyer(ws, { type: "ERROR", message: "Destinataire manquant." });
@@ -415,7 +413,7 @@ wss.on("connection", (ws) => {
         creerAppel(from, to);
 
         if (message.offer) {
-            pendingOffers.set(to, { from: from, offer: message.offer });
+            pendingOffers.set(to, { from: from, offer: message.offer, callId: callId });
         }
 
         let transmisWs = false;
@@ -426,11 +424,12 @@ wss.on("connection", (ws) => {
                 type: "incoming-call",
                 from: from,
                 to: to,
-                offer: message.offer
+                offer: message.offer,
+                callId: callId
             });
         }
 
-        // 2. Envoi via Push Firebase FCM (Format DATA-ONLY strict pour éviter tout doublon système)
+        // 2. Envoi via Push Firebase FCM (Format DATA-ONLY avec boutons interactifs)
         let pushTente = false;
 
         if (tokenDestinataire && messaging) {
@@ -443,6 +442,7 @@ wss.on("connection", (ws) => {
                 token: tokenDestinataire,
                 data: {
                     type: "APPEL",
+                    callId: String(callId),
                     callerId: String(from),
                     caller_name: String(from),
                     appelant: String(from),
@@ -453,6 +453,18 @@ wss.on("connection", (ws) => {
                     body: `${from} vous appelle`,
                     color: "#00A884",
                     offer: offerStr,
+                    actions: JSON.stringify([
+                        {
+                            title: "Refuser",
+                            callback: "rejectCallAction",
+                            foreground: false
+                        },
+                        {
+                            title: "Accepter",
+                            callback: "acceptCallAction",
+                            foreground: true
+                        }
+                    ]),
                     android_channel_id: "calls_channel",
                     channelId: "calls_channel",
                     priority: "high",
@@ -478,7 +490,7 @@ wss.on("connection", (ws) => {
                 }
             };
 
-            console.log(`📡 Envoi de la notification d'appel interactive vers ${to}...`);
+            console.log(`📡 Envoi de la notification d'appel interactive vers ${to} (callId: ${callId})...`);
 
             messaging.send(payload)
                 .then(response => console.log(`✅ Push FCM envoyé avec succès à ${to} :`, response))
@@ -515,21 +527,28 @@ wss.on("connection", (ws) => {
                     type: "hang-up",
                     from: to,
                     to: from,
-                    reason: "timeout"
+                    reason: "timeout",
+                    callId: callId
                 });
                 // Notifier le destinataire pour effacer la notification
                 const token = fcmTokens.get(to);
                 if (token && messaging) {
                     messaging.send({
                         token: token,
-                        data: { type: "CANCEL_CALL", action: "cancel_call", from: String(from) },
+                        data: {
+                            type: "CANCEL_CALL",
+                            action: "cancel_call",
+                            from: String(from),
+                            callerId: String(from),
+                            callId: String(callId)
+                        },
                         android: { priority: "high" }
                     }).catch(() => {});
                 }
             }
         }, 60000);
 
-        console.log(`CALLING traité : ${from} -> ${to} (WS direct: ${transmisWs}, Push FCM: ${pushTente})`);
+        console.log(`CALLING traité : ${from} -> ${to} (WS direct: ${transmisWs}, Push FCM: ${pushTente}, callId: ${callId})`);
     }
 
     // ==================================================
@@ -538,6 +557,7 @@ wss.on("connection", (ws) => {
     function traiterCallAccepted(message) {
         const from = identifiant;
         const to = String(message.to || "").trim();
+        const callId = message.callId;
 
         if (to === "" || appels.get(from) !== to) return;
 
@@ -548,10 +568,11 @@ wss.on("connection", (ws) => {
             type: "call-answered",
             from: from,
             to: to,
+            callId: callId,
             answer: message.answer
         });
 
-        console.log(`CALL_ACCEPTED : ${from} -> ${to}`);
+        console.log(`CALL_ACCEPTED : ${from} -> ${to} (callId: ${callId || "n/a"})`);
     }
 
     // ==================================================
@@ -560,12 +581,18 @@ wss.on("connection", (ws) => {
     function traiterCallRejected(message) {
         const from = identifiant;
         const to = String(message.to || "").trim();
+        const callId = message.callId;
 
         if (to === "") return;
 
-        envoyerAUtilisateur(to, { type: "call-refused", from: from, to: to });
+        envoyerAUtilisateur(to, {
+            type: "call-refused",
+            from: from,
+            to: to,
+            callId: callId
+        });
         supprimerAppel(from, to);
-        console.log(`CALL_REJECTED : ${from} -> ${to}`);
+        console.log(`CALL_REJECTED : ${from} -> ${to} (callId: ${callId || "n/a"})`);
     }
 
     // ==================================================
@@ -574,6 +601,7 @@ wss.on("connection", (ws) => {
     function traiterCallEnded(message) {
         const from = identifiant;
         const to = String(message.to || "").trim();
+        const callId = message.callId;
 
         if (to === "") return;
 
@@ -583,15 +611,26 @@ wss.on("connection", (ws) => {
             if (tokenTo && messaging) {
                 messaging.send({
                     token: tokenTo,
-                    data: { type: "CANCEL_CALL", action: "cancel_call", from: String(from) },
+                    data: {
+                        type: "CANCEL_CALL",
+                        action: "cancel_call",
+                        from: String(from),
+                        callerId: String(from),
+                        callId: String(callId || "")
+                    },
                     android: { priority: "high" }
                 }).catch(() => {});
             }
         }
 
-        envoyerAUtilisateur(to, { type: "hang-up", from: from, to: to });
+        envoyerAUtilisateur(to, {
+            type: "hang-up",
+            from: from,
+            to: to,
+            callId: callId
+        });
         supprimerAppel(from, to);
-        console.log(`CALL_ENDED : ${from} -> ${to}`);
+        console.log(`CALL_ENDED : ${from} -> ${to} (callId: ${callId || "n/a"})`);
     }
 
     // ==================================================
@@ -610,6 +649,7 @@ wss.on("connection", (ws) => {
             candidate: message.candidate,
             offer: message.offer,
             answer: message.answer,
+            callId: message.callId,
             from: from,
             to: to
         };
@@ -622,7 +662,6 @@ wss.on("connection", (ws) => {
     // GESTION DECONNEXION
     // ==================================================
     function gererDeconnexion(id, wsOrigine) {
-        // ⚠️ CORRECTION CRITIQUE 4 :
         // 1. Si l'utilisateur est enregistré avec une AUTRE socket active plus récente, on ne touche à rien
         if (utilisateurs.get(id) && utilisateurs.get(id) !== wsOrigine) {
             console.log(`ℹ️ Fermeture d'une socket obsolète pour ${id}, session active préservée.`);
@@ -637,7 +676,6 @@ wss.on("connection", (ws) => {
         const correspondant = appels.get(id);
 
         if (correspondant) {
-            // ⚠️ CORRECTION CRITIQUE 5 :
             // Si un appel est en attente (sonnerie / réveil push) et que l'utilisateur déconnecté est le destinataire,
             // on ne détruit PAS l'appel : le destinataire est probablement en train d'ouvrir l'application via le push !
             if (pendingOffers.has(id)) {
