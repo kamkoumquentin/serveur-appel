@@ -660,4 +660,13 @@ const intervalKeepAlive = setInterval(() => {
         }
         ws.isAlive = false;
         ws.ping();
-   
+    });
+}, 30000);
+
+wss.on("close", () => {
+    clearInterval(intervalKeepAlive);
+});
+
+wss.on("error", (error) => {
+    console.error("ERREUR SERVEUR WEBSOCKET :", error);
+});
