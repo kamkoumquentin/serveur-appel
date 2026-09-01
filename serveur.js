@@ -440,16 +440,19 @@ wss.on("connection", (ws) => {
                 data: {
                     type: "APPEL",
                     appelant: String(from),
-                    title: "📞 Appel entrant",
-                    message: `${from}`,
+                    title: `${from}`,
+                    message: "Appel vocal entrant",
+                    color: "#00A884",
                     actions: JSON.stringify([
                         {
+                            icon: "phone_hangup",
                             title: "Refuser",
                             callback: "rejectCallAction",
                             foreground: false
                         },
                         {
-                            title: "Accepter",
+                            icon: "phone",
+                            title: "Répondre",
                             callback: "acceptCallAction",
                             foreground: true
                         }
@@ -461,8 +464,8 @@ wss.on("connection", (ws) => {
                     importance: "4",
                     sound: "default",
                     vibrate: "true",
-                    "content-available": "1",
-                    "force-start": "1"
+                    category: "call",
+                    "content-available": "1"
                 },
                 android: {
                     priority: "high"
@@ -477,7 +480,7 @@ wss.on("connection", (ws) => {
                 }
             };
 
-            console.log(`📡 Envoi de la notification d'appel avec boutons vers ${to}...`);
+            console.log(`📡 Envoi de la notification d'appel avec boutons [Refuser] / [Répondre] vers ${to}...`);
 
             messaging.send(payload)
                 .then(response => console.log(`✅ Push FCM envoye avec succes a ${to} :`, response))
