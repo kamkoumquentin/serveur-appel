@@ -430,7 +430,7 @@ wss.on("connection", (ws) => {
             });
         }
 
-        // 2. Envoi via Push Firebase FCM
+        // 2. Envoi via Push Firebase FCM (Format DATA-ONLY strict pour éviter tout doublon système)
         let pushTente = false;
 
         if (tokenDestinataire && messaging) {
@@ -439,53 +439,34 @@ wss.on("connection", (ws) => {
                 ? (typeof message.offer === "string" ? message.offer : JSON.stringify(message.offer))
                 : "";
 
-            // ----------------------------------------------------
-            // NOUVEAU PAYLOAD FCM "WHATSAPP STYLE"
-            // ----------------------------------------------------
             const payload = {
                 token: tokenDestinataire,
                 data: {
                     type: "APPEL",
-                    appelant: String(from),
                     callerId: String(from),
-                    title: `${from}`,
-                    message: "Appel vocal entrant",
-                    body: "Appel vocal entrant",
+                    caller_name: String(from),
+                    appelant: String(from),
+                    app_name: "KamSoft",
+                    title: "KamSoft",
+                    subText: "Appel entrant",
+                    message: `${from} vous appelle`,
+                    body: `${from} vous appelle`,
                     color: "#00A884",
                     offer: offerStr,
-                    notId: Date.now().toString(), // ID Unique crucial
                     android_channel_id: "calls_channel",
                     channelId: "calls_channel",
-                    priority: "2",
+                    priority: "high",
                     visibility: "1",
                     importance: "4",
+                    sound: "default",
+                    vibrate: "true",
                     category: "call",
-                    "content-available": "1", // Permet un réveil en arrière-plan sans UI forcée
-                    // ❌ force-start a été retiré
-                    actions: JSON.stringify([
-                        {
-                            icon: "phone_hangup",
-                            title: "Refuser",
-                            callback: "rejectCallAction",
-                            foreground: false
-                        },
-                        {
-                            icon: "phone",
-                            title: "Répondre",
-                            callback: "acceptCallAction",
-                            foreground: true
-                        }
-                    ])
+                    "content-available": "1",
+                    "force-start": "1"
                 },
                 android: {
                     priority: "high",
-                    ttl: 60 * 1000,
-                    notification: {
-                        channelId: "calls_channel",
-                        sound: "default",
-                        priority: "max",
-                        visibility: "public"
-                    }
+                    ttl: 60 * 1000
                 },
                 apns: {
                     payload: {
@@ -496,24 +477,23 @@ wss.on("connection", (ws) => {
                     }
                 }
             };
-            // ----------------------------------------------------
 
-            console.log(`📡 Envoi de la notification d'appel avec boutons [Refuser] / [Répondre] vers ${to}...`);
+            console.log(`📡 Envoi de la notification d'appel interactive vers ${to}...`);
 
             messaging.send(payload)
-                .then(response => console.log(`✅ Push FCM envoye avec succes a ${to} :`, response))
+                .then(response => console.log(`✅ Push FCM envoyé avec succès à ${to} :`, response))
                 .catch(error => {
-                    console.error(`❌ Erreur envoi Push FCM a ${to} :`, error.message);
+                    console.error(`❌ Erreur envoi Push FCM à ${to} :`, error.message);
                     if (error.code === "messaging/registration-token-not-registered" || 
                         error.code === "messaging/invalid-registration-token") {
-                        console.log(`🗑️ Suppression du token perime pour ${to}`);
+                        console.log(`🗑️ Suppression du token périmé pour ${to}`);
                         fcmTokens.delete(to);
                     }
                 });
         } else if (!tokenDestinataire) {
-            console.log(`⚠️ Aucun token FCM enregistre pour ${to}.`);
+            console.log(`⚠️ Aucun token FCM enregistré pour ${to}.`);
         } else if (!messaging) {
-            console.error("⚠️ Firebase Messaging n'est pas configure sur le serveur.");
+            console.error("⚠️ Firebase Messaging n'est pas configuré sur le serveur.");
         }
 
         if (!transmisWs && !pushTente) {
@@ -537,10 +517,19 @@ wss.on("connection", (ws) => {
                     to: from,
                     reason: "timeout"
                 });
+                // Notifier le destinataire pour effacer la notification
+                const token = fcmTokens.get(to);
+                if (token && messaging) {
+                    messaging.send({
+                        token: token,
+                        data: { type: "CANCEL_CALL", action: "cancel_call", from: String(from) },
+                        android: { priority: "high" }
+                    }).catch(() => {});
+                }
             }
         }, 60000);
 
-        console.log(`CALLING traite : ${from} -> ${to} (WS direct: ${transmisWs}, Push FCM: ${pushTente})`);
+        console.log(`CALLING traité : ${from} -> ${to} (WS direct: ${transmisWs}, Push FCM: ${pushTente})`);
     }
 
     // ==================================================
@@ -587,6 +576,18 @@ wss.on("connection", (ws) => {
         const to = String(message.to || "").trim();
 
         if (to === "") return;
+
+        // Si l'appel était en attente (destinataire n'avait pas encore répondu), envoyer un push d'annulation
+        if (pendingOffers.has(to)) {
+            const tokenTo = fcmTokens.get(to);
+            if (tokenTo && messaging) {
+                messaging.send({
+                    token: tokenTo,
+                    data: { type: "CANCEL_CALL", action: "cancel_call", from: String(from) },
+                    android: { priority: "high" }
+                }).catch(() => {});
+            }
+        }
 
         envoyerAUtilisateur(to, { type: "hang-up", from: from, to: to });
         supprimerAppel(from, to);
