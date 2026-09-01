@@ -129,16 +129,12 @@ const server = http.createServer(async (req, res) => {
                 },
                 data: {
                     type: "TEST",
-                    time: new Date().toISOString(),
-                    android_channel_id: "calls_channel",
-                    channelId: "calls_channel",
-                    priority: "2",
-                    visibility: "1"
+                    time: new Date().toISOString()
                 },
                 android: {
                     priority: "high",
                     notification: {
-                        channelId: "calls_channel",
+                        channelId: "default",
                         sound: "default",
                         priority: "max",
                         visibility: "public"
@@ -297,7 +293,7 @@ wss.on("connection", (ws) => {
         if (type === "CALL_ACCEPTED") return traiterCallAccepted(message);
         if (type === "CALL_REJECTED") return traiterCallRejected(message);
         if (type === "CALL_ENDED") return traiterCallEnded(message);
-        if (type === "ICE_CANDIDATE" || type === "WEBRTC_OFFER" || type === "WEBRTC_ANSWER" || type === "renegotiate-offer" || type === "renegotiate-answer") {
+        if (type === "ICE_CANDIDATE" || type === "WEBRTC_OFFER" || type === "WEBRTC_ANSWER") {
             return relayerSignalisation(message);
         }
 
@@ -329,7 +325,7 @@ wss.on("connection", (ws) => {
             if (ancienneWs && ancienneWs !== wsClient) {
                 console.log(`🔄 Remplacement de l'ancienne socket pour ${nouvelIdentifiant}`);
                 ancienneWs.isReplaced = true;
-                try { ancienneWs.close(); } catch (e) {}
+                try { ancienneWs.close(); } catch (e) { }
             }
         }
 
@@ -435,14 +431,21 @@ wss.on("connection", (ws) => {
 
         if (tokenDestinataire && messaging) {
             pushTente = true;
+            const offerStr = message.offer
+                ? (typeof message.offer === "string" ? message.offer : JSON.stringify(message.offer))
+                : "";
+
             const payload = {
                 token: tokenDestinataire,
                 data: {
                     type: "APPEL",
                     appelant: String(from),
+                    from: String(from),
                     title: `${from}`,
                     message: "Appel vocal entrant",
+                    body: "Appel vocal entrant",
                     color: "#00A884",
+                    offer: offerStr,
                     actions: JSON.stringify([
                         {
                             icon: "phone_hangup",
@@ -465,10 +468,12 @@ wss.on("connection", (ws) => {
                     sound: "default",
                     vibrate: "true",
                     category: "call",
-                    "content-available": "1"
+                    "content-available": "1",
+                    "force-start": "1"
                 },
                 android: {
-                    priority: "high"
+                    priority: "high",
+                    ttl: 60 * 1000
                 },
                 apns: {
                     payload: {
@@ -480,13 +485,13 @@ wss.on("connection", (ws) => {
                 }
             };
 
-            console.log(`📡 Envoi de la notification d'appel avec boutons [Refuser] / [Répondre] vers ${to}...`);
+            console.log(`📡 Envoi de la notification d'appel avec boutons vers ${to}...`);
 
             messaging.send(payload)
                 .then(response => console.log(`✅ Push FCM envoye avec succes a ${to} :`, response))
                 .catch(error => {
                     console.error(`❌ Erreur envoi Push FCM a ${to} :`, error.message);
-                    if (error.code === "messaging/registration-token-not-registered" || 
+                    if (error.code === "messaging/registration-token-not-registered" ||
                         error.code === "messaging/invalid-registration-token") {
                         console.log(`🗑️ Suppression du token perime pour ${to}`);
                         fcmTokens.delete(to);
