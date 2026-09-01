@@ -439,6 +439,9 @@ wss.on("connection", (ws) => {
                 ? (typeof message.offer === "string" ? message.offer : JSON.stringify(message.offer))
                 : "";
 
+            // ----------------------------------------------------
+            // NOUVEAU PAYLOAD FCM "WHATSAPP STYLE"
+            // ----------------------------------------------------
             const payload = {
                 token: tokenDestinataire,
                 data: {
@@ -450,6 +453,15 @@ wss.on("connection", (ws) => {
                     body: "Appel vocal entrant",
                     color: "#00A884",
                     offer: offerStr,
+                    notId: Date.now().toString(), // ID Unique crucial
+                    android_channel_id: "calls_channel",
+                    channelId: "calls_channel",
+                    priority: "2",
+                    visibility: "1",
+                    importance: "4",
+                    category: "call",
+                    "content-available": "1", // Permet un réveil en arrière-plan sans UI forcée
+                    // ❌ force-start a été retiré
                     actions: JSON.stringify([
                         {
                             icon: "phone_hangup",
@@ -463,21 +475,17 @@ wss.on("connection", (ws) => {
                             callback: "acceptCallAction",
                             foreground: true
                         }
-                    ]),
-                    android_channel_id: "calls_channel",
-                    channelId: "calls_channel",
-                    priority: "2",
-                    visibility: "1",
-                    importance: "4",
-                    sound: "default",
-                    vibrate: "true",
-                    category: "call",
-                    "content-available": "1",
-                    "force-start": "1"
+                    ])
                 },
                 android: {
                     priority: "high",
-                    ttl: 60 * 1000
+                    ttl: 60 * 1000,
+                    notification: {
+                        channelId: "calls_channel",
+                        sound: "default",
+                        priority: "max",
+                        visibility: "public"
+                    }
                 },
                 apns: {
                     payload: {
@@ -488,6 +496,7 @@ wss.on("connection", (ws) => {
                     }
                 }
             };
+            // ----------------------------------------------------
 
             console.log(`📡 Envoi de la notification d'appel avec boutons [Refuser] / [Répondre] vers ${to}...`);
 
