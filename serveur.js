@@ -129,12 +129,16 @@ const server = http.createServer(async (req, res) => {
                 },
                 data: {
                     type: "TEST",
-                    time: new Date().toISOString()
+                    time: new Date().toISOString(),
+                    android_channel_id: "calls_channel",
+                    channelId: "calls_channel",
+                    priority: "2",
+                    visibility: "1"
                 },
                 android: {
                     priority: "high",
                     notification: {
-                        channelId: "default",
+                        channelId: "calls_channel",
                         sound: "default",
                         priority: "max",
                         visibility: "public"
@@ -293,7 +297,7 @@ wss.on("connection", (ws) => {
         if (type === "CALL_ACCEPTED") return traiterCallAccepted(message);
         if (type === "CALL_REJECTED") return traiterCallRejected(message);
         if (type === "CALL_ENDED") return traiterCallEnded(message);
-        if (type === "ICE_CANDIDATE" || type === "WEBRTC_OFFER" || type === "WEBRTC_ANSWER") {
+        if (type === "ICE_CANDIDATE" || type === "WEBRTC_OFFER" || type === "WEBRTC_ANSWER" || type === "renegotiate-offer" || type === "renegotiate-answer") {
             return relayerSignalisation(message);
         }
 
@@ -325,7 +329,7 @@ wss.on("connection", (ws) => {
             if (ancienneWs && ancienneWs !== wsClient) {
                 console.log(`🔄 Remplacement de l'ancienne socket pour ${nouvelIdentifiant}`);
                 ancienneWs.isReplaced = true;
-                try { ancienneWs.close(); } catch (e) { }
+                try { ancienneWs.close(); } catch (e) {}
             }
         }
 
@@ -485,13 +489,13 @@ wss.on("connection", (ws) => {
                 }
             };
 
-            console.log(`📡 Envoi de la notification d'appel avec boutons vers ${to}...`);
+            console.log(`📡 Envoi de la notification d'appel avec boutons [Refuser] / [Répondre] vers ${to}...`);
 
             messaging.send(payload)
                 .then(response => console.log(`✅ Push FCM envoye avec succes a ${to} :`, response))
                 .catch(error => {
                     console.error(`❌ Erreur envoi Push FCM a ${to} :`, error.message);
-                    if (error.code === "messaging/registration-token-not-registered" ||
+                    if (error.code === "messaging/registration-token-not-registered" || 
                         error.code === "messaging/invalid-registration-token") {
                         console.log(`🗑️ Suppression du token perime pour ${to}`);
                         fcmTokens.delete(to);
@@ -656,13 +660,4 @@ const intervalKeepAlive = setInterval(() => {
         }
         ws.isAlive = false;
         ws.ping();
-    });
-}, 30000);
-
-wss.on("close", () => {
-    clearInterval(intervalKeepAlive);
-});
-
-wss.on("error", (error) => {
-    console.error("ERREUR SERVEUR WEBSOCKET :", error);
-});
+   
