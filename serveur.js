@@ -12,6 +12,45 @@ const utilisateurs = new Map();
 const appels = new Map();
 const pendingOffers = new Map();
 
+// MACHINE À ÉTATS SERVEUR & DÉDUPLICATION
+// callSessions : callId -> { callId, from, to, state: "RINGING" | "ACCEPTING" | "CONNECTED" | "REJECTED" | "ENDED", offer, createdAt }
+const callSessions = new Map();
+// endedCalls : callId -> timestamp (TTL 60s pour empêcher le replay d'anciens appels)
+const endedCalls = new Map();
+
+function logCall(event, details = {}) {
+    console.log(`[CALL] ${event} | callId=${details.callId || "n/a"} | from=${details.from || "n/a"} | to=${details.to || "n/a"} | state=${details.state || "n/a"} | info=${details.info || ""}`);
+}
+
+function markCallEnded(callId) {
+    if (!callId) return;
+    endedCalls.set(String(callId), Date.now());
+    const session = callSessions.get(String(callId));
+    if (session) {
+        session.state = "ENDED";
+    }
+}
+
+function isCallEnded(callId) {
+    if (!callId) return false;
+    return endedCalls.has(String(callId));
+}
+
+// Nettoyage périodique (toutes les 30s) des appels terminés et sessions expirées (> 60s / 5min)
+setInterval(() => {
+    const now = Date.now();
+    endedCalls.forEach((timestamp, callId) => {
+        if (now - timestamp > 60000) {
+            endedCalls.delete(callId);
+        }
+    });
+    callSessions.forEach((session, callId) => {
+        if (now - session.createdAt > 300000) { // 5 minutes max par session
+            callSessions.delete(callId);
+        }
+    });
+}, 30000);
+
 // ======================================================
 // INITIALISATION FIREBASE notification firebase
 // ======================================================
@@ -99,6 +138,8 @@ const server = http.createServer(async (req, res) => {
             message: "Serveur d'appel operationnel",
             firebaseAdminReady: messaging !== null,
             connectedUsers: Array.from(utilisateurs.keys()),
+            activeCallsCount: appels.size / 2,
+            activeSessionsCount: callSessions.size,
             registeredFcmTokensCount: fcmTokens.size,
             registeredFcmTokens: tokensList
         }, null, 2));
@@ -234,7 +275,6 @@ wss.on("connection", (ws) => {
     ws.on("message", (data) => {
         try {
             const message = JSON.parse(data.toString());
-            console.log("\nMESSAGE RECU :", message);
             traiterMessage(ws, message);
         } catch (error) {
             console.error("Message JSON invalide :", error);
@@ -343,28 +383,42 @@ wss.on("connection", (ws) => {
             console.log(`⚠️ Aucun token FCM fourni lors du REGISTER pour ${identifiant}`);
         }
 
-        console.log(`✅ UTILISATEUR ENREGISTRE : ${identifiant}`);
+        logCall("REGISTER", { from: identifiant, info: `Utilisateur enregistré (${identifiant})` });
 
         envoyer(wsClient, {
             type: "REGISTERED",
             id: identifiant
         });
 
-        // Envoi immédiat et fiable de l'offre en attente lors de la reconnexion / réveil push
+        // ⚠️ TRANSMISSION SÉCURISÉE DE L'OFFRE EN ATTENTE :
+        // On vérifie STRICTEMENT que l'offre est toujours dans l'état RINGING.
+        // Si l'appel a déjà été accepté (state === 'ACCEPTING' ou 'CONNECTED'), ou terminé ('ENDED' / 'REJECTED'),
+        // NE SURTOUT PAS renvoyer incoming-call !
         if (pendingOffers.has(identifiant)) {
             const pending = pendingOffers.get(identifiant);
             if (pending && pending.from) {
-                if (utilisateurExiste(pending.from) && appels.get(pending.from) === identifiant) {
-                    console.log(`📦 Transmission de l'offre en attente a ${identifiant} de la part de ${pending.from} (callId: ${pending.callId || "n/a"})`);
+                const callId = pending.callId;
+                const session = callId ? callSessions.get(callId) : null;
+
+                if (isCallEnded(callId)) {
+                    logCall("PENDING_OFFER_IGNORED", { callId, to: identifiant, info: "Appel déjà terminé dans endedCalls" });
+                    pendingOffers.delete(identifiant);
+                } else if (session && session.state !== "RINGING") {
+                    logCall("PENDING_OFFER_IGNORED", { callId, to: identifiant, state: session.state, info: `Appel non 'RINGING' (${session.state}), pas de renvoi incoming-call` });
+                    if (session.state === "CONNECTED" || session.state === "ENDED" || session.state === "REJECTED") {
+                        pendingOffers.delete(identifiant);
+                    }
+                } else if (utilisateurExiste(pending.from) && appels.get(pending.from) === identifiant) {
+                    logCall("PENDING_OFFER_SENT", { callId, from: pending.from, to: identifiant, state: "RINGING" });
                     envoyer(wsClient, {
                         type: "incoming-call",
                         from: pending.from,
                         to: identifiant,
                         offer: pending.offer,
-                        callId: pending.callId
+                        callId: callId
                     });
                 } else {
-                    console.log(`⚠️ Offre en attente expiree pour ${identifiant} (l'appelant ${pending.from} a quitte)`);
+                    logCall("PENDING_OFFER_EXPIRED", { callId, to: identifiant, info: `L'appelant ${pending.from} n'est plus en ligne/occupé` });
                     pendingOffers.delete(identifiant);
                     appels.delete(identifiant);
                 }
@@ -378,7 +432,7 @@ wss.on("connection", (ws) => {
     function traiterCalling(message) {
         const from = identifiant;
         const to = String(message.to || "").trim();
-        const callId = message.callId || (Date.now().toString() + "-" + Math.random().toString(36).substring(2, 9));
+        const callId = String(message.callId || (Date.now().toString() + "-" + Math.random().toString(36).substring(2, 9)));
 
         if (to === "") {
             envoyer(ws, { type: "ERROR", message: "Destinataire manquant." });
@@ -390,11 +444,16 @@ wss.on("connection", (ws) => {
             return;
         }
 
+        if (isCallEnded(callId)) {
+            logCall("CALLING_IGNORED", { callId, from, to, info: "callId présent dans endedCalls" });
+            return;
+        }
+
         const destinataireEnLigne = utilisateurExiste(to);
         const tokenDestinataire = fcmTokens.get(to);
 
         if (!destinataireEnLigne && !tokenDestinataire) {
-            console.log(`❌ Echec appel : ${to} n'est ni connecte en direct ni joignable via Push FCM.`);
+            logCall("CALLING_FAILED", { callId, from, to, info: "Destinataire ni connecté ni token FCM" });
             envoyer(ws, { type: "ERROR", message: "Le correspondant est hors ligne ou introuvable." });
             return;
         }
@@ -406,19 +465,30 @@ wss.on("connection", (ws) => {
 
         if (utilisateurOccupe(to)) {
             envoyer(ws, { type: "BUSY", from: to, to: from, message: "Le correspondant est occupe." });
-            console.log(`APPEL REFUSE : ${to} est occupe.`);
+            logCall("CALLING_BUSY", { callId, from, to, info: `${to} est déjà occupé` });
             return;
         }
 
         creerAppel(from, to);
 
+        // Enregistrement de la session d'appel serveur
+        const session = {
+            callId: callId,
+            from: from,
+            to: to,
+            state: "RINGING",
+            offer: message.offer,
+            createdAt: Date.now()
+        };
+        callSessions.set(callId, session);
+
         if (message.offer) {
-            pendingOffers.set(to, { from: from, offer: message.offer, callId: callId });
+            pendingOffers.set(to, { from: from, offer: message.offer, callId: callId, createdAt: Date.now() });
         }
 
         let transmisWs = false;
 
-        // 1. Envoi direct via WebSocket si connecte
+        // 1. Envoi direct via WebSocket si connecté
         if (destinataireEnLigne) {
             transmisWs = envoyerAUtilisateur(to, {
                 type: "incoming-call",
@@ -427,6 +497,9 @@ wss.on("connection", (ws) => {
                 offer: message.offer,
                 callId: callId
             });
+            if (transmisWs) {
+                logCall("WS_RECEIVED", { callId, from, to, state: "RINGING", info: "Transmis par WebSocket direct" });
+            }
         }
 
         // 2. Envoi via Push Firebase FCM (Format DATA-ONLY avec boutons interactifs)
@@ -490,10 +563,12 @@ wss.on("connection", (ws) => {
                 }
             };
 
-            console.log(`📡 Envoi de la notification d'appel interactive vers ${to} (callId: ${callId})...`);
+            logCall("FCM_SENT", { callId, from, to, info: "Envoi push FCM interactif" });
 
             messaging.send(payload)
-                .then(response => console.log(`✅ Push FCM envoyé avec succès à ${to} :`, response))
+                .then(response => {
+                    logCall("FCM_DELIVERED", { callId, from, to, info: `FCM envoyé avec succès (${response})` });
+                })
                 .catch(error => {
                     console.error(`❌ Erreur envoi Push FCM à ${to} :`, error.message);
                     if (error.code === "messaging/registration-token-not-registered" || 
@@ -510,6 +585,7 @@ wss.on("connection", (ws) => {
 
         if (!transmisWs && !pushTente) {
             supprimerAppel(from, to);
+            callSessions.delete(callId);
             envoyer(ws, {
                 type: "ERROR",
                 message: "Impossible de joindre le correspondant (hors ligne)."
@@ -519,8 +595,10 @@ wss.on("connection", (ws) => {
 
         // Timeout de sécurité : si le destinataire ne répond pas après 60 secondes
         setTimeout(() => {
-            if (pendingOffers.has(to) && pendingOffers.get(to).from === from) {
-                console.log(`⏰ Délai d'attente dépassé (60s) pour l'appel ${from} -> ${to}`);
+            const currentSession = callSessions.get(callId);
+            if (currentSession && currentSession.state === "RINGING") {
+                logCall("TIMEOUT", { callId, from, to, info: "Délai d'attente 60s dépassé" });
+                markCallEnded(callId);
                 pendingOffers.delete(to);
                 supprimerAppel(from, to);
                 envoyerAUtilisateur(from, {
@@ -548,19 +626,34 @@ wss.on("connection", (ws) => {
             }
         }, 60000);
 
-        console.log(`CALLING traité : ${from} -> ${to} (WS direct: ${transmisWs}, Push FCM: ${pushTente}, callId: ${callId})`);
+        logCall("CREATED", { callId, from, to, state: "RINGING", info: `WS direct: ${transmisWs}, Push FCM: ${pushTente}` });
     }
 
     // ==================================================
-    // TRAITER CALL ACCEPTED
+    // TRAITER CALL ACCEPTED (ATOMIQUE)
     // ==================================================
     function traiterCallAccepted(message) {
         const from = identifiant;
         const to = String(message.to || "").trim();
-        const callId = message.callId;
+        const callId = String(message.callId || "");
 
-        if (to === "" || appels.get(from) !== to) return;
+        if (to === "") return;
 
+        if (callId && isCallEnded(callId)) {
+            logCall("ACCEPT_IGNORED_DUPLICATE", { callId, from, to, info: "callId dans endedCalls" });
+            return;
+        }
+
+        const session = callId ? callSessions.get(callId) : null;
+        if (session) {
+            if (session.state === "CONNECTED") {
+                logCall("ACCEPT_IGNORED_DUPLICATE", { callId, from, to, state: "CONNECTED", info: "Session déjà connectée" });
+                return;
+            }
+            session.state = "CONNECTED";
+        }
+
+        // Suppression immédiate et absolue des pendingOffers pour les deux parties
         pendingOffers.delete(from);
         pendingOffers.delete(to);
 
@@ -572,7 +665,7 @@ wss.on("connection", (ws) => {
             answer: message.answer
         });
 
-        console.log(`CALL_ACCEPTED : ${from} -> ${to} (callId: ${callId || "n/a"})`);
+        logCall("ANSWER_SENT", { callId, from, to, state: "CONNECTED", info: "Réponse WebRTC relayée à l'appelant" });
     }
 
     // ==================================================
@@ -581,9 +674,18 @@ wss.on("connection", (ws) => {
     function traiterCallRejected(message) {
         const from = identifiant;
         const to = String(message.to || "").trim();
-        const callId = message.callId;
+        const callId = String(message.callId || "");
 
         if (to === "") return;
+
+        if (callId) {
+            markCallEnded(callId);
+            const session = callSessions.get(callId);
+            if (session) session.state = "REJECTED";
+        }
+
+        pendingOffers.delete(from);
+        pendingOffers.delete(to);
 
         envoyerAUtilisateur(to, {
             type: "call-refused",
@@ -592,7 +694,7 @@ wss.on("connection", (ws) => {
             callId: callId
         });
         supprimerAppel(from, to);
-        console.log(`CALL_REJECTED : ${from} -> ${to} (callId: ${callId || "n/a"})`);
+        logCall("REJECTED", { callId, from, to, state: "REJECTED" });
     }
 
     // ==================================================
@@ -601,9 +703,15 @@ wss.on("connection", (ws) => {
     function traiterCallEnded(message) {
         const from = identifiant;
         const to = String(message.to || "").trim();
-        const callId = message.callId;
+        const callId = String(message.callId || "");
 
         if (to === "") return;
+
+        if (callId) {
+            markCallEnded(callId);
+            const session = callSessions.get(callId);
+            if (session) session.state = "ENDED";
+        }
 
         // Si l'appel était en attente (destinataire n'avait pas encore répondu), envoyer un push d'annulation
         if (pendingOffers.has(to)) {
@@ -623,6 +731,9 @@ wss.on("connection", (ws) => {
             }
         }
 
+        pendingOffers.delete(from);
+        pendingOffers.delete(to);
+
         envoyerAUtilisateur(to, {
             type: "hang-up",
             from: from,
@@ -630,7 +741,7 @@ wss.on("connection", (ws) => {
             callId: callId
         });
         supprimerAppel(from, to);
-        console.log(`CALL_ENDED : ${from} -> ${to} (callId: ${callId || "n/a"})`);
+        logCall("ENDED", { callId, from, to, state: "ENDED" });
     }
 
     // ==================================================
@@ -639,6 +750,7 @@ wss.on("connection", (ws) => {
     function relayerSignalisation(message) {
         const from = identifiant;
         const to = String(message.to || "").trim();
+        const callId = message.callId;
 
         if (to === "" || appels.get(from) !== to) return;
 
@@ -649,13 +761,13 @@ wss.on("connection", (ws) => {
             candidate: message.candidate,
             offer: message.offer,
             answer: message.answer,
-            callId: message.callId,
+            callId: callId,
             from: from,
             to: to
         };
 
         envoyerAUtilisateur(to, signal);
-        console.log(`${eventType} : ${from} -> ${to}`);
+        console.log(`[CALL] SIGNAL | ${eventType} | callId=${callId || "n/a"} | ${from} -> ${to}`);
     }
 
     // ==================================================
