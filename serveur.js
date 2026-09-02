@@ -1,13 +1,46 @@
 const http = require("http");
 const WebSocket = require("ws");
+const fs = require("fs");
+const path = require("path");
 
 // MODIFICATION RENDER : Utilisation du port dynamique
 const PORT = process.env.PORT || 8080;
 
 // ======================================================
-// TOKENS & SESSIONS EN MEMOIRE
+// TOKENS & SESSIONS EN MEMOIRE & PERSISTANCE DISQUE
 // ======================================================
 const fcmTokens = new Map();
+const TOKENS_CACHE_FILE = path.join(__dirname, "fcm_tokens_cache.json");
+
+function chargerTokensFCM() {
+    try {
+        if (fs.existsSync(TOKENS_CACHE_FILE)) {
+            const data = fs.readFileSync(TOKENS_CACHE_FILE, "utf-8");
+            const parsed = JSON.parse(data);
+            Object.entries(parsed).forEach(([id, token]) => {
+                if (id && token) fcmTokens.set(String(id), String(token));
+            });
+            console.log(`💾 ${fcmTokens.size} tokens FCM chargés depuis le cache local (${TOKENS_CACHE_FILE})`);
+        }
+    } catch (e) {
+        console.warn("⚠️ Impossible de charger fcm_tokens_cache.json :", e.message);
+    }
+}
+
+function sauvegarderTokensFCM() {
+    try {
+        const obj = {};
+        fcmTokens.forEach((token, id) => {
+            obj[id] = token;
+        });
+        fs.writeFileSync(TOKENS_CACHE_FILE, JSON.stringify(obj, null, 2), "utf-8");
+    } catch (e) {
+        console.warn("⚠️ Impossible d'écrire dans fcm_tokens_cache.json :", e.message);
+    }
+}
+
+chargerTokensFCM();
+
 const utilisateurs = new Map();
 const appels = new Map();
 const pendingOffers = new Map();
@@ -386,6 +419,7 @@ wss.on("connection", (ws) => {
         // Sauvegarde du token FCM
         if (message.fcmToken) {
             fcmTokens.set(identifiant, message.fcmToken);
+            sauvegarderTokensFCM();
             console.log(`📲 TOKEN FCM ENREGISTRE pour ${identifiant} : ${message.fcmToken.substring(0, 20)}...`);
         } else if (fcmTokens.has(identifiant)) {
             console.log(`📲 Token FCM deja conserve en memoire pour ${identifiant}`);
@@ -587,6 +621,7 @@ wss.on("connection", (ws) => {
                         error.code === "messaging/invalid-registration-token") {
                         console.log(`🗑️ Suppression du token périmé pour ${to}`);
                         fcmTokens.delete(to);
+                        sauvegarderTokensFCM();
                     }
                 });
         } else if (!tokenDestinataire) {
