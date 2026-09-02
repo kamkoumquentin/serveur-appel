@@ -42,6 +42,7 @@ function sauvegarderTokensFCM() {
 chargerTokensFCM();
 
 const utilisateurs = new Map();
+const userAppStates = new Map(); // identifiant -> isForeground (boolean)
 const appels = new Map();
 const pendingOffers = new Map();
 
@@ -212,10 +213,6 @@ const server = http.createServer(async (req, res) => {
         try {
             const testPayload = {
                 token: token,
-                notification: {
-                    title: "KamSoft - Test Appel",
-                    body: "Ceci est un test de bannière d'appel réussie !"
-                },
                 data: {
                     type: "TEST",
                     title: "KamSoft - Test",
@@ -246,16 +243,7 @@ const server = http.createServer(async (req, res) => {
                 },
                 android: {
                     priority: "high",
-                    ttl: 60 * 1000,
-                    notification: {
-                        channelId: "calls_channel_v5",
-                        priority: "max",
-                        visibility: "public",
-                        defaultSound: true,
-                        defaultVibrateTimings: true,
-                        icon: "ic_launcher",
-                        color: "#00A884"
-                    }
+                    ttl: 60 * 1000
                 }
             };
 
@@ -393,6 +381,15 @@ wss.on("connection", (ws) => {
 
         if (type === "REGISTER" || type === "UPDATE_TOKEN") {
             enregistrerUtilisateur(wsClient, message);
+            return;
+        }
+
+        if (type === "SET_APP_STATE") {
+            const isFg = !!message.isForeground;
+            if (identifiant) {
+                userAppStates.set(identifiant, isFg);
+                console.log(`📱 État app pour ${identifiant} : ${isFg ? "FOREGROUND (1er plan)" : "BACKGROUND (arrière-plan)"}`);
+            }
             return;
         }
 
@@ -560,6 +557,7 @@ wss.on("connection", (ws) => {
         }
 
         let transmisWs = false;
+        const isDestinataireAuPremierPlan = destinataireEnLigne && (userAppStates.get(to) === true);
 
         // 1. Envoi direct via WebSocket si connecté
         if (destinataireEnLigne) {
@@ -571,28 +569,26 @@ wss.on("connection", (ws) => {
                 callId: callId
             });
             if (transmisWs) {
-                logCall("WS_RECEIVED", { callId, from, to, state: "RINGING", info: "Transmis par WebSocket direct" });
+                logCall("WS_RECEIVED", { callId, from, to, state: "RINGING", info: `Transmis par WS direct (1er plan: ${isDestinataireAuPremierPlan})` });
             }
         }
 
-        // 2. Envoi via Push Firebase FCM (Format HYBRIDE : Notification Système Google + Data)
+        // 2. Envoi via Push Firebase FCM :
+        // ⚠️ RÈGLE IMPORTANTE : Si le destinataire a déjà l'application ouverte au premier plan devant les yeux,
+        // NE PAS envoyer de notification push pour ne pas créer de bannière en doublon !
         let pushTente = false;
 
-        if (tokenDestinataire && messaging) {
+        if (!isDestinataireAuPremierPlan && tokenDestinataire && messaging) {
             pushTente = true;
             const offerStr = message.offer
                 ? (typeof message.offer === "string" ? message.offer : JSON.stringify(message.offer))
                 : "";
 
             const notIdVal = String(Math.floor(10000 + Math.random() * 89999));
+            // Format DATA-ONLY ciblant calls_channel_v5 : permet à FCMService.kt d'attacher
+            // les 2 boutons d'action interactifs [Refuser] et [Accepter] à la bannière
             const payload = {
                 token: tokenDestinataire,
-                // Le bloc "notification" de niveau racine permet à Android d'afficher
-                // la notification sous forme de bannière même si l'application est COMPLÈTEMENT FERMÉE
-                notification: {
-                    title: "KamSoft - Appel entrant",
-                    body: `${from} vous appelle`
-                },
                 data: {
                     type: "APPEL",
                     callId: String(callId),
@@ -632,17 +628,7 @@ wss.on("connection", (ws) => {
                 },
                 android: {
                     priority: "high",
-                    ttl: 60 * 1000,
-                    notification: {
-                        channelId: "calls_channel_v5",
-                        priority: "max",
-                        visibility: "public",
-                        defaultSound: true,
-                        defaultVibrateTimings: true,
-                        icon: "ic_launcher",
-                        color: "#00A884",
-                        clickAction: "PushHandlerActivity"
-                    }
+                    ttl: 60 * 1000
                 },
                 apns: {
                     payload: {
@@ -654,7 +640,7 @@ wss.on("connection", (ws) => {
                 }
             };
 
-            logCall("FCM_SENT", { callId, from, to, info: `Envoi push FCM interactif (notId=${notIdVal})` });
+            logCall("FCM_SENT", { callId, from, to, info: `Envoi push FCM avec boutons [Accepter/Refuser] (notId=${notIdVal})` });
 
             messaging.send(payload)
                 .then(response => {
@@ -669,6 +655,8 @@ wss.on("connection", (ws) => {
                         sauvegarderTokensFCM();
                     }
                 });
+        } else if (isDestinataireAuPremierPlan) {
+            console.log(`ℹ️ Destinataire ${to} a l'application ouverte au premier plan : push FCM non requis.`);
         } else if (!tokenDestinataire) {
             console.log(`⚠️ Aucun token FCM enregistré pour ${to}.`);
         } else if (!messaging) {
@@ -875,6 +863,7 @@ wss.on("connection", (ws) => {
         // 2. Nettoyer la map utilisateurs si c'est bien la socket active qui a fermé
         if (utilisateurs.get(id) === wsOrigine) {
             utilisateurs.delete(id);
+            userAppStates.delete(id);
         }
 
         const correspondant = appels.get(id);
