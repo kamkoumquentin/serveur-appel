@@ -718,20 +718,8 @@ wss.on("connection", (ws) => {
                 : "";
 
             const notIdVal = String(Math.floor(10000 + Math.random() * 89999));
-            const screenState = userScreenStates.get(to);
-
-            // ── SÉPARATION STRICTE TEST 1 vs TEST 2 ──────────────────────────
-            // Si le destinataire est identifié en veille (écran éteint / SCREEN_OFF) :
-            // 👉 Utiliser la fonction dédiée TEST 2 (Réveil écran et affichage Interface 2)
-            // Sinon (écran allumé / arrière-plan / par défaut) :
-            // 👉 Utiliser la fonction dédiée TEST 1 (Bannière interactive avec boutons [Accepter]/[Refuser])
-            if (screenState === "SCREEN_OFF") {
-                console.log(`🌙 [TEST 2] Destinataire ${to} en veille (SCREEN_OFF) -> Utilisation fonction TEST 2`);
-                envoyerPushTest2Veille(tokenDestinataire, to, from, callId, offerStr, notIdVal);
-            } else {
-                console.log(`☀️ [TEST 1] Destinataire ${to} écran allumé (${screenState || "défaut"}) -> Utilisation fonction TEST 1`);
-                envoyerPushTest1Banniere(tokenDestinataire, to, from, callId, offerStr, notIdVal);
-            }
+            console.log(`📲 Envoi Push FCM d'appel à ${to} (notId=${notIdVal})`);
+            envoyerPushTest2Veille(tokenDestinataire, to, from, callId, offerStr, notIdVal);
         } else if (isDestinataireAuPremierPlan) {
             console.log(`ℹ️ Destinataire ${to} a l'application ouverte au premier plan : push FCM non requis.`);
         } else if (!tokenDestinataire) {
