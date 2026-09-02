@@ -170,14 +170,14 @@ const server = http.createServer(async (req, res) => {
                     message: "Ceci est un test de notification bannière réussi !",
                     body: "Ceci est un test de notification bannière réussi !",
                     notId: "9999",
-                    android_channel_id: "calls_channel_v3",
-                    channelId: "calls_channel_v3",
+                    android_channel_id: "calls_channel_v4",
+                    channelId: "calls_channel_v4",
                     priority: "2",
                     visibility: "1",
-                    importance: "5",
+                    importance: "4",
                     sound: "default",
                     vibrate: "true",
-                    vibrationPattern: "[500, 250, 500, 250, 500]",
+                    vibrationPattern: "[0, 500, 250, 500]",
                     category: "call",
                     actions: JSON.stringify([
                         {
@@ -376,7 +376,7 @@ wss.on("connection", (ws) => {
             if (ancienneWs && ancienneWs !== wsClient) {
                 console.log(`🔄 Remplacement de l'ancienne socket pour ${nouvelIdentifiant}`);
                 ancienneWs.isReplaced = true;
-                try { ancienneWs.close(); } catch (e) {}
+                try { ancienneWs.close(); } catch (e) { }
             }
         }
 
@@ -551,14 +551,14 @@ wss.on("connection", (ws) => {
                             foreground: true
                         }
                     ]),
-                    android_channel_id: "calls_channel_v3",
-                    channelId: "calls_channel_v3",
+                    android_channel_id: "calls_channel_v4",
+                    channelId: "calls_channel_v4",
                     priority: "2",
                     visibility: "1",
-                    importance: "5",
+                    importance: "4",
                     sound: "default",
                     vibrate: "true",
-                    vibrationPattern: "[500, 250, 500, 250, 500]",
+                    vibrationPattern: "[0, 500, 250, 500]",
                     category: "call"
                 },
                 android: {
@@ -583,7 +583,7 @@ wss.on("connection", (ws) => {
                 })
                 .catch(error => {
                     console.error(`❌ Erreur envoi Push FCM à ${to} :`, error.message);
-                    if (error.code === "messaging/registration-token-not-registered" || 
+                    if (error.code === "messaging/registration-token-not-registered" ||
                         error.code === "messaging/invalid-registration-token") {
                         console.log(`🗑️ Suppression du token périmé pour ${to}`);
                         fcmTokens.delete(to);
@@ -633,7 +633,7 @@ wss.on("connection", (ws) => {
                             callId: String(callId)
                         },
                         android: { priority: "high" }
-                    }).catch(() => {});
+                    }).catch(() => { });
                 }
             }
         }, 60000);
@@ -739,7 +739,7 @@ wss.on("connection", (ws) => {
                         callId: String(callId || "")
                     },
                     android: { priority: "high" }
-                }).catch(() => {});
+                }).catch(() => { });
             }
         }
 
