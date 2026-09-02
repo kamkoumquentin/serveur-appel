@@ -511,6 +511,7 @@ wss.on("connection", (ws) => {
                 ? (typeof message.offer === "string" ? message.offer : JSON.stringify(message.offer))
                 : "";
 
+            const notIdVal = String(Math.floor(10000 + Math.random() * 89999));
             const payload = {
                 token: tokenDestinataire,
                 data: {
@@ -524,6 +525,8 @@ wss.on("connection", (ws) => {
                     subText: "Appel entrant",
                     message: `${from} vous appelle`,
                     body: `${from} vous appelle`,
+                    notId: notIdVal,
+                    icon: "ic_launcher",
                     color: "#00A884",
                     offer: offerStr,
                     actions: JSON.stringify([
@@ -545,7 +548,10 @@ wss.on("connection", (ws) => {
                     importance: "4",
                     sound: "default",
                     vibrate: "true",
-                    category: "call"
+                    vibrationPattern: "[500, 250, 500, 250, 500]",
+                    category: "call",
+                    "content-available": "1",
+                    "force-start": "1"
                 },
                 android: {
                     priority: "high",
@@ -561,7 +567,7 @@ wss.on("connection", (ws) => {
                 }
             };
 
-            logCall("FCM_SENT", { callId, from, to, info: "Envoi push FCM interactif" });
+            logCall("FCM_SENT", { callId, from, to, info: `Envoi push FCM interactif (notId=${notIdVal})` });
 
             messaging.send(payload)
                 .then(response => {
