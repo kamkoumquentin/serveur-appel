@@ -704,8 +704,8 @@ wss.on("connection", (ws) => {
         let transmisWs = false;
         const isDestinataireAuPremierPlan = destinataireEnLigne && (userAppStates.get(to) === true);
 
-        // 1. Envoi direct via WebSocket si connecté
-        if (destinataireEnLigne) {
+        // 1. Envoi direct via WebSocket UNIQUEMENT si le destinataire est au premier plan
+        if (destinataireEnLigne && isDestinataireAuPremierPlan) {
             transmisWs = envoyerAUtilisateur(to, {
                 type: "incoming-call",
                 from: from,
@@ -714,13 +714,12 @@ wss.on("connection", (ws) => {
                 callId: callId
             });
             if (transmisWs) {
-                logCall("WS_RECEIVED", { callId, from, to, state: "RINGING", info: `Transmis par WS direct (1er plan: ${isDestinataireAuPremierPlan})` });
+                logCall("WS_RECEIVED", { callId, from, to, state: "RINGING", info: "Transmis par WS direct (app au 1er plan)" });
             }
         }
 
-        // 2. Envoi via Push Firebase FCM :
-        // ⚠️ RÈGLE IMPORTANTE : Si le destinataire a déjà l'application ouverte au premier plan devant les yeux,
-        // NE PAS envoyer de notification push pour ne pas créer de bannière en doublon !
+        // 2. Envoi via Push Firebase FCM (Arrière-plan et Veille) :
+        // ⚠️ Si l'app est au premier plan, aucun push n'est requis (l'interface interne s'affiche).
         let pushTente = false;
 
         if (!isDestinataireAuPremierPlan && tokenDestinataire && messaging) {
@@ -733,16 +732,16 @@ wss.on("connection", (ws) => {
             const screenState = userScreenStates.get(to);
 
             // ── SÉPARATION STRICTE TEST 1 vs TEST 2 ──────────────────────────
-            // Si le destinataire est en veille (SCREEN_OFF) OU hors-ligne (app fermée) :
+            // Si le destinataire a son écran EXPLICITEMENT allumé en arrière-plan :
+            // 👉 Utiliser TEST 1 (Bannière interactive avec [Refuser] et [Accepter], sans forçage)
+            // Dans TOUS les autres cas (veille, écran noir avec schéma, app fermée) :
             // 👉 Utiliser TEST 2 (Réveil physique de l'écran + Interface 2 au-dessus du lockscreen)
-            // Sinon (destinataire connecté en arrière-plan avec écran allumé) :
-            // 👉 Utiliser TEST 1 (Bannière pure avec boutons [Refuser] et [Accepter], sans force-start)
-            if (screenState === "SCREEN_OFF" || !destinataireEnLigne) {
-                console.log(`🌙 [TEST 2] Destinataire ${to} en veille (${screenState || "hors-ligne"}) -> Push réveil écran`);
-                envoyerPushTest2Veille(tokenDestinataire, to, from, callId, offerStr, notIdVal);
-            } else {
-                console.log(`☀️ [TEST 1] Destinataire ${to} écran allumé (${screenState || "connecté"}) -> Push bannière sans forçage`);
+            if (screenState === "SCREEN_ON") {
+                console.log(`☀️ [TEST 1] Destinataire ${to} écran allumé -> Push bannière interactive`);
                 envoyerPushTest1Banniere(tokenDestinataire, to, from, callId, offerStr, notIdVal);
+            } else {
+                console.log(`🌙 [TEST 2] Destinataire ${to} en veille (${screenState || "défaut"}) -> Push réveil écran`);
+                envoyerPushTest2Veille(tokenDestinataire, to, from, callId, offerStr, notIdVal);
             }
         } else if (isDestinataireAuPremierPlan) {
             console.log(`ℹ️ Destinataire ${to} a l'application ouverte au premier plan : push FCM non requis.`);
