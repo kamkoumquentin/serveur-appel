@@ -545,9 +545,7 @@ wss.on("connection", (ws) => {
                     importance: "4",
                     sound: "default",
                     vibrate: "true",
-                    category: "call",
-                    "content-available": "1",
-                    "force-start": "1"
+                    category: "call"
                 },
                 android: {
                     priority: "high",
