@@ -526,8 +526,6 @@ wss.on("connection", (ws) => {
                     body: `${from} vous appelle`,
                     color: "#00A884",
                     offer: offerStr,
-                    "content-available": "1",
-                    "force-start": "1",
                     actions: JSON.stringify([
                         {
                             title: "Refuser",
@@ -540,11 +538,11 @@ wss.on("connection", (ws) => {
                             foreground: true
                         }
                     ]),
-                    android_channel_id: "calls_channel_v2",
-                    channelId: "calls_channel_v2",
+                    android_channel_id: "calls_channel",
+                    channelId: "calls_channel",
                     priority: "high",
                     visibility: "1",
-                    importance: "5",
+                    importance: "4",
                     sound: "default",
                     vibrate: "true",
                     category: "call"
