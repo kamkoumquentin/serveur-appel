@@ -159,6 +159,21 @@ const server = http.createServer(async (req, res) => {
 
     const parsedUrl = new URL(req.url, `http://${req.headers.host || "localhost"}`);
 
+    // Endpoint d'enregistrement de token FCM direct via HTTP
+    if (parsedUrl.pathname === "/register-token") {
+        const userId = parsedUrl.searchParams.get("id");
+        const token = parsedUrl.searchParams.get("token");
+
+        if (userId && token) {
+            fcmTokens.set(String(userId).trim(), String(token).trim());
+            sauvegarderTokensFCM();
+            console.log(`📲 [HTTP] Token FCM synchronisé pour ${userId} : ${token.substring(0, 15)}...`);
+            return res.end(JSON.stringify({ success: true, message: `Token enregistré pour ${userId}` }));
+        } else {
+            return res.end(JSON.stringify({ error: "Paramètres 'id' et 'token' requis." }));
+        }
+    }
+
     // Endpoint de diagnostic
     if (parsedUrl.pathname === "/status" || parsedUrl.pathname === "/") {
         const tokensList = {};
@@ -197,17 +212,21 @@ const server = http.createServer(async (req, res) => {
         try {
             const testPayload = {
                 token: token,
+                notification: {
+                    title: "KamSoft - Test Appel",
+                    body: "Ceci est un test de bannière d'appel réussie !"
+                },
                 data: {
                     type: "TEST",
                     title: "KamSoft - Test",
                     message: "Ceci est un test de notification bannière réussi !",
                     body: "Ceci est un test de notification bannière réussi !",
                     notId: "9999",
-                    android_channel_id: "calls_channel_v4",
-                    channelId: "calls_channel_v4",
+                    android_channel_id: "calls_channel_v5",
+                    channelId: "calls_channel_v5",
                     priority: "2",
                     visibility: "1",
-                    importance: "4",
+                    importance: "5",
                     sound: "default",
                     vibrate: "true",
                     vibrationPattern: "[0, 500, 250, 500]",
@@ -226,7 +245,17 @@ const server = http.createServer(async (req, res) => {
                     ])
                 },
                 android: {
-                    priority: "high"
+                    priority: "high",
+                    ttl: 60 * 1000,
+                    notification: {
+                        channelId: "calls_channel_v5",
+                        priority: "max",
+                        visibility: "public",
+                        defaultSound: true,
+                        defaultVibrateTimings: true,
+                        icon: "ic_launcher",
+                        color: "#00A884"
+                    }
                 }
             };
 
@@ -546,7 +575,7 @@ wss.on("connection", (ws) => {
             }
         }
 
-        // 2. Envoi via Push Firebase FCM (Format DATA-ONLY avec boutons interactifs)
+        // 2. Envoi via Push Firebase FCM (Format HYBRIDE : Notification Système Google + Data)
         let pushTente = false;
 
         if (tokenDestinataire && messaging) {
@@ -558,6 +587,12 @@ wss.on("connection", (ws) => {
             const notIdVal = String(Math.floor(10000 + Math.random() * 89999));
             const payload = {
                 token: tokenDestinataire,
+                // Le bloc "notification" de niveau racine permet à Android d'afficher
+                // la notification sous forme de bannière même si l'application est COMPLÈTEMENT FERMÉE
+                notification: {
+                    title: "KamSoft - Appel entrant",
+                    body: `${from} vous appelle`
+                },
                 data: {
                     type: "APPEL",
                     callId: String(callId),
@@ -565,7 +600,7 @@ wss.on("connection", (ws) => {
                     caller_name: String(from),
                     appelant: String(from),
                     app_name: "KamSoft",
-                    title: "KamSoft",
+                    title: "KamSoft - Appel entrant",
                     subText: "Appel entrant",
                     message: `${from} vous appelle`,
                     body: `${from} vous appelle`,
@@ -585,11 +620,11 @@ wss.on("connection", (ws) => {
                             foreground: true
                         }
                     ]),
-                    android_channel_id: "calls_channel_v4",
-                    channelId: "calls_channel_v4",
+                    android_channel_id: "calls_channel_v5",
+                    channelId: "calls_channel_v5",
                     priority: "2",
                     visibility: "1",
-                    importance: "4",
+                    importance: "5",
                     sound: "default",
                     vibrate: "true",
                     vibrationPattern: "[0, 500, 250, 500]",
@@ -597,7 +632,17 @@ wss.on("connection", (ws) => {
                 },
                 android: {
                     priority: "high",
-                    ttl: 60 * 1000
+                    ttl: 60 * 1000,
+                    notification: {
+                        channelId: "calls_channel_v5",
+                        priority: "max",
+                        visibility: "public",
+                        defaultSound: true,
+                        defaultVibrateTimings: true,
+                        icon: "ic_launcher",
+                        color: "#00A884",
+                        clickAction: "PushHandlerActivity"
+                    }
                 },
                 apns: {
                     payload: {
