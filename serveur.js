@@ -164,26 +164,36 @@ const server = http.createServer(async (req, res) => {
         try {
             const testPayload = {
                 token: token,
-                notification: {
-                    title: "Test de Notification",
-                    body: "Ceci est un test de notification push reussi !"
-                },
                 data: {
                     type: "TEST",
-                    time: new Date().toISOString(),
-                    android_channel_id: "calls_channel",
-                    channelId: "calls_channel",
+                    title: "KamSoft - Test",
+                    message: "Ceci est un test de notification bannière réussi !",
+                    body: "Ceci est un test de notification bannière réussi !",
+                    notId: "9999",
+                    android_channel_id: "calls_channel_v3",
+                    channelId: "calls_channel_v3",
                     priority: "2",
-                    visibility: "1"
+                    visibility: "1",
+                    importance: "5",
+                    sound: "default",
+                    vibrate: "true",
+                    vibrationPattern: "[500, 250, 500, 250, 500]",
+                    category: "call",
+                    actions: JSON.stringify([
+                        {
+                            title: "Refuser",
+                            callback: "rejectCallAction",
+                            foreground: false
+                        },
+                        {
+                            title: "Accepter",
+                            callback: "acceptCallAction",
+                            foreground: true
+                        }
+                    ])
                 },
                 android: {
-                    priority: "high",
-                    notification: {
-                        channelId: "calls_channel",
-                        sound: "default",
-                        priority: "max",
-                        visibility: "public"
-                    }
+                    priority: "high"
                 }
             };
 
@@ -541,11 +551,11 @@ wss.on("connection", (ws) => {
                             foreground: true
                         }
                     ]),
-                    android_channel_id: "calls_channel",
-                    channelId: "calls_channel",
-                    priority: "high",
+                    android_channel_id: "calls_channel_v3",
+                    channelId: "calls_channel_v3",
+                    priority: "2",
                     visibility: "1",
-                    importance: "4",
+                    importance: "5",
                     sound: "default",
                     vibrate: "true",
                     vibrationPattern: "[500, 250, 500, 250, 500]",
