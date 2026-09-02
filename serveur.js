@@ -559,9 +559,7 @@ wss.on("connection", (ws) => {
                     sound: "default",
                     vibrate: "true",
                     vibrationPattern: "[500, 250, 500, 250, 500]",
-                    category: "call",
-                    "content-available": "1",
-                    "force-start": "1"
+                    category: "call"
                 },
                 android: {
                     priority: "high",
