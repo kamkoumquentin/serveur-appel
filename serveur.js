@@ -1,16 +1,47 @@
 const http = require("http");
 const WebSocket = require("ws");
+const fs = require("fs");
+const path = require("path");
 
 // MODIFICATION RENDER : Utilisation du port dynamique
 const PORT = process.env.PORT || 8080;
 
 // ======================================================
-// TOKENS & SESSIONS EN MEMOIRE
+// TOKENS & SESSIONS EN MEMOIRE & SUR DISQUE (PERSISTANCE)
 // ======================================================
 const fcmTokens = new Map();
 const utilisateurs = new Map();
 const appels = new Map();
 const pendingOffers = new Map();
+
+const TOKENS_FILE = path.join(__dirname, "fcm_tokens.json");
+
+function saveTokensToFile() {
+    try {
+        const obj = Object.fromEntries(fcmTokens);
+        fs.writeFileSync(TOKENS_FILE, JSON.stringify(obj, null, 2), "utf8");
+    } catch (e) {
+        console.error("❌ Erreur sauvegarde fcm_tokens.json :", e.message);
+    }
+}
+
+function loadTokensFromFile() {
+    try {
+        if (fs.existsSync(TOKENS_FILE)) {
+            const data = fs.readFileSync(TOKENS_FILE, "utf8");
+            const obj = JSON.parse(data);
+            for (const [id, token] of Object.entries(obj)) {
+                if (id && token) fcmTokens.set(id, token);
+            }
+            console.log(`📦 ${fcmTokens.size} tokens FCM chargés depuis fcm_tokens.json`);
+        }
+    } catch (e) {
+        console.error("❌ Erreur chargement fcm_tokens.json :", e.message);
+    }
+}
+
+// Charger les tokens enregistrés au démarrage
+loadTokensFromFile();
 
 // MACHINE À ÉTATS SERVEUR & DÉDUPLICATION
 // callSessions : callId -> { callId, from, to, state: "RINGING" | "ACCEPTING" | "CONNECTED" | "REJECTED" | "ENDED", offer, createdAt }
@@ -192,6 +223,29 @@ const server = http.createServer(async (req, res) => {
         } catch (pushErr) {
             return res.end(JSON.stringify({ success: false, error: pushErr.message }));
         }
+    }
+
+    // Endpoint d'enregistrement de token FCM via HTTP : POST /register-token
+    if (req.method === "POST" && parsedUrl.pathname === "/register-token") {
+        let body = "";
+        req.on("data", chunk => body += chunk);
+        req.on("end", () => {
+            try {
+                const data = JSON.parse(body);
+                const id = String(data.id || data.userId || "").trim();
+                const fcmToken = String(data.fcmToken || data.token || "").trim();
+                if (id && fcmToken) {
+                    fcmTokens.set(id, fcmToken);
+                    saveTokensToFile();
+                    console.log(`📲 Token FCM enregistré via HTTP pour ${id} : ${fcmToken.substring(0, 20)}...`);
+                    return res.end(JSON.stringify({ success: true, id: id, totalTokens: fcmTokens.size }));
+                }
+            } catch (e) {
+                console.error("Erreur parsing /register-token :", e.message);
+            }
+            res.end(JSON.stringify({ success: false, error: "Identifiant ou token invalide." }));
+        });
+        return;
     }
 
     res.end(JSON.stringify({ status: "ok" }));
@@ -376,6 +430,7 @@ wss.on("connection", (ws) => {
         // Sauvegarde du token FCM
         if (message.fcmToken) {
             fcmTokens.set(identifiant, message.fcmToken);
+            saveTokensToFile();
             console.log(`📲 TOKEN FCM ENREGISTRE pour ${identifiant} : ${message.fcmToken.substring(0, 20)}...`);
         } else if (fcmTokens.has(identifiant)) {
             console.log(`📲 Token FCM deja conserve en memoire pour ${identifiant}`);
@@ -542,10 +597,12 @@ wss.on("connection", (ws) => {
                     channelId: "calls_channel",
                     priority: "high",
                     visibility: "1",
-                    importance: "4",
+                    importance: "5",
                     sound: "default",
                     vibrate: "true",
-                    category: "call"
+                    category: "call",
+                    forceShow: "1",
+                    "content-available": "1"
                 },
                 android: {
                     priority: "high",
