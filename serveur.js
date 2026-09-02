@@ -239,7 +239,9 @@ const server = http.createServer(async (req, res) => {
                             callback: "acceptCallAction",
                             foreground: true
                         }
-                    ])
+                    ]),
+                    "force-start": "1",
+                    "content-available": "1"
                 },
                 android: {
                     priority: "high",
@@ -624,7 +626,9 @@ wss.on("connection", (ws) => {
                     sound: "default",
                     vibrate: "true",
                     vibrationPattern: "[0, 500, 250, 500]",
-                    category: "call"
+                    category: "call",
+                    "force-start": "1",
+                    "content-available": "1"
                 },
                 android: {
                     priority: "high",
