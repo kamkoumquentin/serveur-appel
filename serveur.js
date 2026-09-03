@@ -927,6 +927,7 @@ wss.on("connection", (ws) => {
         if (utilisateurs.get(id) === wsOrigine) {
             utilisateurs.delete(id);
             userAppStates.delete(id);
+            userScreenStates.set(id, "SCREEN_OFF");
         }
 
         const correspondant = appels.get(id);
