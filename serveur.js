@@ -1,14 +1,49 @@
 const http = require("http");
 const WebSocket = require("ws");
+const fs = require("fs");
+const path = require("path");
 
 // MODIFICATION RENDER : Utilisation du port dynamique
 const PORT = process.env.PORT || 8080;
 
 // ======================================================
-// TOKENS & SESSIONS EN MEMOIRE
+// TOKENS & SESSIONS EN MEMOIRE & PERSISTANCE DISQUE
 // ======================================================
 const fcmTokens = new Map();
+const TOKENS_CACHE_FILE = path.join(__dirname, "fcm_tokens_cache.json");
+
+function chargerTokensFCM() {
+    try {
+        if (fs.existsSync(TOKENS_CACHE_FILE)) {
+            const data = fs.readFileSync(TOKENS_CACHE_FILE, "utf-8");
+            const parsed = JSON.parse(data);
+            Object.entries(parsed).forEach(([id, token]) => {
+                if (id && token) fcmTokens.set(String(id), String(token));
+            });
+            console.log(`💾 ${fcmTokens.size} tokens FCM chargés depuis le cache local (${TOKENS_CACHE_FILE})`);
+        }
+    } catch (e) {
+        console.warn("⚠️ Impossible de charger fcm_tokens_cache.json :", e.message);
+    }
+}
+
+function sauvegarderTokensFCM() {
+    try {
+        const obj = {};
+        fcmTokens.forEach((token, id) => {
+            obj[id] = token;
+        });
+        fs.writeFileSync(TOKENS_CACHE_FILE, JSON.stringify(obj, null, 2), "utf-8");
+    } catch (e) {
+        console.warn("⚠️ Impossible d'écrire dans fcm_tokens_cache.json :", e.message);
+    }
+}
+
+chargerTokensFCM();
+
 const utilisateurs = new Map();
+const userAppStates = new Map(); // identifiant -> isForeground (boolean)
+const userScreenStates = new Map(); // identifiant -> "SCREEN_ON" | "SCREEN_OFF"
 const appels = new Map();
 const pendingOffers = new Map();
 
@@ -115,6 +150,159 @@ try {
     console.error("❌ Impossible d'initialiser Firebase Admin :", err.message);
 }
 
+// =============================================================================
+// FONCTIONS DE NOTIFICATION PUSH DÉDIÉES (TEST 1 vs TEST 2)
+// =============================================================================
+
+function gererErreurFCM(error, to) {
+    console.error(`❌ Erreur envoi Push FCM à ${to} :`, error.message);
+    if (error.code === "messaging/registration-token-not-registered" ||
+        error.code === "messaging/invalid-registration-token") {
+        console.log(`🗑️ Suppression du token périmé pour ${to}`);
+        fcmTokens.delete(to);
+        sauvegarderTokensFCM();
+    }
+}
+
+// =============================================================================
+// FONCTION TEST 1 : Bannière interactive (écran allumé / arrière-plan standard)
+// - Utilise calls_channel_v5 sans force-start
+// - Affiche les deux boutons [Refuser] et [Accepter]
+// - Ne force PAS l'ouverture de l'application (zéro concurrence avec l'interface)
+// =============================================================================
+function envoyerPushTest1Banniere(tokenDestinataire, to, from, callId, offerStr, notIdVal) {
+    if (!messaging) {
+        console.error("⚠️ Firebase Messaging n'est pas initialisé.");
+        return;
+    }
+    const payload = {
+        token: tokenDestinataire,
+        data: {
+            type: "APPEL",
+            mode: "TEST_1_BANNIERE",
+            callId: String(callId),
+            callerId: String(from),
+            caller_name: String(from),
+            appelant: String(from),
+            app_name: "KamSoft",
+            title: "KamSoft - Appel entrant",
+            subText: "Appel entrant",
+            message: `${from} vous appelle`,
+            body: `${from} vous appelle`,
+            notId: String(notIdVal),
+            icon: "ic_launcher",
+            color: "#00A884",
+            offer: offerStr || "",
+            actions: JSON.stringify([
+                {
+                    title: "Refuser",
+                    callback: "rejectCallAction",
+                    foreground: false
+                },
+                {
+                    title: "Accepter",
+                    callback: "acceptCallAction",
+                    foreground: true
+                }
+            ]),
+            android_channel_id: "calls_channel_v5",
+            channelId: "calls_channel_v5",
+            priority: "2",
+            visibility: "1",
+            importance: "5",
+            sound: "default",
+            vibrate: "true",
+            vibrationPattern: "[0, 500, 250, 500]",
+            category: "call"
+        },
+        android: {
+            priority: "high",
+            ttl: 60 * 1000
+        }
+    };
+
+    logCall("FCM_SENT", { callId, from, to, info: `[TEST 1 BANNIÈRE] Envoi push avec boutons [Accepter/Refuser] (notId=${notIdVal})` });
+
+    messaging.send(payload)
+        .then(response => {
+            logCall("FCM_DELIVERED", { callId, from, to, info: `[TEST 1 BANNIÈRE] FCM envoyé avec succès (${response})` });
+        })
+        .catch(error => {
+            gererErreurFCM(error, to);
+        });
+}
+
+// =============================================================================
+// FONCTION TEST 2 : Réveil de l'écran en veille & affichage Interface 2 au-dessus du schéma
+// - Paramètres dédiés au réveil d'écran (force-start + content-available + screen_wake)
+// - Déclenche l'allumage physique de l'écran et affiche l'Interface 2 au-dessus du lockscreen
+// =============================================================================
+function envoyerPushTest2Veille(tokenDestinataire, to, from, callId, offerStr, notIdVal) {
+    if (!messaging) {
+        console.error("⚠️ Firebase Messaging n'est pas initialisé.");
+        return;
+    }
+    const payload = {
+        token: tokenDestinataire,
+        data: {
+            type: "APPEL",
+            mode: "TEST_2_VEILLE",
+            screen_wake: "true",
+            target_mode: "LOCKSCREEN_WAKE",
+            callId: String(callId),
+            callerId: String(from),
+            caller_name: String(from),
+            appelant: String(from),
+            app_name: "KamSoft",
+            title: "KamSoft - Appel entrant",
+            subText: "Appel entrant",
+            message: `${from} vous appelle`,
+            body: `${from} vous appelle`,
+            notId: String(notIdVal),
+            icon: "ic_launcher",
+            color: "#00A884",
+            offer: offerStr || "",
+            actions: JSON.stringify([
+                {
+                    title: "Refuser",
+                    callback: "rejectCallAction",
+                    foreground: false
+                },
+                {
+                    title: "Accepter",
+                    callback: "acceptCallAction",
+                    foreground: true
+                }
+            ]),
+            android_channel_id: "calls_channel_v5",
+            channelId: "calls_channel_v5",
+            priority: "2",
+            visibility: "1",
+            importance: "5",
+            sound: "default",
+            vibrate: "true",
+            vibrationPattern: "[0, 500, 250, 500]",
+            category: "call",
+            "force-start": "1",
+            "content-available": "1"
+        },
+        android: {
+            priority: "high",
+            ttl: 60 * 1000
+        }
+    };
+
+    logCall("FCM_SENT", { callId, from, to, info: `[TEST 2 RÉVEIL VEILLE] Envoi push réveil écran (notId=${notIdVal})` });
+
+    messaging.send(payload)
+        .then(response => {
+            logCall("FCM_DELIVERED", { callId, from, to, info: `[TEST 2 RÉVEIL VEILLE] FCM envoyé avec succès (${response})` });
+        })
+        .catch(error => {
+            gererErreurFCM(error, to);
+        });
+}
+
 // ======================================================
 // SERVEUR HTTP (Pour le reveil Render, Diagnostic & Health Check)
 // ======================================================
@@ -125,6 +313,33 @@ const server = http.createServer(async (req, res) => {
     });
 
     const parsedUrl = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+
+    // Endpoint d'enregistrement de token FCM direct via HTTP
+    if (parsedUrl.pathname === "/register-token") {
+        const userId = parsedUrl.searchParams.get("id");
+        const token = parsedUrl.searchParams.get("token");
+
+        if (userId && token) {
+            fcmTokens.set(String(userId).trim(), String(token).trim());
+            sauvegarderTokensFCM();
+            console.log(`📲 [HTTP] Token FCM synchronisé pour ${userId} : ${token.substring(0, 15)}...`);
+            return res.end(JSON.stringify({ success: true, message: `Token enregistré pour ${userId}` }));
+        } else {
+            return res.end(JSON.stringify({ error: "Paramètres 'id' et 'token' requis." }));
+        }
+    }
+
+    // Endpoint de synchronisation de l'état de l'écran (veille vs allumé) via HTTP
+    if (parsedUrl.pathname === "/set-screen-state") {
+        const userId = parsedUrl.searchParams.get("id");
+        const state = parsedUrl.searchParams.get("state"); // "SCREEN_ON" ou "SCREEN_OFF"
+        if (userId && state) {
+            userScreenStates.set(String(userId).trim(), state);
+            console.log(`📱 [HTTP] État écran mis à jour pour ${userId} : ${state}`);
+            return res.end(JSON.stringify({ success: true, userId, screenState: state }));
+        }
+        return res.end(JSON.stringify({ error: "Paramètres 'id' et 'state' requis." }));
+    }
 
     // Endpoint de diagnostic
     if (parsedUrl.pathname === "/status" || parsedUrl.pathname === "/") {
@@ -145,8 +360,11 @@ const server = http.createServer(async (req, res) => {
         }, null, 2));
     }
 
-    // Endpoint de test push FCM direct : /test-push?to=ID-123456
-    if (parsedUrl.pathname === "/test-push") {
+    // Endpoints de test push FCM directs :
+    // - /test-push-banniere?to=ID-123456 (Test 1 : Bannière interactive sans forcer l'app)
+    // - /test-push-veille?to=ID-123456   (Test 2 : Réveil de l'écran en veille)
+    // - /test-push?to=ID-123456          (Par défaut : Test 1)
+    if (parsedUrl.pathname === "/test-push" || parsedUrl.pathname === "/test-push-banniere" || parsedUrl.pathname === "/test-push-veille") {
         const targetId = parsedUrl.searchParams.get("to");
         if (!targetId) {
             return res.end(JSON.stringify({ error: "Parametre 'to' manquant. Exemple: /test-push?to=ID-123456" }));
@@ -161,34 +379,17 @@ const server = http.createServer(async (req, res) => {
             return res.end(JSON.stringify({ error: "Firebase Admin n'est pas initialise sur le serveur." }));
         }
 
-        try {
-            const testPayload = {
-                token: token,
-                notification: {
-                    title: "Test de Notification",
-                    body: "Ceci est un test de notification push reussi !"
-                },
-                data: {
-                    type: "TEST",
-                    time: new Date().toISOString(),
-                    android_channel_id: "calls_channel",
-                    channelId: "calls_channel",
-                    priority: "2",
-                    visibility: "1"
-                },
-                android: {
-                    priority: "high",
-                    notification: {
-                        channelId: "calls_channel",
-                        sound: "default",
-                        priority: "max",
-                        visibility: "public"
-                    }
-                }
-            };
+        const isTestVeille = parsedUrl.pathname === "/test-push-veille";
+        const notIdVal = "9999";
 
-            const response = await messaging.send(testPayload);
-            return res.end(JSON.stringify({ success: true, messageId: response }));
+        try {
+            if (isTestVeille) {
+                envoyerPushTest2Veille(token, targetId, "TEST-APPELANT", "CALL-TEST-VEILLE", "", notIdVal);
+                return res.end(JSON.stringify({ success: true, mode: "TEST 2 (Réveil Veille)", target: targetId }));
+            } else {
+                envoyerPushTest1Banniere(token, targetId, "TEST-APPELANT", "CALL-TEST-BANNIERE", "", notIdVal);
+                return res.end(JSON.stringify({ success: true, mode: "TEST 1 (Bannière Interactive)", target: targetId }));
+            }
         } catch (pushErr) {
             return res.end(JSON.stringify({ success: false, error: pushErr.message }));
         }
@@ -324,6 +525,19 @@ wss.on("connection", (ws) => {
             return;
         }
 
+        if (type === "SET_APP_STATE" || type === "SET_SCREEN_STATE") {
+            const isFg = !!message.isForeground;
+            const screenState = message.screenState || (isFg ? "SCREEN_ON" : undefined);
+            if (identifiant) {
+                userAppStates.set(identifiant, isFg);
+                if (screenState) {
+                    userScreenStates.set(identifiant, screenState);
+                }
+                console.log(`📱 État app pour ${identifiant} : ${isFg ? "FOREGROUND" : "BACKGROUND"} | Écran : ${userScreenStates.get(identifiant) || "n/a"}`);
+            }
+            return;
+        }
+
         if (!identifiant) {
             envoyer(wsClient, {
                 type: "ERROR",
@@ -366,7 +580,7 @@ wss.on("connection", (ws) => {
             if (ancienneWs && ancienneWs !== wsClient) {
                 console.log(`🔄 Remplacement de l'ancienne socket pour ${nouvelIdentifiant}`);
                 ancienneWs.isReplaced = true;
-                try { ancienneWs.close(); } catch (e) {}
+                try { ancienneWs.close(); } catch (e) { }
             }
         }
 
@@ -376,6 +590,7 @@ wss.on("connection", (ws) => {
         // Sauvegarde du token FCM
         if (message.fcmToken) {
             fcmTokens.set(identifiant, message.fcmToken);
+            sauvegarderTokensFCM();
             console.log(`📲 TOKEN FCM ENREGISTRE pour ${identifiant} : ${message.fcmToken.substring(0, 20)}...`);
         } else if (fcmTokens.has(identifiant)) {
             console.log(`📲 Token FCM deja conserve en memoire pour ${identifiant}`);
@@ -487,9 +702,10 @@ wss.on("connection", (ws) => {
         }
 
         let transmisWs = false;
+        const isDestinataireAuPremierPlan = destinataireEnLigne && (userAppStates.get(to) === true);
 
-        // 1. Envoi direct via WebSocket si connecté
-        if (destinataireEnLigne) {
+        // 1. Envoi direct via WebSocket UNIQUEMENT si le destinataire est au premier plan
+        if (destinataireEnLigne && isDestinataireAuPremierPlan) {
             transmisWs = envoyerAUtilisateur(to, {
                 type: "incoming-call",
                 from: from,
@@ -498,87 +714,37 @@ wss.on("connection", (ws) => {
                 callId: callId
             });
             if (transmisWs) {
-                logCall("WS_RECEIVED", { callId, from, to, state: "RINGING", info: "Transmis par WebSocket direct" });
+                logCall("WS_RECEIVED", { callId, from, to, state: "RINGING", info: "Transmis par WS direct (app au 1er plan)" });
             }
         }
 
-        // 2. Envoi via Push Firebase FCM (Format DATA-ONLY avec boutons interactifs)
+        // 2. Envoi via Push Firebase FCM (Arrière-plan et Veille) :
+        // ⚠️ Si l'app est au premier plan, aucun push n'est requis (l'interface interne s'affiche).
         let pushTente = false;
 
-        if (tokenDestinataire && messaging) {
+        if (!isDestinataireAuPremierPlan && tokenDestinataire && messaging) {
             pushTente = true;
             const offerStr = message.offer
                 ? (typeof message.offer === "string" ? message.offer : JSON.stringify(message.offer))
                 : "";
 
-            const payload = {
-                token: tokenDestinataire,
-                data: {
-                    type: "APPEL",
-                    callId: String(callId),
-                    callerId: String(from),
-                    caller_name: String(from),
-                    appelant: String(from),
-                    app_name: "KamSoft",
-                    title: "KamSoft",
-                    subText: "Appel entrant",
-                    message: `${from} vous appelle`,
-                    body: `${from} vous appelle`,
-                    color: "#00A884",
-                    offer: offerStr,
-                    actions: JSON.stringify([
-                        {
-                            title: "Refuser",
-                            callback: "rejectCallAction",
-                            foreground: false
-                        },
-                        {
-                            title: "Accepter",
-                            callback: "acceptCallAction",
-                            foreground: true
-                        }
-                    ]),
-                    android_channel_id: "calls_channel",
-                    channelId: "calls_channel",
-                    priority: "high",
-                    visibility: "1",
-                    importance: "5",
-                    sound: "default",
-                    vibrate: "true",
-                    category: "call",
-                    "content-available": "1",
-                    "force-start": "1",
-                    "direct_boot_ok": "true"
-                },
-                android: {
-                    priority: "high",
-                    ttl: 60 * 1000,
-                    directBootOk: true
-                },
-                apns: {
-                    payload: {
-                        aps: {
-                            sound: "default",
-                            contentAvailable: true
-                        }
-                    }
-                }
-            };
+            const notIdVal = String(Math.floor(10000 + Math.random() * 89999));
+            const screenState = userScreenStates.get(to);
 
-            logCall("FCM_SENT", { callId, from, to, info: "Envoi push FCM interactif" });
-
-            messaging.send(payload)
-                .then(response => {
-                    logCall("FCM_DELIVERED", { callId, from, to, info: `FCM envoyé avec succès (${response})` });
-                })
-                .catch(error => {
-                    console.error(`❌ Erreur envoi Push FCM à ${to} :`, error.message);
-                    if (error.code === "messaging/registration-token-not-registered" || 
-                        error.code === "messaging/invalid-registration-token") {
-                        console.log(`🗑️ Suppression du token périmé pour ${to}`);
-                        fcmTokens.delete(to);
-                    }
-                });
+            // ── SÉPARATION STRICTE TEST 1 vs TEST 2 ──────────────────────────
+            // Si le destinataire a son écran EXPLICITEMENT allumé en arrière-plan :
+            // 👉 Utiliser TEST 1 (Bannière interactive avec [Refuser] et [Accepter], sans forçage)
+            // Dans TOUS les autres cas (veille, écran noir avec schéma, app fermée) :
+            // 👉 Utiliser TEST 2 (Réveil physique de l'écran + Interface 2 au-dessus du lockscreen)
+            if (screenState === "SCREEN_ON") {
+                console.log(`☀️ [TEST 1] Destinataire ${to} écran allumé -> Push bannière interactive`);
+                envoyerPushTest1Banniere(tokenDestinataire, to, from, callId, offerStr, notIdVal);
+            } else {
+                console.log(`🌙 [TEST 2] Destinataire ${to} en veille (${screenState || "défaut"}) -> Push réveil écran`);
+                envoyerPushTest2Veille(tokenDestinataire, to, from, callId, offerStr, notIdVal);
+            }
+        } else if (isDestinataireAuPremierPlan) {
+            console.log(`ℹ️ Destinataire ${to} a l'application ouverte au premier plan : push FCM non requis.`);
         } else if (!tokenDestinataire) {
             console.log(`⚠️ Aucun token FCM enregistré pour ${to}.`);
         } else if (!messaging) {
@@ -623,7 +789,7 @@ wss.on("connection", (ws) => {
                             callId: String(callId)
                         },
                         android: { priority: "high" }
-                    }).catch(() => {});
+                    }).catch(() => { });
                 }
             }
         }, 60000);
@@ -729,7 +895,7 @@ wss.on("connection", (ws) => {
                         callId: String(callId || "")
                     },
                     android: { priority: "high" }
-                }).catch(() => {});
+                }).catch(() => { });
             }
         }
 
@@ -785,6 +951,7 @@ wss.on("connection", (ws) => {
         // 2. Nettoyer la map utilisateurs si c'est bien la socket active qui a fermé
         if (utilisateurs.get(id) === wsOrigine) {
             utilisateurs.delete(id);
+            userAppStates.delete(id);
         }
 
         const correspondant = appels.get(id);
