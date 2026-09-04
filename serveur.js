@@ -707,15 +707,16 @@ wss.on("connection", (ws) => {
             const screenState = userScreenStates.get(to);
 
             // ── SÉPARATION STRICTE TEST 1 vs TEST 2 ──────────────────────────
-            // Si le destinataire a son écran EXPLICITEMENT allumé en arrière-plan :
+            // Si le destinataire a son écran EXPLICITEMENT allumé en arrière-plan ET est connecté en WS :
             // 👉 Utiliser TEST 1 (Bannière interactive avec [Refuser] et [Accepter], sans forçage)
-            // Dans TOUS les autres cas (veille, écran noir avec schéma, app fermée) :
-            // 👉 Utiliser TEST 2 (Réveil physique de l'écran + Interface 2 au-dessus du lockscreen)
-            if (screenState === "SCREEN_ON") {
-                console.log(`☀️ [TEST 1] Destinataire ${to} écran allumé -> Push bannière interactive`);
+            // Dans TOUS les autres cas (veille, écran noir avec schéma, app fermée, hors-ligne) :
+            // 👉 Utiliser TEST 2 (Réveil physique de l'écran + Interface 2 active au-dessus du lockscreen)
+            const isStrictementEcranAllume = (screenState === "SCREEN_ON") && destinataireEnLigne;
+            if (isStrictementEcranAllume) {
+                console.log(`☀️ [TEST 1] Destinataire ${to} écran allumé et en ligne -> Push bannière interactive`);
                 envoyerPushTest1Banniere(tokenDestinataire, to, from, callId, offerStr, notIdVal);
             } else {
-                console.log(`🌙 [TEST 2] Destinataire ${to} en veille (${screenState || "défaut"}) -> Push réveil écran`);
+                console.log(`🌙 [TEST 2] Destinataire ${to} en veille ou hors ligne (${screenState || "défaut"}) -> Push réveil écran`);
                 envoyerPushTest2Veille(tokenDestinataire, to, from, callId, offerStr, notIdVal);
             }
         } else if (isDestinataireAuPremierPlan) {
