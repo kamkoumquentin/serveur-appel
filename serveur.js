@@ -234,14 +234,17 @@ function envoyerPushTest1Banniere(tokenDestinataire, to, from, callId, offerStr,
 
 // =============================================================================
 // FONCTION TEST 2 : Réveil de l'écran en veille & affichage Interface 2 au-dessus du schéma
-// - Paramètres dédiés au réveil d'écran (force-start + content-available + screen_wake)
-// - Déclenche l'allumage physique de l'écran et affiche l'Interface 2 au-dessus du lockscreen
+// - Payload Data-Only silencieux (AUCUNE notification système affichée dans la barre)
+// - Déclenche le réveil matériel de l'écran via backgroundMode.wakeUp() et l'Interface 2
 // =============================================================================
 function envoyerPushTest2Veille(tokenDestinataire, to, from, callId, offerStr, notIdVal) {
     if (!messaging) {
         console.error("⚠️ Firebase Messaging n'est pas initialisé.");
         return;
     }
+    // Payload Data-Only pur : sans title, body, message, ni actions
+    // Sur Android, cela ne crée aucune notification dans la barre de notifications
+    // mais délivre immédiatement les données à l'application pour allumer l'écran
     const payload = {
         token: tokenDestinataire,
         data: {
@@ -254,35 +257,7 @@ function envoyerPushTest2Veille(tokenDestinataire, to, from, callId, offerStr, n
             caller_name: String(from),
             appelant: String(from),
             app_name: "KamSoft",
-            title: "KamSoft - Appel entrant",
-            subText: "Appel entrant",
-            message: `${from} vous appelle`,
-            body: `${from} vous appelle`,
-            notId: String(notIdVal),
-            icon: "ic_launcher",
-            color: "#00A884",
             offer: offerStr || "",
-            actions: JSON.stringify([
-                {
-                    title: "Refuser",
-                    callback: "rejectCallAction",
-                    foreground: false
-                },
-                {
-                    title: "Accepter",
-                    callback: "acceptCallAction",
-                    foreground: true
-                }
-            ]),
-            android_channel_id: "calls_channel_v5",
-            channelId: "calls_channel_v5",
-            priority: "2",
-            visibility: "1",
-            importance: "5",
-            sound: "default",
-            vibrate: "true",
-            vibrationPattern: "[0, 500, 250, 500]",
-            category: "call",
             "force-start": "1",
             "content-available": "1"
         },
@@ -292,7 +267,7 @@ function envoyerPushTest2Veille(tokenDestinataire, to, from, callId, offerStr, n
         }
     };
 
-    logCall("FCM_SENT", { callId, from, to, info: `[TEST 2 RÉVEIL VEILLE] Envoi push réveil écran (notId=${notIdVal})` });
+    logCall("FCM_SENT", { callId, from, to, info: `[TEST 2 RÉVEIL VEILLE] Envoi push réveil écran (Data-only sans notification)` });
 
     messaging.send(payload)
         .then(response => {
@@ -952,6 +927,7 @@ wss.on("connection", (ws) => {
         if (utilisateurs.get(id) === wsOrigine) {
             utilisateurs.delete(id);
             userAppStates.delete(id);
+            userScreenStates.set(id, "SCREEN_OFF");
         }
 
         const correspondant = appels.get(id);
