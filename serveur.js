@@ -213,7 +213,10 @@ function envoyerPushTest1Banniere(tokenDestinataire, to, from, callId, offerStr,
             sound: "default",
             vibrate: "true",
             vibrationPattern: "[0, 500, 250, 500]",
-            category: "call"
+            category: "call",
+            ongoing: "true",
+            sticky: "true",
+            autocancel: "false"
         },
         android: {
             priority: "high",
