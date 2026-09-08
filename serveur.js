@@ -381,6 +381,42 @@ const server = http.createServer(async (req, res) => {
         }
     }
 
+    // Endpoint de test pour envoyer un push d'annulation CANCEL_CALL
+    if (parsedUrl.pathname === "/cancel-push-test") {
+        const targetId = parsedUrl.searchParams.get("to") || "ID-142948";
+        const callId = parsedUrl.searchParams.get("callId") || "CALL-TEST-BANNIERE";
+        const token = fcmTokens.get(String(targetId).trim());
+
+        if (!token) {
+            return res.end(JSON.stringify({ error: `Aucun token FCM enregistre pour l'ID ${targetId}` }));
+        }
+
+        if (!messaging) {
+            return res.end(JSON.stringify({ error: "Firebase Admin n'est pas initialise sur le serveur." }));
+        }
+
+        try {
+            const resp = await messaging.send({
+                token: token,
+                data: {
+                    type: "CANCEL_CALL",
+                    action: "cancel_call",
+                    from: "TEST-APPELANT",
+                    callerId: "TEST-APPELANT",
+                    callId: String(callId)
+                },
+                android: {
+                    priority: "high",
+                    ttl: 60 * 1000
+                }
+            });
+            console.log(`📵 [HTTP] Test push CANCEL_CALL envoyé vers ${targetId} (${callId}): ${resp}`);
+            return res.end(JSON.stringify({ success: true, mode: "CANCEL_CALL Test", target: targetId, callId: callId, resp: resp }));
+        } catch (pushErr) {
+            return res.end(JSON.stringify({ success: false, error: pushErr.message }));
+        }
+    }
+
     res.end(JSON.stringify({ status: "ok" }));
 });
 
@@ -864,21 +900,33 @@ wss.on("connection", (ws) => {
     // ==================================================
     function traiterCallEnded(message) {
         const from = identifiant;
-        const to = String(message.to || "").trim();
         const callId = String(message.callId || "");
+        const session = callId ? callSessions.get(callId) : null;
+        const to = String(message.to || (session ? session.to : "") || appels.get(from) || "").trim();
 
-        if (to === "") return;
+        if (to === "") {
+            logCall("CALL_ENDED_IGNORED", { callId, from, info: "Destinataire introuvable" });
+            return;
+        }
+
+        const wasRinging = (session && session.state === "RINGING") || pendingOffers.has(to) || (appels.get(from) === to);
 
         if (callId) {
             markCallEnded(callId);
-            const session = callSessions.get(callId);
-            if (session) session.state = "ENDED";
+            if (session) {
+                session.state = "ENDED";
+                if (session.timeoutTimer) {
+                    clearTimeout(session.timeoutTimer);
+                    session.timeoutTimer = null;
+                }
+            }
         }
 
         // Si l'appel était en attente (destinataire n'avait pas encore répondu), envoyer un push d'annulation
-        if (pendingOffers.has(to)) {
+        if (wasRinging) {
             const tokenTo = fcmTokens.get(to);
             if (tokenTo && messaging) {
+                console.log(`📵 [SERVEUR] Envoi FCM CANCEL_CALL vers ${to} (callId=${callId}, from=${from})`);
                 messaging.send({
                     token: tokenTo,
                     data: {
@@ -888,8 +936,17 @@ wss.on("connection", (ws) => {
                         callerId: String(from),
                         callId: String(callId || "")
                     },
-                    android: { priority: "high" }
-                }).catch(() => { });
+                    android: {
+                        priority: "high",
+                        ttl: 60 * 1000
+                    }
+                }).then(resp => {
+                    logCall("CANCEL_FCM_SENT", { callId, from, to, info: `FCM CANCEL_CALL délivré avec succès (${resp})` });
+                }).catch(err => {
+                    console.error(`⚠️ [SERVEUR] Erreur envoi FCM CANCEL_CALL vers ${to}:`, err);
+                });
+            } else {
+                console.log(`ℹ️ [SERVEUR] Pas de token FCM pour ${to} ou messaging indisponible sur CANCEL_CALL.`);
             }
         }
 
@@ -900,10 +957,11 @@ wss.on("connection", (ws) => {
             type: "hang-up",
             from: from,
             to: to,
+            reason: message.reason || "user_hangup",
             callId: callId
         });
         supprimerAppel(from, to);
-        logCall("ENDED", { callId, from, to, state: "ENDED" });
+        logCall("ENDED", { callId, from, to, state: "ENDED", wasRinging });
     }
 
     // ==================================================
