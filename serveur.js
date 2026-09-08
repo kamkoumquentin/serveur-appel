@@ -707,6 +707,10 @@ wss.on("connection", (ws) => {
             return;
         }
 
+        // Nettoyage préventif de toute offre orpheline résiduelle
+        pendingOffers.delete(from);
+        pendingOffers.delete(to);
+
         creerAppel(from, to);
 
         // Enregistrement de la session d'appel serveur
@@ -792,6 +796,8 @@ wss.on("connection", (ws) => {
             if (currentSession && currentSession.state === "RINGING") {
                 logCall("TIMEOUT", { callId, from, to, info: `Délai d'attente sonnerie (${RINGING_TIMEOUT_MS}ms) dépassé sans réponse` });
                 markCallEnded(callId);
+                callSessions.delete(callId);
+                pendingOffers.delete(from);
                 pendingOffers.delete(to);
                 supprimerAppel(from, to);
                 envoyerAUtilisateur(from, {
@@ -880,8 +886,7 @@ wss.on("connection", (ws) => {
 
         if (callId) {
             markCallEnded(callId);
-            const session = callSessions.get(callId);
-            if (session) session.state = "REJECTED";
+            callSessions.delete(callId);
         }
 
         pendingOffers.delete(from);
@@ -911,17 +916,16 @@ wss.on("connection", (ws) => {
             return;
         }
 
-        const wasRinging = (session && session.state === "RINGING") || pendingOffers.has(to) || (appels.get(from) === to);
+        const isSessionRinging = session && session.state === "RINGING";
+        const isPendingOfferRinging = pendingOffers.has(to) && (!session || session.state === "RINGING");
+        const isConnectedOrEnded = session && (session.state === "CONNECTED" || session.state === "ACCEPTING" || session.state === "ENDED" || session.state === "REJECTED");
+        const wasRinging = !isConnectedOrEnded && (isSessionRinging || isPendingOfferRinging);
+
+        console.log(`[CALL_DEBUG] traiterCallEnded: callId=${callId}, from=${from}, to=${to}, sessionState=${session ? session.state : "null"}, pendingOffersHasTo=${pendingOffers.has(to)}, appelsFrom=${appels.get(from)}, decision wasRinging=${wasRinging}`);
 
         if (callId) {
             markCallEnded(callId);
-            if (session) {
-                session.state = "ENDED";
-                if (session.timeoutTimer) {
-                    clearTimeout(session.timeoutTimer);
-                    session.timeoutTimer = null;
-                }
-            }
+            callSessions.delete(callId);
         }
 
         // Si l'appel était en attente (destinataire n'avait pas encore répondu), envoyer un push d'annulation
@@ -1028,6 +1032,12 @@ wss.on("connection", (ws) => {
             });
 
             supprimerAppel(id, correspondant);
+            callSessions.forEach((sess, cId) => {
+                if ((sess.from === id && sess.to === correspondant) || (sess.from === correspondant && sess.to === id)) {
+                    markCallEnded(cId);
+                    callSessions.delete(cId);
+                }
+            });
         }
 
         console.log(`❌ UTILISATEUR DECONNECTE : ${id}`);
