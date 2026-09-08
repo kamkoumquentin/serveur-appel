@@ -401,8 +401,9 @@ const server = http.createServer(async (req, res) => {
                 data: {
                     type: "CANCEL_CALL",
                     action: "cancel_call",
-                    from: "TEST-APPELANT",
                     callerId: "TEST-APPELANT",
+                    callerName: "TEST-APPELANT",
+                    appelant: "TEST-APPELANT",
                     callId: String(callId)
                 },
                 android: {
@@ -808,8 +809,9 @@ wss.on("connection", (ws) => {
                         data: {
                             type: "CANCEL_CALL",
                             action: "cancel_call",
-                            from: String(from),
                             callerId: String(from),
+                            callerName: String(from),
+                            appelant: String(from),
                             callId: String(callId)
                         },
                         android: { priority: "high" }
@@ -932,8 +934,9 @@ wss.on("connection", (ws) => {
                     data: {
                         type: "CANCEL_CALL",
                         action: "cancel_call",
-                        from: String(from),
                         callerId: String(from),
+                        callerName: String(from),
+                        appelant: String(from),
                         callId: String(callId || "")
                     },
                     android: {
