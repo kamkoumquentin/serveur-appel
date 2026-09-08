@@ -366,15 +366,16 @@ const server = http.createServer(async (req, res) => {
         }
 
         const isTestVeille = parsedUrl.pathname === "/test-push-veille";
-        const notIdVal = "9999";
+        const callIdVal = parsedUrl.searchParams.get("callId") || (isTestVeille ? "CALL-TEST-VEILLE" : "CALL-TEST-BANNIERE");
+        const notIdVal = parsedUrl.searchParams.get("notId") || (isTestVeille ? "8888" : "9999");
 
         try {
             if (isTestVeille) {
-                envoyerPushTest2Veille(token, targetId, "TEST-APPELANT", "CALL-TEST-VEILLE", "", notIdVal);
-                return res.end(JSON.stringify({ success: true, mode: "TEST 2 (Réveil Veille)", target: targetId }));
+                envoyerPushTest2Veille(token, targetId, "TEST-APPELANT", callIdVal, "", notIdVal);
+                return res.end(JSON.stringify({ success: true, mode: "TEST 2 (Réveil Veille)", target: targetId, callId: callIdVal }));
             } else {
-                envoyerPushTest1Banniere(token, targetId, "TEST-APPELANT", "CALL-TEST-BANNIERE", "", notIdVal);
-                return res.end(JSON.stringify({ success: true, mode: "TEST 1 (Bannière Interactive)", target: targetId }));
+                envoyerPushTest1Banniere(token, targetId, "TEST-APPELANT", callIdVal, "", notIdVal);
+                return res.end(JSON.stringify({ success: true, mode: "TEST 1 (Bannière Interactive)", target: targetId, callId: callIdVal }));
             }
         } catch (pushErr) {
             return res.end(JSON.stringify({ success: false, error: pushErr.message }));
