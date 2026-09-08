@@ -75,6 +75,40 @@ function markCallEnded(callId) {
     }
 }
 
+function nettoyerSessionAppel(callId, from, to) {
+    if (callId) {
+        markCallEnded(callId);
+        const session = callSessions.get(String(callId));
+        if (session && session.timeoutTimer) {
+            clearTimeout(session.timeoutTimer);
+            session.timeoutTimer = null;
+        }
+        callSessions.delete(String(callId));
+    }
+    if (from || to) {
+        callSessions.forEach((session, cId) => {
+            if ((from && (session.from === from || session.to === from)) ||
+                (to && (session.from === to || session.to === to))) {
+                if (session.timeoutTimer) {
+                    clearTimeout(session.timeoutTimer);
+                    session.timeoutTimer = null;
+                }
+                markCallEnded(cId);
+                callSessions.delete(cId);
+            }
+        });
+    }
+    if (from) {
+        appels.delete(from);
+        pendingOffers.delete(from);
+    }
+    if (to) {
+        appels.delete(to);
+        pendingOffers.delete(to);
+    }
+    console.log(`🧹 [SESSION] Nettoyage complet session appel | callId=${callId || "n/a"} | from=${from || "n/a"} | to=${to || "n/a"}`);
+}
+
 function isCallEnded(callId) {
     if (!callId) return false;
     return endedCalls.has(String(callId));
@@ -174,21 +208,22 @@ function gererErreurFCM(error, to) {
 }
 
 // =============================================================================
-// FONCTION TEST 1 : Bannière interactive (écran allumé / arrière-plan standard)
-// - Utilise calls_channel_v5 sans force-start
-// - Affiche les deux boutons [Refuser] et [Accepter]
-// - Ne force PAS l'ouverture de l'application (zéro concurrence avec l'interface)
+// FONCTION UNIQUE DE NOTIFICATION PUSH D'APPEL ENTRANT (Conforme Spécification Définitive)
+// - Payload complet avec boutons [Refuser] et [Accepter]
+// - Canal calls_channel_v5
+// - L'adaptation visuelle (bannière Heads-Up si déverrouillé vs plein écran si verrouillé)
+//   est gérée localement par le terminal Android à la réception du push.
 // =============================================================================
-function envoyerPushTest1Banniere(tokenDestinataire, to, from, callId, offerStr, notIdVal) {
+function envoyerPushAppelEntrant(tokenDestinataire, to, from, callId, offerStr, notIdVal) {
     if (!messaging) {
         console.error("⚠️ Firebase Messaging n'est pas initialisé.");
         return;
     }
+    const notId = notIdVal || String(Math.floor(10000 + Math.random() * 89999));
     const payload = {
         token: tokenDestinataire,
         data: {
             type: "APPEL",
-            mode: "TEST_1_BANNIERE",
             callId: String(callId),
             callerId: String(from),
             caller_name: String(from),
@@ -198,7 +233,7 @@ function envoyerPushTest1Banniere(tokenDestinataire, to, from, callId, offerStr,
             subText: "Appel entrant",
             message: `${from} vous appelle`,
             body: `${from} vous appelle`,
-            notId: String(notIdVal),
+            notId: String(notId),
             icon: "ic_launcher",
             color: "#00A884",
             offer: offerStr || "",
@@ -231,62 +266,24 @@ function envoyerPushTest1Banniere(tokenDestinataire, to, from, callId, offerStr,
         }
     };
 
-    logCall("FCM_SENT", { callId, from, to, info: `[TEST 1 BANNIÈRE] Envoi push avec boutons [Accepter/Refuser] (notId=${notIdVal})` });
+    logCall("FCM_SENT", { callId, from, to, info: `[PUSH APPEL ENTRANT] Envoi push complet avec boutons [Accepter/Refuser] (notId=${notId})` });
 
     messaging.send(payload)
         .then(response => {
-            logCall("FCM_DELIVERED", { callId, from, to, info: `[TEST 1 BANNIÈRE] FCM envoyé avec succès (${response})` });
+            logCall("FCM_DELIVERED", { callId, from, to, info: `[PUSH APPEL ENTRANT] FCM envoyé avec succès (${response})` });
         })
         .catch(error => {
             gererErreurFCM(error, to);
         });
 }
 
-// =============================================================================
-// FONCTION TEST 2 : Réveil de l'écran en veille & affichage Interface 2 au-dessus du schéma
-// - Payload Data-Only silencieux (AUCUNE notification système affichée dans la barre)
-// - Déclenche le réveil matériel de l'écran via backgroundMode.wakeUp() et l'Interface 2
-// =============================================================================
+// Alias pour compatibilité des endpoints de tests
+function envoyerPushTest1Banniere(tokenDestinataire, to, from, callId, offerStr, notIdVal) {
+    envoyerPushAppelEntrant(tokenDestinataire, to, from, callId, offerStr, notIdVal);
+}
+
 function envoyerPushTest2Veille(tokenDestinataire, to, from, callId, offerStr, notIdVal) {
-    if (!messaging) {
-        console.error("⚠️ Firebase Messaging n'est pas initialisé.");
-        return;
-    }
-    // Payload Data-Only pur : sans title, body, message, ni actions
-    // Sur Android, cela ne crée aucune notification dans la barre de notifications
-    // mais délivre immédiatement les données à l'application pour allumer l'écran
-    const payload = {
-        token: tokenDestinataire,
-        data: {
-            type: "APPEL",
-            mode: "TEST_2_VEILLE",
-            screen_wake: "true",
-            target_mode: "LOCKSCREEN_WAKE",
-            callId: String(callId),
-            callerId: String(from),
-            caller_name: String(from),
-            appelant: String(from),
-            app_name: "KamSoft",
-            offer: offerStr || "",
-            "force-start": "1",
-            "content-available": "1",
-            ringingTimeoutMs: String(RINGING_TIMEOUT_MS)
-        },
-        android: {
-            priority: "high",
-            ttl: 60 * 1000
-        }
-    };
-
-    logCall("FCM_SENT", { callId, from, to, info: `[TEST 2 RÉVEIL VEILLE] Envoi push réveil écran (Data-only sans notification)` });
-
-    messaging.send(payload)
-        .then(response => {
-            logCall("FCM_DELIVERED", { callId, from, to, info: `[TEST 2 RÉVEIL VEILLE] FCM envoyé avec succès (${response})` });
-        })
-        .catch(error => {
-            gererErreurFCM(error, to);
-        });
+    envoyerPushAppelEntrant(tokenDestinataire, to, from, callId, offerStr, notIdVal);
 }
 
 // ======================================================
@@ -758,21 +755,8 @@ wss.on("connection", (ws) => {
                 : "";
 
             const notIdVal = String(Math.floor(10000 + Math.random() * 89999));
-            const screenState = userScreenStates.get(to);
-
-            // ── SÉPARATION STRICTE TEST 1 vs TEST 2 ──────────────────────────
-            // Si le destinataire a son écran EXPLICITEMENT allumé en arrière-plan ET est connecté en WS :
-            // 👉 Utiliser TEST 1 (Bannière interactive avec [Refuser] et [Accepter], sans forçage)
-            // Dans TOUS les autres cas (veille, écran noir avec schéma, app fermée, hors-ligne) :
-            // 👉 Utiliser TEST 2 (Réveil physique de l'écran + Interface 2 active au-dessus du lockscreen)
-            const isStrictementEcranAllume = (screenState === "SCREEN_ON") && destinataireEnLigne;
-            if (isStrictementEcranAllume) {
-                console.log(`☀️ [TEST 1] Destinataire ${to} écran allumé et en ligne -> Push bannière interactive`);
-                envoyerPushTest1Banniere(tokenDestinataire, to, from, callId, offerStr, notIdVal);
-            } else {
-                console.log(`🌙 [TEST 2] Destinataire ${to} en veille ou hors ligne (${screenState || "défaut"}) -> Push réveil écran`);
-                envoyerPushTest2Veille(tokenDestinataire, to, from, callId, offerStr, notIdVal);
-            }
+            console.log(`📲 [PUSH] Envoi push appel entrant complet vers ${to} (callId=${callId}, notId=${notIdVal})`);
+            envoyerPushAppelEntrant(tokenDestinataire, to, from, callId, offerStr, notIdVal);
         } else if (isDestinataireAuPremierPlan) {
             console.log(`ℹ️ Destinataire ${to} a l'application ouverte au premier plan : push FCM non requis.`);
         } else if (!tokenDestinataire) {
@@ -782,8 +766,7 @@ wss.on("connection", (ws) => {
         }
 
         if (!transmisWs && !pushTente) {
-            supprimerAppel(from, to);
-            callSessions.delete(callId);
+            nettoyerSessionAppel(callId, from, to);
             envoyer(ws, {
                 type: "ERROR",
                 message: "Impossible de joindre le correspondant (hors ligne)."
@@ -791,16 +774,13 @@ wss.on("connection", (ws) => {
             return;
         }
 
-        // Timeout de sécurité : si le destinataire ne répond pas après RINGING_TIMEOUT_MS
+        // Timeout de sécurité : si le destinataire ne répond pas après RINGING_TIMEOUT_MS (35s)
         const ringingTimer = setTimeout(() => {
             const currentSession = callSessions.get(callId);
             if (currentSession && currentSession.state === "RINGING") {
                 logCall("TIMEOUT", { callId, from, to, info: `Délai d'attente sonnerie (${RINGING_TIMEOUT_MS}ms) dépassé sans réponse` });
-                markCallEnded(callId);
-                callSessions.delete(callId);
-                pendingOffers.delete(from);
-                pendingOffers.delete(to);
-                supprimerAppel(from, to);
+                nettoyerSessionAppel(callId, from, to);
+                // Notifier l'appelant via WebSocket
                 envoyerAUtilisateur(from, {
                     type: "hang-up",
                     from: to,
@@ -808,7 +788,15 @@ wss.on("connection", (ws) => {
                     reason: "timeout",
                     callId: callId
                 });
-                // Notifier le destinataire pour effacer la notification
+                // Notifier l'appelé via WebSocket s'il est connecté
+                envoyerAUtilisateur(to, {
+                    type: "hang-up",
+                    from: from,
+                    to: to,
+                    reason: "timeout",
+                    callId: callId
+                });
+                // Notifier le destinataire via FCM CANCEL_CALL pour basculer en appel manqué
                 const token = fcmTokens.get(to);
                 if (token && messaging) {
                     messaging.send({
@@ -821,7 +809,10 @@ wss.on("connection", (ws) => {
                             appelant: String(from),
                             callId: String(callId)
                         },
-                        android: { priority: "high" }
+                        android: {
+                            priority: "high",
+                            ttl: 60 * 1000
+                        }
                     }).catch(() => { });
                 }
             }
@@ -885,13 +876,7 @@ wss.on("connection", (ws) => {
 
         if (to === "") return;
 
-        if (callId) {
-            markCallEnded(callId);
-            callSessions.delete(callId);
-        }
-
-        pendingOffers.delete(from);
-        pendingOffers.delete(to);
+        nettoyerSessionAppel(callId, from, to);
 
         envoyerAUtilisateur(to, {
             type: "call-refused",
@@ -899,7 +884,6 @@ wss.on("connection", (ws) => {
             to: to,
             callId: callId
         });
-        supprimerAppel(from, to);
         logCall("REJECTED", { callId, from, to, state: "REJECTED" });
     }
 
@@ -914,22 +898,21 @@ wss.on("connection", (ws) => {
 
         if (to === "") {
             logCall("CALL_ENDED_IGNORED", { callId, from, info: "Destinataire introuvable" });
+            nettoyerSessionAppel(callId, from, null);
             return;
         }
 
         const isSessionRinging = session && session.state === "RINGING";
         const isPendingOfferRinging = pendingOffers.has(to) && (!session || session.state === "RINGING");
         const isConnectedOrEnded = session && (session.state === "CONNECTED" || session.state === "ACCEPTING" || session.state === "ENDED" || session.state === "REJECTED");
-        const wasRinging = !isConnectedOrEnded && (isSessionRinging || isPendingOfferRinging);
+        const wasRinging = !isConnectedOrEnded && (isSessionRinging || isPendingOfferRinging || !session);
 
         console.log(`[CALL_DEBUG] traiterCallEnded: callId=${callId}, from=${from}, to=${to}, sessionState=${session ? session.state : "null"}, pendingOffersHasTo=${pendingOffers.has(to)}, appelsFrom=${appels.get(from)}, decision wasRinging=${wasRinging}`);
 
-        if (callId) {
-            markCallEnded(callId);
-            callSessions.delete(callId);
-        }
+        // Nettoyage systématique et immédiat de la session et des timers
+        nettoyerSessionAppel(callId, from, to);
 
-        // Si l'appel était en attente (destinataire n'avait pas encore répondu), envoyer un push d'annulation
+        // Si l'appel était en attente (destinataire n'avait pas encore répondu), envoyer un push d'annulation (Cas a)
         if (wasRinging) {
             const tokenTo = fcmTokens.get(to);
             if (tokenTo && messaging) {
@@ -958,9 +941,6 @@ wss.on("connection", (ws) => {
             }
         }
 
-        pendingOffers.delete(from);
-        pendingOffers.delete(to);
-
         envoyerAUtilisateur(to, {
             type: "hang-up",
             from: from,
@@ -968,7 +948,6 @@ wss.on("connection", (ws) => {
             reason: message.reason || "user_hangup",
             callId: callId
         });
-        supprimerAppel(from, to);
         logCall("ENDED", { callId, from, to, state: "ENDED", wasRinging });
     }
 
@@ -1032,13 +1011,7 @@ wss.on("connection", (ws) => {
                 reason: "disconnected"
             });
 
-            supprimerAppel(id, correspondant);
-            callSessions.forEach((sess, cId) => {
-                if ((sess.from === id && sess.to === correspondant) || (sess.from === correspondant && sess.to === id)) {
-                    markCallEnded(cId);
-                    callSessions.delete(cId);
-                }
-            });
+            nettoyerSessionAppel(null, id, correspondant);
         }
 
         console.log(`❌ UTILISATEUR DECONNECTE : ${id}`);
