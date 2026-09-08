@@ -210,7 +210,7 @@ function gererErreurFCM(error, to) {
 // =============================================================================
 // FONCTION UNIQUE DE NOTIFICATION PUSH D'APPEL ENTRANT (Conforme Spécification Définitive)
 // - Payload complet avec boutons [Refuser] et [Accepter]
-// - Canal calls_channel_v5
+// - Canal calls_channel_v6
 // - L'adaptation visuelle (bannière Heads-Up si déverrouillé vs plein écran si verrouillé)
 //   est gérée localement par le terminal Android à la réception du push.
 // =============================================================================
@@ -249,12 +249,12 @@ function envoyerPushAppelEntrant(tokenDestinataire, to, from, callId, offerStr, 
                     foreground: true
                 }
             ]),
-            android_channel_id: "calls_channel_v5",
-            channelId: "calls_channel_v5",
+            android_channel_id: "calls_channel_v6",
+            channelId: "calls_channel_v6",
             priority: "2",
             visibility: "1",
             importance: "5",
-            sound: "default",
+            sound: "ringtone",
             vibrate: "true",
             vibrationPattern: "[0, 500, 250, 500]",
             category: "call",
