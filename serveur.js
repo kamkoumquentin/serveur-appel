@@ -14,7 +14,7 @@ let apnProvider = null;
 try {
   apnProvider = new apn.Provider({
     token: {
-      key:MIGTAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBHkwdwIBAQQgQQ89Uh3zRMiN6YlrUlk8tDufQY75O7QggFbBuIMeLEqgCgYIKoZIzj0DAQehRANCAASJnOCVPfyJNifRDXHCyfO2W0bGlq+6B+0KuZVqCTFyVFxSQnFt5wTMjARr//Z+T6ggaccEON4xc+s5bkufznz1, // Chemin vers la clé p8
+      key:process.env.APNS_KEY_CONTENT,
       keyId: "48YTL8938V", // Key ID Apple
       teamId: "C55D4CX59A", // Team ID Apple
     },
