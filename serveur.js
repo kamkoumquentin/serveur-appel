@@ -1,1234 +1,805 @@
-/**
-
-* Serveur de signalisation WebSocket + Push VoIP APNs (iOS) + FCM (Android).
-
-*
-
-* Déployer tel quel sur Render (Web Service, Node).
-
-* Variables d'environnement : voir .env.example
-
-*
-
-* Contrat client (veille.js / ios-callkit-bridge.js) :
-
-* register-user, register-voip-token, call-user, get-offer,
-
-* answer-call, ice-candidate, call-refused, call-end, restart-offer, pong
-
-*/
-
-const fs = require("fs");
-
-const path = require("path");
-
 const express = require("express");
-
 const http = require("http");
-
 const { WebSocketServer, WebSocket } = require("ws");
-
-const apn = require("@parse/node-apn");
-
-
+const apn = require("@parse/node-apn"); // Integration APNs
 
 const app = express();
-
-app.use((_req, res, next) => {
-
-res.setHeader("Access-Control-Allow-Origin", "*");
-
-next();
-
-});
-
 const server = http.createServer(app);
-
 const wss = new WebSocketServer({ server });
 
-
-
 // =========================================================
-
-// CONFIG (env > valeurs par défaut du projet CallApp)
-
+// CONFIGURATION APPLE PUSH NOTIFICATION (APNs VoIP / CallKit)
 // =========================================================
-
-const APP_BUNDLE_ID = process.env.APNS_BUNDLE_ID || "NGOKO.CEDRIC.fm";
-
-const APNS_KEY_ID = process.env.APNS_KEY_ID || "48YTL8938V";
-
-const APNS_TEAM_ID = process.env.APNS_TEAM_ID || "C55D4CX59A";
-
-const APNS_PRODUCTION =
-
-String(process.env.APNS_PRODUCTION || "").toLowerCase() === "true";
-
-const FCM_PROJECT_ID = process.env.FCM_PROJECT_ID || "furthermarket-1975a";
-
-const CALL_TTL_MS = Number(process.env.CALL_TTL_MS || 45000);
-
-const PORT = Number(process.env.PORT || 3000);
-
-
-
-const users = new Map(); // userId -> { ws, pushToken, voipToken }
-
-const pendingCalls = new Map(); // callId -> { from, targetId, offer, isVideo, status, notId, timer }
-
-
-
-// =========================================================
-
-// APNs VoIP
-
-// =========================================================
-
-function loadApnKey() {
-
-if (process.env.APNS_KEY_CONTENT) {
-
-return process.env.APNS_KEY_CONTENT.replace(/\\n/g, "\n");
-
-}
-
-const p =
-
-process.env.APNS_KEY_PATH ||
-
-path.join(__dirname, "AuthKey_48YTL8938V.p8");
-
-if (fs.existsSync(p)) return fs.readFileSync(p, "utf8");
-
-return null;
-
-}
-
-
-
 let apnProvider = null;
-
-(function initApn() {
-
-const key = loadApnKey();
-
-if (!key) {
-
-console.warn("⚠️ APNs : pas de clé .p8 (APNS_KEY_CONTENT ou APNS_KEY_PATH). VoIP iOS inactif.");
-
-return;
-
-}
-
 try {
-
-apnProvider = new apn.Provider({
-
-token: { key, keyId: APNS_KEY_ID, teamId: APNS_TEAM_ID },
-
-production: APNS_PRODUCTION,
-
-});
-
-console.log(
-
-`🍏 APNs VoIP prêt | topic=${APP_BUNDLE_ID}.voip | env=${APNS_PRODUCTION ? "production" : "sandbox"}`
-
-);
-
+  apnProvider = new apn.Provider({
+    token: {
+      key: "./AuthKey_48YTL8938V.p8", // Chemin vers la clé p8
+      keyId: "48YTL8938V", // Key ID Apple
+      teamId: "C55D4CX59A", // Team ID Apple
+    },
+    production: false, // Passer à true pour la production / App Store
+  });
+  console.log("🍏 Configuration APNs VoIP initialisée.");
 } catch (err) {
-
-console.warn("⚠️ Init APNs échouée :", err.message);
-
+  console.warn(
+    "⚠️ Impossible d'initialiser APNs VoIP (Vérifiez le fichier AuthKey p8) :",
+    err.message,
+  );
 }
 
-})();
+const APP_BUNDLE_ID = "NGOKO.CEDRIC.fm"; // Remplacez par votre Bundle ID iOS
 
+// Carte globale persistante (RAM) pour conserver les utilisateurs, leurs tokens FCM et VoIP
+const users = new Map();
 
+// Stockage temporaire en mémoire RAM pour les offres d'appel (évite de surcharger FCM)
+const pendingCalls = new Map();
 
-function maskToken(t) {
+const RING_TIMEOUT_MS = Number(process.env.RING_TIMEOUT_MS) || 30000;
+const missedCallsQueue = new Map(); // userId -> [{callId, from, isVideo, at, reason}], max 50, 7 jours
+const MISSED_CALL_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 jours
+const MAX_MISSED_CALLS = 50;
 
-if (!t || typeof t !== "string") return "aucun";
-
-if (t.length <= 12) return t;
-
-return t.slice(0, 6) + "…" + t.slice(-4);
-
+function sendIfOpen(ws, payload) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(payload));
+  }
 }
 
-
-
-function invalidateVoipToken(userId, reason) {
-
-const u = users.get(userId);
-
-if (!u || !u.voipToken) return;
-
-console.warn(`🗑️ Token VoIP invalidé (${reason}) pour ${userId}`);
-
-users.set(userId, { ...u, voipToken: null });
-
+function findCall(fromId, toId, statuses) {
+  let lastMatch = null;
+  for (const [id, call] of pendingCalls.entries()) {
+    if (call.from === fromId && call.targetId === toId) {
+      if (!statuses || statuses.includes(call.status)) {
+        lastMatch = { id, call };
+      }
+    }
+  }
+  return lastMatch;
 }
 
-
-
-function invalidateFcmToken(userId, reason) {
-
-const u = users.get(userId);
-
-if (!u || !u.pushToken) return;
-
-console.warn(`🗑️ Token FCM invalidé (${reason}) pour ${userId}`);
-
-users.set(userId, { ...u, pushToken: null });
-
+function queueMissedCall(userId, entry) {
+  if (!userId) return;
+  let queue = missedCallsQueue.get(userId) || [];
+  const now = Date.now();
+  queue = queue.filter(
+    (item) => now - item.at < MISSED_CALL_TTL_MS && item.callId !== entry.callId,
+  );
+  queue.push(entry);
+  if (queue.length > MAX_MISSED_CALLS) {
+    queue = queue.slice(-MAX_MISSED_CALLS);
+  }
+  missedCallsQueue.set(userId, queue);
 }
 
-
-
-async function envoyerNotificationVoipIOS(userId, voipToken, callerId, callId, isVideo, cancel) {
-
-if (!apnProvider || !voipToken) return { sent: false };
-
-
-
-const note = new apn.Notification();
-
-note.topic = `${APP_BUNDLE_ID}.voip`;
-
-note.pushType = "voip";
-
-note.priority = 10;
-
-note.expiry = 0;
-
-note.collapseId = String(callId || "").slice(0, 64);
-
-
-
-note.alert = cancel ? "Appel annulé" : "Appel entrant";
-
-const caller = {
-
-Username: String(callerId),
-
-ConnectionId: String(callId),
-
-isVideo: isVideo ? "true" : "false",
-
-};
-
-if (cancel) caller.CancelPush = "true";
-
-note.payload = { data: JSON.stringify({ Caller: caller }) };
-
-
-
-try {
-
-const result = await apnProvider.send(note, voipToken);
-
-const failed = result.failed || [];
-
-console.log(
-
-`🍏 VoIP ${cancel ? "CANCEL" : "RING"} → ${userId} sent=${result.sent.length} fail=${failed.length}`
-
-);
-
-for (const f of failed) {
-
-const status = f.status;
-
-const reason = (f.response && f.response.reason) || f.error;
-
-console.error("❌ Échec VoIP :", status, reason);
-
-if (
-
-status === 410 ||
-
-reason === "Unregistered" ||
-
-reason === "BadDeviceToken" ||
-
-reason === "DeviceTokenNotForTopic"
-
-) {
-
-invalidateVoipToken(userId, String(reason || status));
-
+function sendPendingMissedCalls(userId, ws) {
+  if (!userId) return;
+  let queue = missedCallsQueue.get(userId);
+  if (!queue || queue.length === 0) return;
+  const now = Date.now();
+  queue = queue.filter((item) => now - item.at < MISSED_CALL_TTL_MS);
+  if (queue.length === 0) {
+    missedCallsQueue.delete(userId);
+    return;
+  }
+  missedCallsQueue.set(userId, queue);
+  sendIfOpen(ws, {
+    type: "missed-calls",
+    calls: queue,
+  });
 }
 
+function acknowledgeMissedCalls(userId, callIds) {
+  if (!userId || !Array.isArray(callIds) || callIds.length === 0) return;
+  const queue = missedCallsQueue.get(userId);
+  if (!queue || queue.length === 0) return;
+  const idSet = new Set(callIds);
+  const remaining = queue.filter((item) => !idSet.has(item.callId));
+  if (remaining.length === 0) {
+    missedCallsQueue.delete(userId);
+  } else {
+    missedCallsQueue.set(userId, remaining);
+  }
 }
 
-return { sent: result.sent.length > 0, failed };
+function declareMissedCall(callId, reason) {
+  const call = pendingCalls.get(callId);
+  if (!call || call.status !== "RINGING") {
+    return;
+  }
+  if (call.ringTimer) {
+    clearTimeout(call.ringTimer);
+    call.ringTimer = null;
+  }
+  call.status = reason === "timeout" ? "MISSED" : "CANCELED";
 
-} catch (error) {
+  const entry = {
+    callId,
+    from: call.from,
+    isVideo: call.isVideo,
+    at: Date.now(),
+    reason,
+  };
 
-console.error("❌ Exception Push VoIP :", error);
+  queueMissedCall(call.targetId, entry);
 
-return { sent: false, error };
+  const targetUser = users.get(call.targetId);
+  sendIfOpen(targetUser?.ws, {
+    type: "call-missed",
+    ...entry,
+  });
 
+  if (targetUser && targetUser.pushToken) {
+    envoyerNotificationAppelManque(
+      targetUser.pushToken,
+      call.from,
+      call.isVideo,
+      call.notId,
+    );
+  }
+
+  if (reason === "timeout") {
+    const callerUser = users.get(call.from);
+    sendIfOpen(callerUser?.ws, {
+      type: "call-no-answer",
+      callId,
+      targetId: call.targetId,
+    });
+  }
 }
-
-}
-
-
-
-async function envoyerAnnulationVoipIOS(userId, voipToken, callerId, callId, isVideo) {
-
-return envoyerNotificationVoipIOS(userId, voipToken, callerId, callId, isVideo, true);
-
-}
-
-
 
 // =========================================================
-
-// FCM HTTP v1
-
+// ENVOI NOTIFICATION FCM VIA HTTP REST (v1)
 // =========================================================
+async function sendFcmHttpV1Message(messagePayload) {
+  try {
+    const accessToken =
+      "ya29.a0AdMD6EgvncMrEPMh0JgPCwJx2ysZ3dwleiHyTGMXdJnSYxDlcdLwaJwpx4iNhD3W2qDf0ttt0ICIABztuk6cJoXgUdETR1drEYSS6fNOyIu85ldWLJrWeV_TNvjTvOPVr4kxgKgOaNlZBuctqHcwqN2Vj-a-cwrp8LWn6u9njkZfI_YRz9qnznCcGgI4Sg1RLNswJgMaCgYKAUASARISFQHGX2Misxfrryu9mxWnfyPRE11WVg0206";
+    const url =
+      "https://fcm.googleapis.com/v1/projects/furthermarket-1975a/messages:send";
 
-let googleAuth = null;
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ message: messagePayload }),
+    });
 
-let fcmServiceAccount = null;
-
-
-
-function loadServiceAccount() {
-
-if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
-
-try {
-
-return JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
-
-} catch (e) {
-
-console.warn("⚠️ FIREBASE_SERVICE_ACCOUNT_JSON invalide");
-
+    const result = await response.json();
+    if (!response.ok) {
+      console.error("❌ Erreur API FCM v1 :", result);
+      return null;
+    }
+    return result;
+  } catch (error) {
+    console.error("❌ Erreur REST FCM :", error);
+    return null;
+  }
 }
 
-}
-
-const p =
-
-process.env.GOOGLE_APPLICATION_CREDENTIALS ||
-
-path.join(__dirname, "servicesAccountKey.json");
-
-if (fs.existsSync(p)) {
-
-try {
-
-return JSON.parse(fs.readFileSync(p, "utf8"));
-
-} catch (e) {
-
-console.warn("⚠️ Impossible de lire le compte de service FCM :", e.message);
-
-}
-
-}
-
-return null;
-
-}
-
-
-
-async function getFcmAccessToken() {
-
-if (!fcmServiceAccount) {
-
-fcmServiceAccount = loadServiceAccount();
-
-if (!fcmServiceAccount) return null;
-
-}
-
-if (!googleAuth) {
-
-const { GoogleAuth } = require("google-auth-library");
-
-googleAuth = new GoogleAuth({
-
-credentials: fcmServiceAccount,
-
-scopes: ["https://www.googleapis.com/auth/firebase.messaging"],
-
+app.get("/", (req, res) => {
+  res.send("Serveur WebSocket actif");
 });
 
-}
-
-const client = await googleAuth.getClient();
-
-const tok = await client.getAccessToken();
-
-return tok && tok.token;
-
-}
-
-
-
-async function sendFcmHttpV1Message(messagePayload, userId) {
-
-try {
-
-const accessToken = await getFcmAccessToken();
-
-if (!accessToken) {
-
-console.warn("⚠️ FCM inactif : pas de compte de service (FIREBASE_SERVICE_ACCOUNT_JSON).");
-
-return null;
-
-}
-
-const projectId = (fcmServiceAccount && fcmServiceAccount.project_id) || FCM_PROJECT_ID;
-
-const url = `https://fcm.googleapis.com/v1/projects/${projectId}/messages:send`;
-
-const response = await fetch(url, {
-
-method: "POST",
-
-headers: {
-
-Authorization: `Bearer ${accessToken}`,
-
-"Content-Type": "application/json",
-
-},
-
-body: JSON.stringify({ message: messagePayload }),
-
-});
-
-const result = await response.json();
-
-if (!response.ok) {
-
-console.error("❌ FCM v1 :", result);
-
-const code = result.error && result.error.details && result.error.details[0] && result.error.details[0].errorCode;
-
-if (code === "UNREGISTERED" && userId) invalidateFcmToken(userId, "UNREGISTERED");
-
-return null;
-
-}
-
-return result;
-
-} catch (error) {
-
-console.error("❌ REST FCM :", error);
-
-return null;
-
-}
-
-}
-
-
-
-async function envoyerNotificationPush(userId, tokenDestinataire, nomExpediteur, from, callId, isVideo, notId) {
-
-if (!tokenDestinataire) return;
-
-const currentNotId = notId || Math.floor(100000 + Math.random() * 900000);
-
-const title = isVideo ? "Appel vidéo entrant" : "Appel entrant";
-
-const body = `Appel de ${from}`;
-
-
-
-const payload = {
-
-token: tokenDestinataire,
-
-data: {
-
-title,
-
-message: body,
-
-type: "incoming-call",
-
-callerId: String(from),
-
-callerName: String(nomExpediteur || from),
-
-callId: String(callId),
-
-isVideo: String(!!isVideo),
-
-notId: String(currentNotId),
-
-actions: JSON.stringify([
-
-{ title: "Refuser", callback: "reject", foreground: false },
-
-{ title: "Accepter", callback: "accept", foreground: true },
-
-]),
-
-},
-
-android: { priority: "high" },
-
-apns: {
-
-headers: { "apns-priority": "10", "apns-push-type": "alert" },
-
-payload: {
-
-aps: {
-
-alert: { title, body },
-
-sound: "default",
-
-badge: 1,
-
-"content-available": 1,
-
-},
-
-},
-
-},
-
-};
-
-const result = await sendFcmHttpV1Message(payload, userId);
-
-if (result) console.log("📲 FCM incoming-call →", userId);
-
-}
-
-
-
-async function envoyerNotificationAppelManque(userId, tokenDestinataire, nomExpediteur, isVideo, notId) {
-
-if (!tokenDestinataire) return;
-
-const payload = {
-
-token: tokenDestinataire,
-
-notification: {
-
-title: "Appel manqué",
-
-body: `Vous avez manqué un appel ${isVideo ? "vidéo" : "audio"} de ${nomExpediteur}`,
-
-},
-
-data: {
-
-type: "missed-call",
-
-callerId: String(nomExpediteur),
-
-notId: String(notId || ""),
-
-},
-
-android: {
-
-priority: "high",
-
-notification: { channel_id: "incoming_calls" },
-
-},
-
-apns: {
-
-headers: { "apns-priority": "10", "apns-push-type": "alert" },
-
-payload: {
-
-aps: {
-
-alert: {
-
-title: "Appel manqué",
-
-body: `Vous avez manqué un appel ${isVideo ? "vidéo" : "audio"} de ${nomExpediteur}`,
-
-},
-
-sound: "default",
-
-},
-
-},
-
-},
-
-};
-
-const result = await sendFcmHttpV1Message(payload, userId);
-
-if (result) console.log("📵 FCM missed-call →", userId);
-
-}
-
-
-
 // =========================================================
-
-// HTTP (wake Render + santé)
-
+// HEARTBEAT (Garde les connexions actives)
 // =========================================================
-
-app.get("/", (_req, res) => {
-
-res.json({
-
-ok: true,
-
-service: "callapp-signaling",
-
-users: users.size,
-
-pendingCalls: pendingCalls.size,
-
-apns: !!apnProvider,
-
-apnsEnv: APNS_PRODUCTION ? "production" : "sandbox",
-
-});
-
-});
-
-
-
-app.get("/health", (_req, res) => res.send("ok"));
-
-
-
-// =========================================================
-
-// HEARTBEAT
-
-// =========================================================
-
 const interval = setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (ws.isAlive === false) {
+      console.log(`⚠️ Client inactif expulsé : ${ws.userId || "Inconnu"}`);
+      if (ws.userId && users.get(ws.userId)?.ws === ws) {
+        // Déconnexion : Passe le socket à null sans supprimer l'utilisateur de la Map
+        const existingUser = users.get(ws.userId);
+        users.set(ws.userId, {
+          ...existingUser,
+          ws: null,
+        });
+      }
+      return ws.terminate();
+    }
 
-wss.clients.forEach((ws) => {
+    ws.isAlive = false;
 
-if (ws.isAlive === false) {
-
-if (ws.userId && users.get(ws.userId)?.ws === ws) {
-
-const existing = users.get(ws.userId);
-
-users.set(ws.userId, { ...existing, ws: null });
-
-}
-
-return ws.terminate();
-
-}
-
-ws.isAlive = false;
-
-try {
-
-ws.ping();
-
-ws.send(JSON.stringify({ type: "ping" }));
-
-} catch (e) {}
-
-});
-
+    try {
+      ws.ping();
+      ws.send(JSON.stringify({ type: "ping" }));
+    } catch (e) {
+      console.error("Erreur envoi ping :", e);
+    }
+  });
 }, 30000);
 
-
-
-wss.on("close", () => clearInterval(interval));
-
-
-
-function sendJson(ws, obj) {
-
-if (ws && ws.readyState === WebSocket.OPEN) {
-
-ws.send(JSON.stringify(obj));
-
-return true;
-
-}
-
-return false;
-
-}
-
-
-
-function findPendingCall(fromId, targetId) {
-
-for (const [cId, callData] of pendingCalls.entries()) {
-
-if (
-
-(callData.from === fromId && callData.targetId === targetId) ||
-
-(callData.from === targetId && callData.targetId === fromId)
-
-) {
-
-return { cId, callData };
-
-}
-
-}
-
-return null;
-
-}
-
-
-
-function dropPending(cId) {
-
-const call = pendingCalls.get(cId);
-
-if (call && call.timer) clearTimeout(call.timer);
-
-pendingCalls.delete(cId);
-
-}
-
-
+wss.on("close", () => {
+  clearInterval(interval);
+});
 
 // =========================================================
-
-// WEBSOCKET
-
+// GESTION DES CONNEXIONS WEBSOCKET
 // =========================================================
-
 wss.on("connection", (ws) => {
+  ws.isAlive = true;
 
-ws.isAlive = true;
+  ws.on("pong", () => {
+    ws.isAlive = true;
+  });
 
-ws.on("pong", () => {
+  ws.on("message", async (message) => {
+    ws.isAlive = true;
 
-ws.isAlive = true;
+    try {
+      const data = JSON.parse(message);
+      // Récupération de la propriété isVideo transmise par le client
+      const {
+        type,
+        userId,
+        pushToken,
+        voipToken,
+        targetId,
+        offer,
+        answer,
+        candidate,
+        isVideo,
+        callId,
+      } = data;
 
+      if (type === "pong") {
+        return;
+      }
+
+      console.log(
+        `📩 Message reçu | type=${type} | de=${ws.userId || "?"} | targetId=${targetId || "-"} | callId=${callId || "-"}`,
+      );
+
+      // 1. Enregistrement / Reconnexion de l'utilisateur
+      if (type === "register-user") {
+        ws.userId = userId;
+
+        // VÉRIFICATION DE LA PRÉSENCE DANS LA MAP
+        if (users.has(userId)) {
+          const existingUser = users.get(userId);
+          console.log(
+            `🔄 Utilisateur ${userId} déjà présent dans la Map. Mise à jour de la connexion...`,
+          );
+
+          // Fermer l'ancien socket s'il existe et qu'il est encore actif
+          if (existingUser.ws && existingUser.ws !== ws) {
+            existingUser.ws.userId = null;
+            existingUser.ws.terminate();
+          }
+
+          // Mise à jour : Nouveau socket + mise à jour du token
+          users.set(userId, {
+            ...existingUser,
+            ws: ws,
+            pushToken: pushToken || existingUser.pushToken || null,
+          });
+        } else {
+          // Nouvel utilisateur
+          console.log(
+            `✨ Nouvel utilisateur enregistré dans la Map : ${userId}`,
+          );
+          users.set(userId, {
+            ws: ws,
+            pushToken: pushToken || null,
+            voipToken: null,
+          });
+        }
+
+        const currentUser = users.get(userId);
+        console.log(
+          `👤 Statut : ${userId} | Token FCM : ${currentUser.pushToken || "Aucun"} | Token VoIP : ${currentUser.voipToken || "Aucun"}`,
+        );
+        console.log(
+          "👥 Liste globale des utilisateurs enregistrés :",
+          Array.from(users.keys()),
+        );
+
+        console.log(`✅ [ÉTAPE 1/6 serveur] register-user traité pour ${userId}, accusé 'registered' envoyé.`);
+        ws.send(
+          JSON.stringify({
+            type: "registered",
+            userId: userId,
+          }),
+        );
+        sendPendingMissedCalls(userId, ws);
+        return;
+      }
+
+      if (type === "missed-calls-ack") {
+        acknowledgeMissedCalls(ws.userId, data.callIds);
+        return;
+      }
+
+      // 1b. Enregistrement spécifique du Token APNs VoIP (iOS CallKit)
+      if (type === "register-voip-token") {
+        ws.userId = userId;
+        const existingUser = users.get(userId) || {};
+        users.set(userId, {
+          ...existingUser,
+          ws: ws,
+          voipToken: voipToken || existingUser.voipToken || null,
+        });
+
+        console.log(`🍏 Token VoIP iOS enregistré pour : ${userId}`);
+        return;
+      }
+
+      // 2. Appel de l'utilisateur ('call-user')
+      if (type === "call-user") {
+        const targetUser = users.get(targetId);
+        const targetWs = targetUser?.ws;
+        const callTypeLabel = isVideo ? "vidéo" : "audio";
+
+        const newCallId = `call_${Date.now()}_${ws.userId}`;
+        const notificationId =
+          data.notId || Math.floor(100000 + Math.random() * 900000);
+
+        // Enregistrement de l'appel avec le statut RINGING
+        pendingCalls.set(newCallId, {
+          from: ws.userId,
+          targetId: targetId,
+          offer: offer,
+          isVideo: !!isVideo,
+          status: "RINGING",
+          notId: notificationId,
+          ringTimer: setTimeout(
+            () => declareMissedCall(newCallId, "timeout"),
+            RING_TIMEOUT_MS,
+          ),
+        });
+
+        // ✅ Généreux volontairement (2 minutes) : entre la sonnerie CallKit (qui peut
+        // durer longtemps si le destinataire met du temps à décrocher) et le temps de
+        // reconnexion WebSocket côté client (jusqu'à ~30s si le serveur était en veille),
+        // 45s était trop court et faisait expirer l'appel avant même que get-offer arrive.
+        setTimeout(() => pendingCalls.delete(newCallId), 120000);
+
+        if (targetWs && targetWs.readyState === WebSocket.OPEN) {
+          targetWs.send(
+            JSON.stringify({
+              type: "incoming-call",
+              callId: newCallId,
+              from: ws.userId,
+              offer: offer,
+              isVideo: !!isVideo,
+              notId: notificationId,
+            }),
+          );
+
+          // Envoi Push APNs VoIP si l'utilisateur possède un token VoIP iOS
+          if (targetUser?.voipToken) {
+            await envoyerNotificationVoipIOS(
+              targetUser.voipToken,
+              ws.userId,
+              newCallId,
+              isVideo,
+            );
+          } else if (targetUser?.pushToken) {
+            await envoyerNotificationPush(
+              targetUser.pushToken,
+              ws.userId,
+              `Appel ${callTypeLabel} de ${ws.userId}`,
+              ws.userId,
+              newCallId,
+              isVideo,
+              notificationId,
+            );
+          }
+        } else if (targetUser?.voipToken || targetUser?.pushToken) {
+          if (targetUser.voipToken) {
+            await envoyerNotificationVoipIOS(
+              targetUser.voipToken,
+              ws.userId,
+              newCallId,
+              isVideo,
+            );
+          } else if (targetUser.pushToken) {
+            await envoyerNotificationPush(
+              targetUser.pushToken,
+              ws.userId,
+              `Appel ${callTypeLabel} de ${ws.userId}`,
+              ws.userId,
+              newCallId,
+              isVideo,
+              notificationId,
+            );
+          }
+
+          ws.send(JSON.stringify({ type: "user-offline", targetId: targetId }));
+        } else {
+          ws.send(JSON.stringify({ type: "user-offline", targetId: targetId }));
+        }
+        return;
+      }
+
+      // 3. Récupérer l'offre SDP complète si l'application est ouverte via la notification FCM
+      if (type === "get-offer") {
+        const callData = pendingCalls.get(callId);
+        if (callData && (callData.status === "RINGING" || callData.status === "ACCEPTED")) {
+          console.log(
+            `📨 [ÉTAPE 2/6 serveur] get-offer trouvé pour callId=${callId} (from=${callData.from}, status=${callData.status}) → envoi de call-offer-details à ${ws.userId || "?"}`,
+          );
+          ws.send(
+            JSON.stringify({
+              type: "call-offer-details",
+              callId: callId,
+              from: callData.from,
+              offer: callData.offer,
+              isVideo: callData.isVideo,
+            }),
+          );
+        } else {
+          console.warn(
+            `⚠️ [ÉTAPE 2/6 serveur] get-offer : callId=${callId} introuvable ou non valide dans pendingCalls (expiré ou jamais enregistré). pendingCalls actuels :`,
+            Array.from(pendingCalls.keys()),
+          );
+          ws.send(
+            JSON.stringify({
+              type: "call-expired",
+              callId: callId,
+            }),
+          );
+        }
+        return;
+      }
+
+      // 4. Transmettre la réponse (B -> A)
+      if (type === "answer-call") {
+        console.log(`📤 [ÉTAPE 6/6 serveur] answer-call reçu de ${ws.userId || "?"} pour targetId=${targetId}.`);
+
+        const answered = findCall(targetId, ws.userId);
+        if (answered) {
+          if (answered.call.status === "MISSED" || answered.call.status === "CANCELED") {
+            sendIfOpen(ws, { type: "call-expired", callId: answered.id });
+            return;
+          }
+          if (answered.call.status === "RINGING") {
+            if (answered.call.ringTimer) {
+              clearTimeout(answered.call.ringTimer);
+              answered.call.ringTimer = null;
+            }
+            answered.call.status = "ACCEPTED";
+          }
+        }
+
+        const targetUserForAnswer = users.get(targetId);
+        const targetWs = targetUserForAnswer?.ws;
+        if (targetWs && targetWs.readyState === WebSocket.OPEN) {
+          console.log("✅ [ÉTAPE 6/6 serveur] le recepteur a decrocher — call-answered transmis à l'émetteur.");
+          targetWs.send(
+            JSON.stringify({
+              type: "call-answered",
+              answer: answer,
+            }),
+          );
+        } else if (!targetUserForAnswer) {
+          console.warn(
+            `⚠️ answer-call : aucun utilisateur "${targetId}" trouvé dans la Map (émetteur introuvable).`,
+          );
+        } else {
+          console.warn(
+            `⚠️ answer-call : émetteur "${targetId}" trouvé mais son socket est fermé (readyState=${targetWs?.readyState}). La notification "call-answered" n'a pas pu être envoyée.`,
+          );
+        }
+        return;
+      }
+
+      // 5. Échanger les candidats ICE
+      if (type === "ice-candidate") {
+        const targetWs = users.get(targetId)?.ws;
+        if (targetWs && targetWs.readyState === WebSocket.OPEN) {
+          targetWs.send(
+            JSON.stringify({
+              type: "ice-candidate",
+              candidate: candidate,
+            }),
+          );
+        }
+        return;
+      }
+
+      // 6. Refus d'un appel
+      if (type === "call-refused") {
+        const refused = findCall(targetId, ws.userId, ["RINGING"]);
+        if (refused) {
+          if (refused.call.ringTimer) {
+            clearTimeout(refused.call.ringTimer);
+            refused.call.ringTimer = null;
+          }
+          refused.call.status = "REFUSED";
+        }
+
+        const targetWs = users.get(targetId)?.ws;
+        if (targetWs && targetWs.readyState === WebSocket.OPEN) {
+          targetWs.send(
+            JSON.stringify({
+              type: "call-refused",
+              from: ws.userId,
+            }),
+          );
+        }
+        return;
+      }
+
+      // 7. Fin d'un appel
+      if (type === "call-end") {
+        const live = findCall(ws.userId, targetId, ["RINGING", "ACCEPTED"]);
+        if (live) {
+          if (live.call.status === "RINGING") {
+            declareMissedCall(live.id, "cancelled");
+          } else {
+            pendingCalls.delete(live.id);
+          }
+        }
+
+        const targetUser = users.get(targetId);
+        const targetWs = targetUser?.ws;
+
+        if (targetWs && targetWs.readyState === WebSocket.OPEN) {
+          targetWs.send(
+            JSON.stringify({
+              type: type,
+              from: ws.userId,
+              target: targetId,
+            }),
+          );
+        }
+      }
+
+      // 8. Restart ICE
+      if (type === "restart-offer") {
+        const targetWs = users.get(targetId)?.ws;
+        if (targetWs && targetWs.readyState === WebSocket.OPEN) {
+          targetWs.send(
+            JSON.stringify({
+              type: "restart-offer",
+              offer: offer,
+            }),
+          );
+        }
+        return;
+      }
+    } catch (error) {
+      console.error("❌ Erreur de lecture du message :", error);
+    }
+  });
+
+  // Nettoyage à la déconnexion
+  ws.on("close", () => {
+    if (ws.userId) {
+      const existingUser = users.get(ws.userId);
+      if (existingUser?.ws === ws) {
+        users.set(ws.userId, {
+          ...existingUser,
+          ws: null,
+        });
+        console.log(
+          `❌ Socket déconnecté pour ${ws.userId} (Utilisateur et Tokens conservés)`,
+        );
+      }
+    }
+  });
+
+  ws.on("error", (error) => {
+    console.error(
+      `❌ Erreur WebSocket sur l'utilisateur ${ws.userId || "Inconnu"} :`,
+      error,
+    );
+  });
 });
 
+/**
+ * Fonction d'envoi de notification "Appel Entrant" via HTTP REST Bearer FCM v1
+ */
+async function envoyerNotificationPush(
+  tokenDestinataire,
+  nomExpediteur,
+  texteMessage,
+  from,
+  callId,
+  isVideo = false,
+  notId = null,
+) {
+  if (!tokenDestinataire) {
+    console.warn(
+      "⚠️ Impossible d'envoyer la notification : Aucun token FCM fourni.",
+    );
+    return;
+  }
 
+  const currentNotId = notId || Math.floor(100000 + Math.random() * 900000);
 
-ws.on("message", async (message) => {
+  const payload = {
+    token: tokenDestinataire,
+    data: {
+      title: isVideo ? "📹 Appel vidéo entrant" : "📞 Appel entrant",
+      message: texteMessage || `Appel de ${from}`,
+      type: "incoming-call",
+      callerId: String(from),
+      callerName: String(nomExpediteur || from),
+      callId: String(callId),
+      isVideo: String(isVideo),
+      notId: String(currentNotId),
+      actions: JSON.stringify([
+        {
+          title: "Refuser",
+          callback: "reject",
+          foreground: false,
+        },
+        {
+          title: "Accepter",
+          callback: "accept",
+          foreground: true,
+        },
+      ]),
+    },
+    android: {
+      priority: "high",
+    },
+    apns: {
+      headers: {
+        "apns-priority": "10",
+        "apns-push-type": "alert",
+      },
+      payload: {
+        aps: {
+          alert: {
+            title: isVideo ? "📹 Appel vidéo entrant" : "📞 Appel entrant",
+            body: texteMessage || `Appel de ${from}`,
+          },
+          sound: "default",
+          badge: 1,
+          "content-available": 1,
+        },
+      },
+    },
+  };
 
-ws.isAlive = true;
-
-let data;
-
-try {
-
-data = JSON.parse(message);
-
-} catch (e) {
-
-return;
-
+  const result = await sendFcmHttpV1Message(payload);
+  if (result) {
+    console.log("📲 Notification Push FCM envoyée avec succès :", result.name);
+  }
 }
 
+/**
+ * Fonction d'envoi de notification "Appel Manqué" via HTTP REST Bearer FCM v1
+ */
+async function envoyerNotificationAppelManque(
+  tokenDestinataire,
+  nomExpediteur,
+  isVideo,
+  notId,
+) {
+  if (!tokenDestinataire) return;
 
+  const payload = {
+    token: tokenDestinataire,
+    notification: {
+      title: "Appel manqué",
+      body: `Vous avez manqué un appel ${isVideo ? "vidéo" : "audio"} de ${nomExpediteur}`,
+    },
+    data: {
+      type: "missed-call",
+      callerId: String(nomExpediteur),
+      notId: String(notId),
+    },
+    android: {
+      priority: "high",
+      notification: {
+        channel_id: "incoming_calls",
+      },
+    },
 
-const {
+    apns: {
+      headers: {
+        "apns-priority": "10",
+        "apns-push-type": "alert",
+      },
+      payload: {
+        aps: {
+          alert: {
+            title: "Appel manqué",
+            body: `Vous avez manqué un appel ${isVideo ? "vidéo" : "audio"} de ${nomExpediteur}`,
+          },
+          sound: "default",
+          badge: 1,
+        },
+      },
+    },
+  };
 
-type,
-
-userId,
-
-pushToken,
-
-voipToken,
-
-targetId,
-
-offer,
-
-answer,
-
-candidate,
-
-isVideo,
-
-callId,
-
-} = data;
-
-
-
-if (type === "pong") return;
-
-
-
-if (type === "register-user") {
-
-if (!userId) return;
-
-ws.userId = userId;
-
-const existing = users.get(userId) || {};
-
-if (existing.ws && existing.ws !== ws) {
-
-existing.ws.userId = null;
-
-try { existing.ws.terminate(); } catch (e) {}
-
+  const result = await sendFcmHttpV1Message(payload);
+  if (result) {
+    console.log(`📵 Notification Appel Manqué envoyée pour notId : ${notId}`);
+  }
 }
 
-users.set(userId, {
+// =========================================================
+// ENVOI PUSH VOIP APPLE DIRECT (iOS CallKit)
+// =========================================================
+async function envoyerNotificationVoipIOS(
+  voipToken,
+  callerId,
+  callId,
+  isVideo = false,
+) {
+  if (!apnProvider || !voipToken) return;
 
-...existing,
+  const note = new apn.Notification();
+  note.topic = `${APP_BUNDLE_ID}.voip`;
+  note.priority = 10;
+  note.pushType = "voip";
 
-ws,
+  // CordovaCall.m (didReceiveIncomingPushWithPayload) lit :
+  //   payload["aps"]["alert"]  -> doit être une string non-nil (sinon crash)
+  //   payload["data"]          -> doit être une STRING contenant du JSON,
+  //                                pas un objet imbriqué directement.
+  note.alert = "Appel entrant"; // valeur peu importe le contenu, juste non-nil
+  note.payload = {
+    data: JSON.stringify({
+      Caller: {
+        Username: String(callerId),
+        ConnectionId: String(callId),
+        // ✅ Sans ça, CordovaCall.m (didReceiveIncomingPushWithPayload) ne peut pas
+        // savoir si l'appel entrant est vidéo : CXCallUpdate.hasVideo resterait
+        // toujours à false, et iOS ne déclencherait jamais l'écran de déverrouillage
+        // automatique avant de lancer l'app (comportement natif CallKit réservé aux
+        // appels avec hasVideo=true).
+        isVideo: !!isVideo,
+      },
+    }),
+  };
 
-pushToken: pushToken || existing.pushToken || null,
+  try {
+    const result = await apnProvider.send(note, voipToken);
+    console.log(
+      "🍏 Push VoIP envoyé :",
+      result.sent.length,
+      "| échecs :",
+      result.failed.length,
+    );
+    if (result.failed.length > 0) {
+      console.error(
+        "❌ Détail échec VoIP :",
+        JSON.stringify(result.failed, null, 2),
+      );
+    }
+  } catch (error) {
+    console.error("❌ Erreur Push VoIP APNs :", error);
+  }
+}
 
-});
+// Notification d'annulation pour fermer l'écran CallKit si l'émetteur raccroche
+async function envoyerAnnulationVoipIOS(voipToken, callerId) {
+  if (!apnProvider || !voipToken) return;
 
-const u = users.get(userId);
+  const note = new apn.Notification();
+  note.topic = `${APP_BUNDLE_ID}.voip`;
+  note.priority = 10;
+  note.pushType = "voip";
 
-console.log(
+  note.alert = "Appel annulé";
+  note.payload = {
+    data: JSON.stringify({
+      Caller: {
+        Username: String(callerId),
+        CancelPush: "true",
+      },
+    }),
+  };
 
-`👤 ${userId} | FCM=${maskToken(u.pushToken)} | VoIP=${maskToken(u.voipToken)} | online=${!!u.ws}`
+  try {
+    await apnProvider.send(note, voipToken);
+  } catch (error) {
+    console.error("❌ Erreur annulation VoIP APNs :", error); 
+  }
+}
 
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () =>
+  console.log(`🚀 Serveur WebSocket actif sur le port ${PORT}`),
 );
-
-sendJson(ws, { type: "registered", userId });
-
-return;
-
-}
-
-
-
-if (type === "register-voip-token") {
-
-if (!userId || !voipToken) return;
-
-ws.userId = userId;
-
-const existing = users.get(userId) || {};
-
-users.set(userId, {
-
-...existing,
-
-ws,
-
-voipToken: String(voipToken).toLowerCase(),
-
-});
-
-console.log(`🍏 Token VoIP ${maskToken(voipToken)} pour ${userId}`);
-
-sendJson(ws, { type: "voip-registered", userId });
-
-return;
-
-}
-
-
-
-if (type === "call-user") {
-
-if (!ws.userId || !targetId || !offer) {
-
-sendJson(ws, { type: "call-error", reason: "missing-fields" });
-
-return;
-
-}
-
-const targetUser = users.get(targetId);
-
-const newCallId = `call_${Date.now()}_${ws.userId}`;
-
-const notificationId = data.notId || Math.floor(100000 + Math.random() * 900000);
-
-
-
-const timer = setTimeout(() => {
-
-const still = pendingCalls.get(newCallId);
-
-if (still && still.status === "RINGING") {
-
-sendJson(users.get(still.from)?.ws, { type: "call-expired", callId: newCallId });
-
-sendJson(users.get(still.targetId)?.ws, { type: "call-expired", callId: newCallId });
-
-if (still.voipTokenSnapshot || (users.get(targetId) || {}).voipToken) {
-
-envoyerAnnulationVoipIOS(
-
-targetId,
-
-(users.get(targetId) || {}).voipToken || still.voipTokenSnapshot,
-
-still.from,
-
-newCallId,
-
-still.isVideo
-
-);
-
-}
-
-}
-
-dropPending(newCallId);
-
-}, CALL_TTL_MS);
-
-
-
-pendingCalls.set(newCallId, {
-
-from: ws.userId,
-
-targetId,
-
-offer,
-
-isVideo: !!isVideo,
-
-status: "RINGING",
-
-notId: notificationId,
-
-timer,
-
-voipTokenSnapshot: targetUser?.voipToken || null,
-
-});
-
-
-
-sendJson(ws, {
-
-type: "call-started",
-
-callId: newCallId,
-
-targetId,
-
-isVideo: !!isVideo,
-
-});
-
-
-
-const targetWs = targetUser?.ws;
-
-if (targetWs && targetWs.readyState === WebSocket.OPEN) {
-
-sendJson(targetWs, {
-
-type: "incoming-call",
-
-callId: newCallId,
-
-from: ws.userId,
-
-offer,
-
-isVideo: !!isVideo,
-
-notId: notificationId,
-
-});
-
-}
-
-
-
-if (targetUser?.voipToken) {
-
-await envoyerNotificationVoipIOS(
-
-targetId,
-
-targetUser.voipToken,
-
-ws.userId,
-
-newCallId,
-
-!!isVideo,
-
-false
-
-);
-
-} else if (targetUser?.pushToken) {
-
-await envoyerNotificationPush(
-
-targetId,
-
-targetUser.pushToken,
-
-ws.userId,
-
-ws.userId,
-
-newCallId,
-
-!!isVideo,
-
-notificationId
-
-);
-
-} else if (!targetWs || targetWs.readyState !== WebSocket.OPEN) {
-
-sendJson(ws, { type: "user-offline", targetId });
-
-}
-
-return;
-
-}
-
-
-
-if (type === "get-offer") {
-
-const callData = pendingCalls.get(callId);
-
-if (callData) {
-
-sendJson(ws, {
-
-type: "call-offer-details",
-
-callId,
-
-from: callData.from,
-
-offer: callData.offer,
-
-isVideo: callData.isVideo,
-
-});
-
-} else {
-
-sendJson(ws, { type: "call-expired", callId });
-
-}
-
-return;
-
-}
-
-
-
-if (type === "answer-call") {
-
-const found = findPendingCall(ws.userId, targetId);
-
-if (found) found.callData.status = "ACCEPTED";
-
-sendJson(users.get(targetId)?.ws, {
-
-type: "call-answered",
-
-answer,
-
-from: ws.userId,
-
-callId: found ? found.cId : callId || null,
-
-});
-
-return;
-
-}
-
-
-
-if (type === "ice-candidate") {
-
-sendJson(users.get(targetId)?.ws, {
-
-type: "ice-candidate",
-
-candidate,
-
-from: ws.userId,
-
-});
-
-return;
-
-}
-
-
-
-if (type === "call-refused") {
-
-const found = findPendingCall(ws.userId, targetId);
-
-if (found) dropPending(found.cId);
-
-sendJson(users.get(targetId)?.ws, {
-
-type: "call-refused",
-
-from: ws.userId,
-
-callId: found ? found.cId : null,
-
-});
-
-return;
-
-}
-
-
-
-if (type === "call-end") {
-
-const found = findPendingCall(ws.userId, targetId);
-
-if (found) {
-
-const { cId, callData } = found;
-
-if (callData.status === "RINGING") {
-
-const calleeId = callData.targetId;
-
-const callee = users.get(calleeId);
-
-if (callee?.voipToken) {
-
-await envoyerAnnulationVoipIOS(
-
-calleeId,
-
-callee.voipToken,
-
-callData.from,
-
-cId,
-
-callData.isVideo
-
-);
-
-}
-
-if (callee?.pushToken) {
-
-envoyerNotificationAppelManque(
-
-calleeId,
-
-callee.pushToken,
-
-callData.from,
-
-callData.isVideo,
-
-callData.notId
-
-);
-
-}
-
-}
-
-dropPending(cId);
-
-}
-
-
-
-sendJson(users.get(targetId)?.ws, {
-
-type: "call-end",
-
-from: ws.userId,
-
-target: targetId,
-
-});
-
-return;
-
-}
-
-
-
-if (type === "restart-offer") {
-
-sendJson(users.get(targetId)?.ws, {
-
-type: "restart-offer",
-
-offer,
-
-from: ws.userId,
-
-});
-
-}
-
-});
-
-
-
-ws.on("close", () => {
-
-if (ws.userId) {
-
-const existing = users.get(ws.userId);
-
-if (existing?.ws === ws) {
-
-users.set(ws.userId, { ...existing, ws: null });
-
-console.log(`❌ Socket fermé ${ws.userId} (tokens conservés)`);
-
-}
-
-}
-
-});
-
-
-
-ws.on("error", (error) => {
-
-console.error(`❌ WS ${ws.userId || "?"} :`, error.message);
-
-});
-
-});
-
-
-
-server.listen(PORT, "0.0.0.0", () => {
-
-console.log(`🚀 Signalisation WebSocket sur :${PORT}`);
-
-}); 
-
