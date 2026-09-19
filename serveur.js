@@ -14,7 +14,7 @@ let apnProvider = null;
 try {
   apnProvider = new apn.Provider({
     token: {
-      key: "./AuthKey_48YTL8938V.p8", // Chemin vers la clé p8
+      key: APNS_KEY_CONTENT, // Chemin vers la clé p8
       keyId: "48YTL8938V", // Key ID Apple
       teamId: "C55D4CX59A", // Team ID Apple
     },
