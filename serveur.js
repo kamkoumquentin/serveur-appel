@@ -45,12 +45,20 @@ const { GoogleAuth } = require("google-auth-library");
 const path = require("path");
 
 // Chargement sécurisé du fichier de compte de service
-const serviceAccount = require("./serviceAccountKey.json");
+const serviceAccount = require(process.env.APNS_KEY_CONTENT);
 const PROJECT_ID = serviceAccount.project_id; // Récupère l'ID exact du projet dynamiquement
 
 // Initialisation de l'authentification Google OAuth 2.0
 const auth = new GoogleAuth({
   keyFile: path.join(__dirname, "serviceAccountKey.json"),
+  scopes: ["https://www.googleapis.com/auth/firebase.messaging"],
+});
+
+const auth = new GoogleAuth({
+  credentials: {
+    client_email: "firebase-adminsdk-fbsvc@fmmm-51566.iam.gserviceaccount.com",
+    private_key: process.env.APNS_KEY_CONTENT,
+  },
   scopes: ["https://www.googleapis.com/auth/firebase.messaging"],
 });
 
