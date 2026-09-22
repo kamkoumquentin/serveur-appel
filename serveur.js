@@ -1,1041 +1,738 @@
+const express = require("express");
 const http = require("http");
-const WebSocket = require("ws");
-const fs = require("fs");
+const { WebSocketServer, WebSocket } = require("ws");
+const apn = require("@parse/node-apn"); // Integration APNs
+
+const app = express();
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server });
+
+// =========================================================
+// CONFIGURATION APPLE PUSH NOTIFICATION (APNs VoIP / CallKit)
+// =========================================================
+let apnProvider = null;
+try {
+  apnProvider = new apn.Provider({
+    token: {
+      key: "./AuthKey_48YTL8938V.p8", // Chemin vers la clé p8
+      keyId: "48YTL8938V", // Key ID Apple
+      teamId: "C55D4CX59A", // Team ID Apple
+    },
+    production: false, // Passer à true pour la production / App Store
+  });
+  console.log("🍏 Configuration APNs VoIP initialisée.");
+} catch (err) {
+  console.warn(
+    "⚠️ Impossible d'initialiser APNs VoIP (Vérifiez le fichier AuthKey p8) :",
+    err.message,
+  );
+}
+
+const APP_BUNDLE_ID = "NGOKO.CEDRIC.fm"; // Remplacez par votre Bundle ID iOS
+
+// Carte globale persistante (RAM) pour conserver les utilisateurs, leurs tokens FCM et VoIP
+const users = new Map();
+
+// Stockage temporaire en mémoire RAM pour les offres d'appel (évite de surcharger FCM)
+const pendingCalls = new Map();
+
+// =========================================================
+// ENVOI NOTIFICATION FCM VIA HTTP REST (v1)
+// =========================================================
+
+
+const { GoogleAuth } = require("google-auth-library");
 const path = require("path");
 
-// MODIFICATION RENDER : Utilisation du port dynamique
-const PORT = process.env.PORT || 8080;
+// Chargement sécurisé du fichier de compte de service
+const serviceAccount = require("./serviceAccountKey.json");
+const PROJECT_ID = serviceAccount.project_id; // Récupère l'ID exact du projet dynamiquement
 
-// ======================================================
-// CONFIGURATION GLOBALE - SOURCE DE VÉRITÉ UNIQUE
-// ======================================================
-const RINGING_TIMEOUT_MS = 35000; // Durée de sonnerie avant expiration (35 secondes)
+// Initialisation de l'authentification Google OAuth 2.0
+const auth = new GoogleAuth({
+  keyFile: path.join(__dirname, "serviceAccountKey.json"),
+  scopes: ["https://www.googleapis.com/auth/firebase.messaging"],
+});
 
-// ======================================================
-// TOKENS & SESSIONS EN MEMOIRE & PERSISTANCE DISQUE
-// ======================================================
-const fcmTokens = new Map();
-const TOKENS_CACHE_FILE = path.join(__dirname, "fcm_tokens_cache.json");
-
-function chargerTokensFCM() {
-    try {
-        if (fs.existsSync(TOKENS_CACHE_FILE)) {
-            const data = fs.readFileSync(TOKENS_CACHE_FILE, "utf-8");
-            const parsed = JSON.parse(data);
-            Object.entries(parsed).forEach(([id, token]) => {
-                if (id && token) fcmTokens.set(String(id), String(token));
-            });
-            console.log(`💾 ${fcmTokens.size} tokens FCM chargés depuis le cache local (${TOKENS_CACHE_FILE})`);
-        }
-    } catch (e) {
-        console.warn("⚠️ Impossible de charger fcm_tokens_cache.json :", e.message);
-    }
+/**
+ * Récupère dynamiquement un jeton d'accès OAuth 2.0 valide et à jour
+ */
+async function getAccessToken() {
+  const client = await auth.getClient();
+  const tokenResponse = await client.getAccessToken();
+  return tokenResponse.token;
 }
 
-function sauvegarderTokensFCM() {
-    try {
-        const obj = {};
-        fcmTokens.forEach((token, id) => {
-            obj[id] = token;
-        });
-        fs.writeFileSync(TOKENS_CACHE_FILE, JSON.stringify(obj, null, 2), "utf-8");
-    } catch (e) {
-        console.warn("⚠️ Impossible d'écrire dans fcm_tokens_cache.json :", e.message);
-    }
-}
+/**
+ * Fonction générique pour envoyer un message HTTP v1 REST à FCM
+ */
+async function sendFcmHttpV1Message(messagePayload) {
+  try {
+    const accessToken = await getAccessToken(); // Récupération dynamique sans code en dur
+    const url = `https://fcm.googleapis.com/v1/projects/${PROJECT_ID}/messages:send`;
 
-chargerTokensFCM();
-
-const utilisateurs = new Map();
-const userAppStates = new Map(); // identifiant -> isForeground (boolean)
-const userScreenStates = new Map(); // identifiant -> "SCREEN_ON" | "SCREEN_OFF"
-const appels = new Map();
-const pendingOffers = new Map();
-
-// MACHINE À ÉTATS SERVEUR & DÉDUPLICATION
-// callSessions : callId -> { callId, from, to, state: "RINGING" | "ACCEPTING" | "CONNECTED" | "REJECTED" | "ENDED", offer, createdAt }
-const callSessions = new Map();
-// endedCalls : callId -> timestamp (TTL 60s pour empêcher le replay d'anciens appels)
-const endedCalls = new Map();
-
-function logCall(event, details = {}) {
-    console.log(`[CALL] ${event} | callId=${details.callId || "n/a"} | from=${details.from || "n/a"} | to=${details.to || "n/a"} | state=${details.state || "n/a"} | info=${details.info || ""}`);
-}
-
-function markCallEnded(callId) {
-    if (!callId) return;
-    endedCalls.set(String(callId), Date.now());
-    const session = callSessions.get(String(callId));
-    if (session) {
-        if (session.timeoutTimer) {
-            clearTimeout(session.timeoutTimer);
-            session.timeoutTimer = null;
-        }
-        session.state = "ENDED";
-    }
-}
-
-function nettoyerSessionAppel(callId, from, to) {
-    if (callId) {
-        markCallEnded(callId);
-        const session = callSessions.get(String(callId));
-        if (session && session.timeoutTimer) {
-            clearTimeout(session.timeoutTimer);
-            session.timeoutTimer = null;
-        }
-        callSessions.delete(String(callId));
-    }
-    if (from || to) {
-        callSessions.forEach((session, cId) => {
-            if ((from && (session.from === from || session.to === from)) ||
-                (to && (session.from === to || session.to === to))) {
-                if (session.timeoutTimer) {
-                    clearTimeout(session.timeoutTimer);
-                    session.timeoutTimer = null;
-                }
-                markCallEnded(cId);
-                callSessions.delete(cId);
-            }
-        });
-    }
-    if (from) {
-        appels.delete(from);
-        pendingOffers.delete(from);
-    }
-    if (to) {
-        appels.delete(to);
-        pendingOffers.delete(to);
-    }
-    console.log(`🧹 [SESSION] Nettoyage complet session appel | callId=${callId || "n/a"} | from=${from || "n/a"} | to=${to || "n/a"}`);
-}
-
-function isCallEnded(callId) {
-    if (!callId) return false;
-    return endedCalls.has(String(callId));
-}
-
-// Nettoyage périodique (toutes les 30s) des appels terminés et sessions expirées (> 60s / 5min)
-setInterval(() => {
-    const now = Date.now();
-    endedCalls.forEach((timestamp, callId) => {
-        if (now - timestamp > 60000) {
-            endedCalls.delete(callId);
-        }
-    });
-    callSessions.forEach((session, callId) => {
-        if (now - session.createdAt > 300000) { // 5 minutes max par session
-            callSessions.delete(callId);
-        }
-    });
-}, 30000);
-
-// ======================================================
-// INITIALISATION FIREBASE notification firebase
-// ======================================================
-const { initializeApp, cert } = require("firebase-admin/app");
-const { getMessaging } = require("firebase-admin/messaging");
-let messaging = null;
-
-try {
-    let serviceAccount = null;
-
-    if (process.env.FIREBASE_SERVICE_ACCOUNT) {
-        try {
-            serviceAccount = typeof process.env.FIREBASE_SERVICE_ACCOUNT === "string"
-                ? JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
-                : process.env.FIREBASE_SERVICE_ACCOUNT;
-            console.log("🔑 Clé Firebase chargée depuis FIREBASE_SERVICE_ACCOUNT");
-        } catch (e) {
-            console.error("❌ Erreur parsing FIREBASE_SERVICE_ACCOUNT JSON :", e.message);
-        }
-    } else if (process.env.FIREBASE_KEY) {
-        try {
-            serviceAccount = typeof process.env.FIREBASE_KEY === "string"
-                ? JSON.parse(process.env.FIREBASE_KEY)
-                : process.env.FIREBASE_KEY;
-            console.log("🔑 Clé Firebase chargée depuis FIREBASE_KEY");
-        } catch (e) {
-            console.error("❌ Erreur parsing FIREBASE_KEY JSON :", e.message);
-        }
-    }
-
-    if (!serviceAccount) {
-        try {
-            serviceAccount = require("./firebase-key.json");
-            console.log("🔑 Clé Firebase chargée depuis firebase-key.json local");
-        } catch (e) {
-            try {
-                serviceAccount = require("/etc/secrets/firebase-key.json");
-                console.log("🔑 Clé Firebase chargée depuis /etc/secrets/firebase-key.json");
-            } catch (e2) {
-                console.warn("⚠️ Fichier firebase-key.json introuvable :", e.message);
-            }
-        }
-    }
-
-    if (serviceAccount) {
-        // Important pour Render : transforme les \n échappés en vrais retours à la ligne
-        if (serviceAccount.private_key && typeof serviceAccount.private_key === "string") {
-            serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, "\n");
-        }
-
-        initializeApp({
-            credential: cert(serviceAccount)
-        });
-
-        messaging = getMessaging();
-        console.log("✅ Firebase Admin initialisé avec succès !");
-        console.log("🔥 Projet Firebase :", serviceAccount.project_id);
-    } else {
-        console.warn("⚠️ Aucune clé de service Firebase trouvée. Les notifications push FCM seront désactivées.");
-    }
-} catch (err) {
-    console.error("❌ Impossible d'initialiser Firebase Admin :", err.message);
-}
-
-// =============================================================================
-// FONCTIONS DE NOTIFICATION PUSH DÉDIÉES (TEST 1 vs TEST 2)
-// =============================================================================
-
-function gererErreurFCM(error, to) {
-    console.error(`❌ Erreur envoi Push FCM à ${to} :`, error.message);
-    if (error.code === "messaging/registration-token-not-registered" ||
-        error.code === "messaging/invalid-registration-token") {
-        console.log(`🗑️ Suppression du token périmé pour ${to}`);
-        fcmTokens.delete(to);
-        sauvegarderTokensFCM();
-    }
-}
-
-// =============================================================================
-// FONCTION UNIQUE DE NOTIFICATION PUSH D'APPEL ENTRANT (Conforme Spécification Définitive)
-// - Payload complet avec boutons [Refuser] et [Accepter]
-// - Canal calls_channel_v6
-// - L'adaptation visuelle (bannière Heads-Up si déverrouillé vs plein écran si verrouillé)
-//   est gérée localement par le terminal Android à la réception du push.
-// =============================================================================
-function envoyerPushAppelEntrant(tokenDestinataire, to, from, callId, offerStr, notIdVal) {
-    if (!messaging) {
-        console.error("⚠️ Firebase Messaging n'est pas initialisé.");
-        return;
-    }
-    const notId = notIdVal || String(Math.floor(10000 + Math.random() * 89999));
-    const payload = {
-        token: tokenDestinataire,
-        data: {
-            type: "APPEL",
-            callId: String(callId),
-            callerId: String(from),
-            caller_name: String(from),
-            appelant: String(from),
-            app_name: "KamSoft",
-            title: "KamSoft - Appel entrant",
-            subText: "Appel entrant",
-            message: `${from} vous appelle`,
-            body: `${from} vous appelle`,
-            notId: String(notId),
-            icon: "ic_launcher",
-            color: "#00A884",
-            offer: offerStr || "",
-            actions: JSON.stringify([
-                {
-                    title: "Refuser",
-                    callback: "rejectCallAction",
-                    foreground: false
-                },
-                {
-                    title: "Accepter",
-                    callback: "acceptCallAction",
-                    foreground: true
-                }
-            ]),
-            android_channel_id: "calls_channel_v6",
-            channelId: "calls_channel_v6",
-            priority: "2",
-            visibility: "1",
-            importance: "5",
-            sound: "ringtone",
-            vibrate: "true",
-            vibrationPattern: "[0, 500, 250, 500]",
-            category: "call",
-            ringingTimeoutMs: String(RINGING_TIMEOUT_MS)
-        },
-        android: {
-            priority: "high",
-            ttl: 60 * 1000
-        }
-    };
-
-    logCall("FCM_SENT", { callId, from, to, info: `[PUSH APPEL ENTRANT] Envoi push complet avec boutons [Accepter/Refuser] (notId=${notId})` });
-
-    messaging.send(payload)
-        .then(response => {
-            logCall("FCM_DELIVERED", { callId, from, to, info: `[PUSH APPEL ENTRANT] FCM envoyé avec succès (${response})` });
-        })
-        .catch(error => {
-            gererErreurFCM(error, to);
-        });
-}
-
-// Alias pour compatibilité des endpoints de tests
-function envoyerPushTest1Banniere(tokenDestinataire, to, from, callId, offerStr, notIdVal) {
-    envoyerPushAppelEntrant(tokenDestinataire, to, from, callId, offerStr, notIdVal);
-}
-
-function envoyerPushTest2Veille(tokenDestinataire, to, from, callId, offerStr, notIdVal) {
-    envoyerPushAppelEntrant(tokenDestinataire, to, from, callId, offerStr, notIdVal);
-}
-
-// ======================================================
-// SERVEUR HTTP (Pour le reveil Render, Diagnostic & Health Check)
-// ======================================================
-const server = http.createServer(async (req, res) => {
-    res.writeHead(200, {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
         "Content-Type": "application/json",
-        "Access-Control-Allow-Origin": "*"
+      },
+      body: JSON.stringify({ message: messagePayload }),
     });
 
-    const parsedUrl = new URL(req.url, `http://${req.headers.host || "localhost"}`);
-
-    // Endpoint d'enregistrement de token FCM direct via HTTP
-    if (parsedUrl.pathname === "/register-token") {
-        const userId = parsedUrl.searchParams.get("id");
-        const token = parsedUrl.searchParams.get("token");
-
-        if (userId && token) {
-            fcmTokens.set(String(userId).trim(), String(token).trim());
-            sauvegarderTokensFCM();
-            console.log(`📲 [HTTP] Token FCM synchronisé pour ${userId} : ${token.substring(0, 15)}...`);
-            return res.end(JSON.stringify({ success: true, message: `Token enregistré pour ${userId}` }));
-        } else {
-            return res.end(JSON.stringify({ error: "Paramètres 'id' et 'token' requis." }));
-        }
+    const result = await response.json();
+    if (!response.ok) {
+      console.error("❌ Erreur API FCM v1 :", result);
+      return null;
     }
+    return result;
+  } catch (error) {
+    console.error("❌ Erreur REST FCM :", error);
+    return null;
+  }
+}
 
-    // Endpoint de synchronisation de l'état de l'écran (veille vs allumé) via HTTP
-    if (parsedUrl.pathname === "/set-screen-state") {
-        const userId = parsedUrl.searchParams.get("id");
-        const state = parsedUrl.searchParams.get("state"); // "SCREEN_ON" ou "SCREEN_OFF"
-        if (userId && state) {
-            userScreenStates.set(String(userId).trim(), state);
-            console.log(`📱 [HTTP] État écran mis à jour pour ${userId} : ${state}`);
-            return res.end(JSON.stringify({ success: true, userId, screenState: state }));
-        }
-        return res.end(JSON.stringify({ error: "Paramètres 'id' et 'state' requis." }));
-    }
+//-------------------------------------------------
 
-    // Endpoint de diagnostic
-    if (parsedUrl.pathname === "/status" || parsedUrl.pathname === "/") {
-        const tokensList = {};
-        fcmTokens.forEach((token, id) => {
-            tokensList[id] = token ? `${token.substring(0, 15)}...` : null;
-        });
-
-        return res.end(JSON.stringify({
-            status: "ok",
-            message: "Serveur d'appel operationnel",
-            firebaseAdminReady: messaging !== null,
-            connectedUsers: Array.from(utilisateurs.keys()),
-            activeCallsCount: appels.size / 2,
-            activeSessionsCount: callSessions.size,
-            registeredFcmTokensCount: fcmTokens.size,
-            registeredFcmTokens: tokensList
-        }, null, 2));
-    }
-
-    // Endpoints de test push FCM directs :
-    // - /test-push-banniere?to=ID-123456 (Test 1 : Bannière interactive sans forcer l'app)
-    // - /test-push-veille?to=ID-123456   (Test 2 : Réveil de l'écran en veille)
-    // - /test-push?to=ID-123456          (Par défaut : Test 1)
-    if (parsedUrl.pathname === "/test-push" || parsedUrl.pathname === "/test-push-banniere" || parsedUrl.pathname === "/test-push-veille") {
-        const targetId = parsedUrl.searchParams.get("to");
-        if (!targetId) {
-            return res.end(JSON.stringify({ error: "Parametre 'to' manquant. Exemple: /test-push?to=ID-123456" }));
-        }
-
-        const token = fcmTokens.get(targetId);
-        if (!token) {
-            return res.end(JSON.stringify({ error: `Aucun token FCM enregistre pour l'ID ${targetId}` }));
-        }
-
-        if (!messaging) {
-            return res.end(JSON.stringify({ error: "Firebase Admin n'est pas initialise sur le serveur." }));
-        }
-
-        const isTestVeille = parsedUrl.pathname === "/test-push-veille";
-        const callIdVal = parsedUrl.searchParams.get("callId") || (isTestVeille ? "CALL-TEST-VEILLE" : "CALL-TEST-BANNIERE");
-        const notIdVal = parsedUrl.searchParams.get("notId") || (isTestVeille ? "8888" : "9999");
-
-        try {
-            if (isTestVeille) {
-                envoyerPushTest2Veille(token, targetId, "TEST-APPELANT", callIdVal, "", notIdVal);
-                return res.end(JSON.stringify({ success: true, mode: "TEST 2 (Réveil Veille)", target: targetId, callId: callIdVal }));
-            } else {
-                envoyerPushTest1Banniere(token, targetId, "TEST-APPELANT", callIdVal, "", notIdVal);
-                return res.end(JSON.stringify({ success: true, mode: "TEST 1 (Bannière Interactive)", target: targetId, callId: callIdVal }));
-            }
-        } catch (pushErr) {
-            return res.end(JSON.stringify({ success: false, error: pushErr.message }));
-        }
-    }
-
-    // Endpoint de test pour envoyer un push d'annulation CANCEL_CALL
-    if (parsedUrl.pathname === "/cancel-push-test") {
-        const targetId = parsedUrl.searchParams.get("to") || "ID-142948";
-        const callId = parsedUrl.searchParams.get("callId") || "CALL-TEST-BANNIERE";
-        const token = fcmTokens.get(String(targetId).trim());
-
-        if (!token) {
-            return res.end(JSON.stringify({ error: `Aucun token FCM enregistre pour l'ID ${targetId}` }));
-        }
-
-        if (!messaging) {
-            return res.end(JSON.stringify({ error: "Firebase Admin n'est pas initialise sur le serveur." }));
-        }
-
-        try {
-            const resp = await messaging.send({
-                token: token,
-                data: {
-                    type: "CANCEL_CALL",
-                    action: "cancel_call",
-                    callerId: "TEST-APPELANT",
-                    callerName: "TEST-APPELANT",
-                    appelant: "TEST-APPELANT",
-                    callId: String(callId)
-                },
-                android: {
-                    priority: "high",
-                    ttl: 60 * 1000
-                }
-            });
-            console.log(`📵 [HTTP] Test push CANCEL_CALL envoyé vers ${targetId} (${callId}): ${resp}`);
-            return res.end(JSON.stringify({ success: true, mode: "CANCEL_CALL Test", target: targetId, callId: callId, resp: resp }));
-        } catch (pushErr) {
-            return res.end(JSON.stringify({ success: false, error: pushErr.message }));
-        }
-    }
-
-    res.end(JSON.stringify({ status: "ok" }));
+app.get("/", (req, res) => {
+  res.send("Serveur WebSocket actif");
 });
 
-// ======================================================
-// SERVEUR WEBSOCKET
-// ======================================================
-const wss = new WebSocket.Server({ server });
-
-// ======================================================
-// DEMARRAGE DU SERVEUR
-// ======================================================
-server.listen(PORT, "0.0.0.0", () => {
-    console.log(`🚀 Serveur WebSocket & HTTP demarre sur le port ${PORT}`);
-});
-
-// ======================================================
-// UTILITAIRE : ENVOYER UN MESSAGE WEBSOCKET
-// ======================================================
-function envoyer(ws, message) {
-    if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify(message));
-    }
-}
-
-// ======================================================
-// UTILITAIRE : ENVOYER A UN UTILISATEUR
-// ======================================================
-function envoyerAUtilisateur(identifiant, message) {
-    const ws = utilisateurs.get(identifiant);
-    if (!ws) {
-        console.log(`Utilisateur non connecte en WS : ${identifiant}`);
-        return false;
-    }
-    envoyer(ws, message);
-    return true;
-}
-
-// ======================================================
-// UTILITAIRES D'ETAT
-// ======================================================
-function utilisateurExiste(identifiant) {
-    return utilisateurs.has(identifiant);
-}
-
-function utilisateurOccupe(identifiant) {
-    return appels.has(identifiant);
-}
-
-function creerAppel(utilisateurA, utilisateurB) {
-    appels.set(utilisateurA, utilisateurB);
-    appels.set(utilisateurB, utilisateurA);
-    console.log(`📞 APPEL CREE : ${utilisateurA} <--> ${utilisateurB}`);
-}
-
-function supprimerAppel(utilisateurA, utilisateurB) {
-    if (utilisateurA) {
-        appels.delete(utilisateurA);
-        pendingOffers.delete(utilisateurA);
-    }
-    if (utilisateurB) {
-        appels.delete(utilisateurB);
-        pendingOffers.delete(utilisateurB);
-    }
-    console.log(`📴 APPEL TERMINE : ${utilisateurA} <--> ${utilisateurB}`);
-}
-
-// ======================================================
-// CONNEXION CLIENT WEBSOCKET
-// ======================================================
-wss.on("connection", (ws) => {
-    console.log("Nouveau client connecte.");
-    let identifiant = null;
-
-    ws.isAlive = true;
-    ws.on("pong", () => {
-        ws.isAlive = true;
-    });
-
-    ws.on("message", (data) => {
-        try {
-            const message = JSON.parse(data.toString());
-            traiterMessage(ws, message);
-        } catch (error) {
-            console.error("Message JSON invalide :", error);
-            envoyer(ws, {
-                type: "ERROR",
-                message: "Message invalide."
-            });
-        }
-    });
-
-    ws.on("close", () => {
-        console.log(`Client deconnecte : ${identifiant || "inconnu"}`);
-        // ⚠️ Si cette socket a été remplacée par une nouvelle socket active (isReplaced = true),
-        // NE PAS exécuter gererDeconnexion pour ne pas raccrocher l'appel !
-        if (identifiant && !ws.isReplaced) {
-            gererDeconnexion(identifiant, ws);
-        }
-    });
-
-    ws.on("error", (error) => {
-        console.error(`Erreur WebSocket ${identifiant || ""} :`, error);
-    });
-
-    // ==================================================
-    // TRAITEMENT DES MESSAGES
-    // ==================================================
-    function traiterMessage(wsClient, message) {
-        if (message.targetId) message.to = message.targetId;
-
-        // Normalisation
-        if (message.type === "call-user") message.type = "CALLING";
-        if (message.type === "answer-call") message.type = "CALL_ACCEPTED";
-        if (message.type === "ice-candidate") message.type = "ICE_CANDIDATE";
-        if (message.type === "hang-up") message.type = "CALL_ENDED";
-        if (message.type === "call-refused") message.type = "CALL_REJECTED";
-
-        const type = message.type;
-
-        if (type === "PING" || type === "ping") {
-            ws.isAlive = true;
-            envoyer(wsClient, { type: "PONG" });
-            return;
-        }
-
-        if (type === "REGISTER" || type === "UPDATE_TOKEN") {
-            enregistrerUtilisateur(wsClient, message);
-            return;
-        }
-
-        if (type === "SET_APP_STATE" || type === "SET_SCREEN_STATE") {
-            const isFg = !!message.isForeground;
-            const screenState = message.screenState || (isFg ? "SCREEN_ON" : undefined);
-            if (identifiant) {
-                userAppStates.set(identifiant, isFg);
-                if (screenState) {
-                    userScreenStates.set(identifiant, screenState);
-                }
-                console.log(`📱 État app pour ${identifiant} : ${isFg ? "FOREGROUND" : "BACKGROUND"} | Écran : ${userScreenStates.get(identifiant) || "n/a"}`);
-            }
-            return;
-        }
-
-        if (!identifiant) {
-            envoyer(wsClient, {
-                type: "ERROR",
-                message: "Vous devez etre enregistre avant d'envoyer des messages."
-            });
-            return;
-        }
-
-        if (type === "CALLING") return traiterCalling(message);
-        if (type === "CALL_ACCEPTED") return traiterCallAccepted(message);
-        if (type === "CALL_REJECTED") return traiterCallRejected(message);
-        if (type === "CALL_ENDED") return traiterCallEnded(message);
-        if (type === "ICE_CANDIDATE" || type === "WEBRTC_OFFER" || type === "WEBRTC_ANSWER" || type === "renegotiate-offer" || type === "renegotiate-answer") {
-            return relayerSignalisation(message);
-        }
-
-        envoyer(wsClient, {
-            type: "ERROR",
-            message: `Type de message inconnu : ${type}`
+// =========================================================
+// HEARTBEAT (Garde les connexions actives)
+// =========================================================
+const interval = setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (ws.isAlive === false) {
+      console.log(`⚠️ Client inactif expulsé : ${ws.userId || "Inconnu"}`);
+      if (ws.userId && users.get(ws.userId)?.ws === ws) {
+        // Déconnexion : Passe le socket à null sans supprimer l'utilisateur de la Map
+        const existingUser = users.get(ws.userId);
+        users.set(ws.userId, {
+          ...existingUser,
+          ws: null,
         });
+      }
+      return ws.terminate();
     }
 
-    // ==================================================
-    // ENREGISTRER UTILISATEUR ET TOKEN FCM
-    // ==================================================
-    function enregistrerUtilisateur(wsClient, message) {
-        const nouvelIdentifiant = String(message.id || message.userId || "").trim();
+    ws.isAlive = false;
 
-        if (nouvelIdentifiant === "") {
-            envoyer(wsClient, {
-                type: "ERROR",
-                message: "Identifiant obligatoire."
-            });
-            return;
-        }
-
-        // Marquer l'ancienne socket avec isReplaced = true AVANT de la fermer
-        if (utilisateurs.has(nouvelIdentifiant)) {
-            const ancienneWs = utilisateurs.get(nouvelIdentifiant);
-            if (ancienneWs && ancienneWs !== wsClient) {
-                console.log(`🔄 Remplacement de l'ancienne socket pour ${nouvelIdentifiant}`);
-                ancienneWs.isReplaced = true;
-                try { ancienneWs.close(); } catch (e) { }
-            }
-        }
-
-        identifiant = nouvelIdentifiant;
-        utilisateurs.set(identifiant, wsClient);
-
-        // Sauvegarde du token FCM
-        if (message.fcmToken) {
-            fcmTokens.set(identifiant, message.fcmToken);
-            sauvegarderTokensFCM();
-            console.log(`📲 TOKEN FCM ENREGISTRE pour ${identifiant} : ${message.fcmToken.substring(0, 20)}...`);
-        } else if (fcmTokens.has(identifiant)) {
-            console.log(`📲 Token FCM deja conserve en memoire pour ${identifiant}`);
-        } else {
-            console.log(`⚠️ Aucun token FCM fourni lors du REGISTER pour ${identifiant}`);
-        }
-
-        logCall("REGISTER", { from: identifiant, info: `Utilisateur enregistré (${identifiant})` });
-
-        envoyer(wsClient, {
-            type: "REGISTERED",
-            id: identifiant
-        });
-
-        // ⚠️ TRANSMISSION SÉCURISÉE DE L'OFFRE EN ATTENTE :
-        // On vérifie STRICTEMENT que l'offre est toujours dans l'état RINGING.
-        // Si l'appel a déjà été accepté (state === 'ACCEPTING' ou 'CONNECTED'), ou terminé ('ENDED' / 'REJECTED'),
-        // NE SURTOUT PAS renvoyer incoming-call !
-        if (pendingOffers.has(identifiant)) {
-            const pending = pendingOffers.get(identifiant);
-            if (pending && pending.from) {
-                const callId = pending.callId;
-                const session = callId ? callSessions.get(callId) : null;
-
-                if (isCallEnded(callId)) {
-                    logCall("PENDING_OFFER_IGNORED", { callId, to: identifiant, info: "Appel déjà terminé dans endedCalls" });
-                    pendingOffers.delete(identifiant);
-                } else if (session && session.state !== "RINGING") {
-                    logCall("PENDING_OFFER_IGNORED", { callId, to: identifiant, state: session.state, info: `Appel non 'RINGING' (${session.state}), pas de renvoi incoming-call` });
-                    if (session.state === "CONNECTED" || session.state === "ENDED" || session.state === "REJECTED") {
-                        pendingOffers.delete(identifiant);
-                    }
-                } else if (utilisateurExiste(pending.from) && appels.get(pending.from) === identifiant) {
-                    logCall("PENDING_OFFER_SENT", { callId, from: pending.from, to: identifiant, state: "RINGING" });
-                    envoyer(wsClient, {
-                        type: "incoming-call",
-                        from: pending.from,
-                        to: identifiant,
-                        offer: pending.offer,
-                        callId: callId
-                    });
-                } else {
-                    logCall("PENDING_OFFER_EXPIRED", { callId, to: identifiant, info: `L'appelant ${pending.from} n'est plus en ligne/occupé` });
-                    pendingOffers.delete(identifiant);
-                    appels.delete(identifiant);
-                }
-            }
-        }
+    try {
+      ws.ping();
+      ws.send(JSON.stringify({ type: "ping" }));
+    } catch (e) {
+      console.error("Erreur envoi ping :", e);
     }
-
-    // ==================================================
-    // TRAITER L'APPEL
-    // ==================================================
-    function traiterCalling(message) {
-        const from = identifiant;
-        const to = String(message.to || "").trim();
-        const callId = String(message.callId || (Date.now().toString() + "-" + Math.random().toString(36).substring(2, 9)));
-
-        if (to === "") {
-            envoyer(ws, { type: "ERROR", message: "Destinataire manquant." });
-            return;
-        }
-
-        if (from === to) {
-            envoyer(ws, { type: "ERROR", message: "Vous ne pouvez pas vous appeler vous-meme." });
-            return;
-        }
-
-        if (isCallEnded(callId)) {
-            logCall("CALLING_IGNORED", { callId, from, to, info: "callId présent dans endedCalls" });
-            return;
-        }
-
-        const destinataireEnLigne = utilisateurExiste(to);
-        const tokenDestinataire = fcmTokens.get(to);
-
-        if (!destinataireEnLigne && !tokenDestinataire) {
-            logCall("CALLING_FAILED", { callId, from, to, info: "Destinataire ni connecté ni token FCM" });
-            envoyer(ws, { type: "ERROR", message: "Le correspondant est hors ligne ou introuvable." });
-            return;
-        }
-
-        if (utilisateurOccupe(from)) {
-            envoyer(ws, { type: "BUSY", from: to, message: "Vous etes deja en appel." });
-            return;
-        }
-
-        if (utilisateurOccupe(to)) {
-            envoyer(ws, { type: "BUSY", from: to, to: from, message: "Le correspondant est occupe." });
-            logCall("CALLING_BUSY", { callId, from, to, info: `${to} est déjà occupé` });
-            return;
-        }
-
-        // Nettoyage préventif de toute offre orpheline résiduelle
-        pendingOffers.delete(from);
-        pendingOffers.delete(to);
-
-        creerAppel(from, to);
-
-        // Enregistrement de la session d'appel serveur
-        const session = {
-            callId: callId,
-            from: from,
-            to: to,
-            state: "RINGING",
-            offer: message.offer,
-            createdAt: Date.now()
-        };
-        callSessions.set(callId, session);
-
-        if (message.offer) {
-            pendingOffers.set(to, { from: from, offer: message.offer, callId: callId, createdAt: Date.now() });
-        }
-
-        let transmisWs = false;
-        const isDestinataireAuPremierPlan = destinataireEnLigne && (userAppStates.get(to) === true);
-
-        // 1. Envoi direct via WebSocket UNIQUEMENT si le destinataire est au premier plan
-        if (destinataireEnLigne && isDestinataireAuPremierPlan) {
-            transmisWs = envoyerAUtilisateur(to, {
-                type: "incoming-call",
-                from: from,
-                to: to,
-                offer: message.offer,
-                callId: callId,
-                ringingTimeoutMs: RINGING_TIMEOUT_MS
-            });
-            if (transmisWs) {
-                logCall("WS_RECEIVED", { callId, from, to, state: "RINGING", info: "Transmis par WS direct (app au 1er plan)" });
-            }
-        }
-
-        // 2. Envoi via Push Firebase FCM (Arrière-plan et Veille) :
-        // ⚠️ Si l'app est au premier plan, aucun push n'est requis (l'interface interne s'affiche).
-        let pushTente = false;
-
-        if (!isDestinataireAuPremierPlan && tokenDestinataire && messaging) {
-            pushTente = true;
-            const offerStr = message.offer
-                ? (typeof message.offer === "string" ? message.offer : JSON.stringify(message.offer))
-                : "";
-
-            const notIdVal = String(Math.floor(10000 + Math.random() * 89999));
-            console.log(`📲 [PUSH] Envoi push appel entrant complet vers ${to} (callId=${callId}, notId=${notIdVal})`);
-            envoyerPushAppelEntrant(tokenDestinataire, to, from, callId, offerStr, notIdVal);
-        } else if (isDestinataireAuPremierPlan) {
-            console.log(`ℹ️ Destinataire ${to} a l'application ouverte au premier plan : push FCM non requis.`);
-        } else if (!tokenDestinataire) {
-            console.log(`⚠️ Aucun token FCM enregistré pour ${to}.`);
-        } else if (!messaging) {
-            console.error("⚠️ Firebase Messaging n'est pas configuré sur le serveur.");
-        }
-
-        if (!transmisWs && !pushTente) {
-            nettoyerSessionAppel(callId, from, to);
-            envoyer(ws, {
-                type: "ERROR",
-                message: "Impossible de joindre le correspondant (hors ligne)."
-            });
-            return;
-        }
-
-        // Timeout de sécurité : si le destinataire ne répond pas après RINGING_TIMEOUT_MS (35s)
-        const ringingTimer = setTimeout(() => {
-            const currentSession = callSessions.get(callId);
-            if (currentSession && currentSession.state === "RINGING") {
-                logCall("TIMEOUT", { callId, from, to, info: `Délai d'attente sonnerie (${RINGING_TIMEOUT_MS}ms) dépassé sans réponse` });
-                nettoyerSessionAppel(callId, from, to);
-                // Notifier l'appelant via WebSocket
-                envoyerAUtilisateur(from, {
-                    type: "hang-up",
-                    from: to,
-                    to: from,
-                    reason: "timeout",
-                    callId: callId
-                });
-                // Notifier l'appelé via WebSocket s'il est connecté
-                envoyerAUtilisateur(to, {
-                    type: "hang-up",
-                    from: from,
-                    to: to,
-                    reason: "timeout",
-                    callId: callId
-                });
-                // Notifier le destinataire via FCM CANCEL_CALL pour basculer en appel manqué
-                const token = fcmTokens.get(to);
-                if (token && messaging) {
-                    messaging.send({
-                        token: token,
-                        data: {
-                            type: "CANCEL_CALL",
-                            action: "cancel_call",
-                            callerId: String(from),
-                            callerName: String(from),
-                            appelant: String(from),
-                            callId: String(callId)
-                        },
-                        android: {
-                            priority: "high",
-                            ttl: 60 * 1000
-                        }
-                    }).catch(() => { });
-                }
-            }
-        }, RINGING_TIMEOUT_MS);
-
-        session.timeoutTimer = ringingTimer;
-
-        logCall("CREATED", { callId, from, to, state: "RINGING", info: `WS direct: ${transmisWs}, Push FCM: ${pushTente}, Timeout: ${RINGING_TIMEOUT_MS}ms` });
-    }
-
-    // ==================================================
-    // TRAITER CALL ACCEPTED (ATOMIQUE)
-    // ==================================================
-    function traiterCallAccepted(message) {
-        const from = identifiant;
-        const to = String(message.to || "").trim();
-        const callId = String(message.callId || "");
-
-        if (to === "") return;
-
-        if (callId && isCallEnded(callId)) {
-            logCall("ACCEPT_IGNORED_DUPLICATE", { callId, from, to, info: "callId dans endedCalls" });
-            return;
-        }
-
-        const session = callId ? callSessions.get(callId) : null;
-        if (session) {
-            if (session.state === "CONNECTED") {
-                logCall("ACCEPT_IGNORED_DUPLICATE", { callId, from, to, state: "CONNECTED", info: "Session déjà connectée" });
-                return;
-            }
-            if (session.timeoutTimer) {
-                clearTimeout(session.timeoutTimer);
-                session.timeoutTimer = null;
-            }
-            session.state = "CONNECTED";
-        }
-
-        // Suppression immédiate et absolue des pendingOffers pour les deux parties
-        pendingOffers.delete(from);
-        pendingOffers.delete(to);
-
-        envoyerAUtilisateur(to, {
-            type: "call-answered",
-            from: from,
-            to: to,
-            callId: callId,
-            answer: message.answer
-        });
-
-        logCall("ANSWER_SENT", { callId, from, to, state: "CONNECTED", info: "Réponse WebRTC relayée à l'appelant" });
-    }
-
-    // ==================================================
-    // TRAITER CALL REJECTED
-    // ==================================================
-    function traiterCallRejected(message) {
-        const from = identifiant;
-        const to = String(message.to || "").trim();
-        const callId = String(message.callId || "");
-
-        if (to === "") return;
-
-        nettoyerSessionAppel(callId, from, to);
-
-        envoyerAUtilisateur(to, {
-            type: "call-refused",
-            from: from,
-            to: to,
-            callId: callId
-        });
-        logCall("REJECTED", { callId, from, to, state: "REJECTED" });
-    }
-
-    // ==================================================
-    // TRAITER CALL ENDED
-    // ==================================================
-    function traiterCallEnded(message) {
-        const from = identifiant;
-        const callId = String(message.callId || "");
-        const session = callId ? callSessions.get(callId) : null;
-        const to = String(message.to || (session ? session.to : "") || appels.get(from) || "").trim();
-
-        if (to === "") {
-            logCall("CALL_ENDED_IGNORED", { callId, from, info: "Destinataire introuvable" });
-            nettoyerSessionAppel(callId, from, null);
-            return;
-        }
-
-        const isSessionRinging = session && session.state === "RINGING";
-        const isPendingOfferRinging = pendingOffers.has(to) && (!session || session.state === "RINGING");
-        const isConnectedOrEnded = session && (session.state === "CONNECTED" || session.state === "ACCEPTING" || session.state === "ENDED" || session.state === "REJECTED");
-        const wasRinging = !isConnectedOrEnded && (isSessionRinging || isPendingOfferRinging || !session);
-
-        console.log(`[CALL_DEBUG] traiterCallEnded: callId=${callId}, from=${from}, to=${to}, sessionState=${session ? session.state : "null"}, pendingOffersHasTo=${pendingOffers.has(to)}, appelsFrom=${appels.get(from)}, decision wasRinging=${wasRinging}`);
-
-        // Nettoyage systématique et immédiat de la session et des timers
-        nettoyerSessionAppel(callId, from, to);
-
-        // Si l'appel était en attente (destinataire n'avait pas encore répondu), envoyer un push d'annulation (Cas a)
-        if (wasRinging) {
-            const tokenTo = fcmTokens.get(to);
-            if (tokenTo && messaging) {
-                console.log(`📵 [SERVEUR] Envoi FCM CANCEL_CALL vers ${to} (callId=${callId}, from=${from})`);
-                messaging.send({
-                    token: tokenTo,
-                    data: {
-                        type: "CANCEL_CALL",
-                        action: "cancel_call",
-                        callerId: String(from),
-                        callerName: String(from),
-                        appelant: String(from),
-                        callId: String(callId || "")
-                    },
-                    android: {
-                        priority: "high",
-                        ttl: 60 * 1000
-                    }
-                }).then(resp => {
-                    logCall("CANCEL_FCM_SENT", { callId, from, to, info: `FCM CANCEL_CALL délivré avec succès (${resp})` });
-                }).catch(err => {
-                    console.error(`⚠️ [SERVEUR] Erreur envoi FCM CANCEL_CALL vers ${to}:`, err);
-                });
-            } else {
-                console.log(`ℹ️ [SERVEUR] Pas de token FCM pour ${to} ou messaging indisponible sur CANCEL_CALL.`);
-            }
-        }
-
-        envoyerAUtilisateur(to, {
-            type: "hang-up",
-            from: from,
-            to: to,
-            reason: message.reason || "user_hangup",
-            callId: callId
-        });
-        logCall("ENDED", { callId, from, to, state: "ENDED", wasRinging });
-    }
-
-    // ==================================================
-    // SIGNALISATION WEBRTC
-    // ==================================================
-    function relayerSignalisation(message) {
-        const from = identifiant;
-        const to = String(message.to || "").trim();
-        const callId = message.callId;
-
-        if (to === "" || appels.get(from) !== to) return;
-
-        const eventType = (message.type === "ICE_CANDIDATE") ? "ice-candidate" : message.type;
-
-        const signal = {
-            type: eventType,
-            candidate: message.candidate,
-            offer: message.offer,
-            answer: message.answer,
-            callId: callId,
-            from: from,
-            to: to
-        };
-
-        envoyerAUtilisateur(to, signal);
-        console.log(`[CALL] SIGNAL | ${eventType} | callId=${callId || "n/a"} | ${from} -> ${to}`);
-    }
-
-    // ==================================================
-    // GESTION DECONNEXION
-    // ==================================================
-    function gererDeconnexion(id, wsOrigine) {
-        // 1. Si l'utilisateur est enregistré avec une AUTRE socket active plus récente, on ne touche à rien
-        if (utilisateurs.get(id) && utilisateurs.get(id) !== wsOrigine) {
-            console.log(`ℹ️ Fermeture d'une socket obsolète pour ${id}, session active préservée.`);
-            return;
-        }
-
-        // 2. Nettoyer la map utilisateurs si c'est bien la socket active qui a fermé
-        if (utilisateurs.get(id) === wsOrigine) {
-            utilisateurs.delete(id);
-            userAppStates.delete(id);
-            userScreenStates.set(id, "SCREEN_OFF");
-        }
-
-        const correspondant = appels.get(id);
-
-        if (correspondant) {
-            // Si un appel est en attente (sonnerie / réveil push) et que l'utilisateur déconnecté est le destinataire,
-            // on ne détruit PAS l'appel : le destinataire est probablement en train d'ouvrir l'application via le push !
-            if (pendingOffers.has(id)) {
-                console.log(`⏳ Destinataire ${id} déconnecté temporairement pendant la sonnerie/push. Appel maintenu.`);
-                return;
-            }
-
-            envoyerAUtilisateur(correspondant, {
-                type: "hang-up",
-                from: id,
-                to: correspondant,
-                reason: "disconnected"
-            });
-
-            nettoyerSessionAppel(null, id, correspondant);
-        }
-
-        console.log(`❌ UTILISATEUR DECONNECTE : ${id}`);
-    }
-});
-
-// ======================================================
-// HEARTBEAT KEEP-ALIVE (30s)
-// ======================================================
-const intervalKeepAlive = setInterval(() => {
-    wss.clients.forEach((ws) => {
-        if (ws.isAlive === false) {
-            console.log("Connexion inactive terminee (timeout keep-alive)");
-            return ws.terminate();
-        }
-        ws.isAlive = false;
-        ws.ping();
-    });
+  });
 }, 30000);
 
 wss.on("close", () => {
-    clearInterval(intervalKeepAlive);
+  clearInterval(interval);
 });
 
-wss.on("error", (error) => {
-    console.error("ERREUR SERVEUR WEBSOCKET :", error);
+// =========================================================
+// GESTION DES CONNEXIONS WEBSOCKET
+// =========================================================
+wss.on("connection", (ws) => {
+  ws.isAlive = true;
+
+  ws.on("pong", () => {
+    ws.isAlive = true;
+  });
+
+  ws.on("message", async (message) => {
+    ws.isAlive = true;
+
+    try {
+      const data = JSON.parse(message);
+      // Récupération de la propriété isVideo transmise par le client
+      const {
+        type,
+        userId,
+        pushToken,
+        voipToken,
+        targetId,
+        offer,
+        answer,
+        candidate,
+        isVideo,
+        callId,
+        accepted,
+        muted,
+      } = data;
+
+      if (type === "pong") {
+        return;
+      }
+
+      console.log(
+        `📩 Message reçu | type=${type} | de=${ws.userId || "?"} | targetId=${targetId || "-"} | callId=${callId || "-"}`,
+      );
+
+      // 1. Enregistrement / Reconnexion de l'utilisateur
+      if (type === "register-user") {
+        ws.userId = userId;
+
+        // VÉRIFICATION DE LA PRÉSENCE DANS LA MAP
+        if (users.has(userId)) {
+          const existingUser = users.get(userId);
+          console.log(
+            `🔄 Utilisateur ${userId} déjà présent dans la Map. Mise à jour de la connexion...`,
+          );
+
+          // Fermer l'ancien socket s'il existe et qu'il est encore actif
+          if (existingUser.ws && existingUser.ws !== ws) {
+            existingUser.ws.userId = null;
+            existingUser.ws.terminate();
+          }
+
+          // Mise à jour : Nouveau socket + mise à jour du token
+          users.set(userId, {
+            ...existingUser,
+            ws: ws,
+            pushToken: pushToken || existingUser.pushToken || null,
+          });
+        } else {
+          // Nouvel utilisateur
+          console.log(
+            `✨ Nouvel utilisateur enregistré dans la Map : ${userId}`,
+          );
+          users.set(userId, {
+            ws: ws,
+            pushToken: pushToken || null,
+            voipToken: null,
+          });
+        }
+
+        const currentUser = users.get(userId);
+        console.log(
+          `👤 Statut : ${userId} | Token FCM : ${currentUser.pushToken || "Aucun"} | Token VoIP : ${currentUser.voipToken || "Aucun"}`,
+        );
+        console.log(
+          "👥 Liste globale des utilisateurs enregistrés :",
+          Array.from(users.keys()),
+        );
+
+        ws.send(
+          JSON.stringify({
+            type: "registered",
+            userId: userId,
+          }),
+        );
+        return;
+      }
+
+      // 1b. Enregistrement spécifique du Token APNs VoIP (iOS CallKit)
+      if (type === "register-voip-token") {
+        ws.userId = userId;
+        const existingUser = users.get(userId) || {};
+        users.set(userId, {
+          ...existingUser,
+          ws: ws,
+          voipToken: voipToken || existingUser.voipToken || null,
+        });
+
+        console.log(`🍏 Token VoIP iOS enregistré pour : ${userId}`);
+        return;
+      }
+
+      // 2. Appel de l'utilisateur ('call-user')
+      if (type === "call-user") {
+        const targetUser = users.get(targetId);
+        const targetWs = targetUser?.ws;
+        const callTypeLabel = isVideo ? "vidéo" : "audio";
+
+        const newCallId = `call_${Date.now()}_${ws.userId}`;
+        const notificationId =
+          data.notId || Math.floor(100000 + Math.random() * 900000);
+
+        // Enregistrement de l'appel avec le statut RINGING
+        pendingCalls.set(newCallId, {
+          from: ws.userId,
+          targetId: targetId,
+          offer: offer,
+          isVideo: !!isVideo,
+          status: "RINGING",
+          notId: notificationId,
+        });
+
+        setTimeout(() => pendingCalls.delete(newCallId), 45000);
+
+        if (targetWs && targetWs.readyState === WebSocket.OPEN) {
+          targetWs.send(
+            JSON.stringify({
+              type: "incoming-call",
+              callId: newCallId,
+              from: ws.userId,
+              offer: offer,
+              isVideo: !!isVideo,
+              notId: notificationId,
+            }),
+          );
+
+          // Envoi Push APNs VoIP si l'utilisateur possède un token VoIP iOS
+          if (targetUser?.voipToken) {
+            await envoyerNotificationVoipIOS(
+              targetUser.voipToken,
+              ws.userId,
+              newCallId,
+              isVideo,
+            );
+          } else if (targetUser?.pushToken) {
+            await envoyerNotificationPush(
+              targetUser.pushToken,
+              ws.userId,
+              `Appel ${callTypeLabel} de ${ws.userId}`,
+              ws.userId,
+              newCallId,
+              isVideo,
+              notificationId,
+            );
+          }
+        } else if (targetUser?.voipToken || targetUser?.pushToken) {
+          if (targetUser.voipToken) {
+            await envoyerNotificationVoipIOS(
+              targetUser.voipToken,
+              ws.userId,
+              newCallId,
+              isVideo,
+            );
+          } else if (targetUser.pushToken) {
+            await envoyerNotificationPush(
+              targetUser.pushToken,
+              ws.userId,
+              `Appel ${callTypeLabel} de ${ws.userId}`,
+              ws.userId,
+              newCallId,
+              isVideo,
+              notificationId,
+            );
+          }
+
+          ws.send(JSON.stringify({ type: "user-offline", targetId: targetId }));
+        } else {
+          ws.send(JSON.stringify({ type: "user-offline", targetId: targetId }));
+        }
+        return;
+      }
+
+      // 3. Récupérer l'offre SDP complète si l'application est ouverte via la notification FCM
+      if (type === "get-offer") {
+        const callData = pendingCalls.get(callId);
+        if (callData) {
+          ws.send(
+            JSON.stringify({
+              type: "call-offer-details",
+              callId: callId,
+              from: callData.from,
+              offer: callData.offer,
+              isVideo: callData.isVideo,
+            }),
+          );
+        } else {
+          ws.send(
+            JSON.stringify({
+              type: "call-expired",
+              callId: callId,
+            }),
+          );
+        }
+        return;
+      }
+
+      // 4. Transmettre la réponse (B -> A)
+      if (type === "answer-call") {
+        // Retrouver l'appel associé et passer son statut à ACCEPTED
+        for (const [cId, callData] of pendingCalls.entries()) {
+          if (callData.from === targetId || callData.targetId === ws.userId) {
+            callData.status = "ACCEPTED";
+            break;
+          }
+        }
+
+        const targetUserForAnswer = users.get(targetId);
+        const targetWs = targetUserForAnswer?.ws;
+        if (targetWs && targetWs.readyState === WebSocket.OPEN) {
+          console.log("le recepteur a decrocher");
+          targetWs.send(
+            JSON.stringify({
+              type: "call-answered",
+              answer: answer,
+            }),
+          );
+        } else if (!targetUserForAnswer) {
+          console.warn(
+            `⚠️ answer-call : aucun utilisateur "${targetId}" trouvé dans la Map (émetteur introuvable).`,
+          );
+        } else {
+          console.warn(
+            `⚠️ answer-call : émetteur "${targetId}" trouvé mais son socket est fermé (readyState=${targetWs?.readyState}). La notification "call-answered" n'a pas pu être envoyée.`,
+          );
+        }
+        return;
+      }
+
+      // 5. Échanger les candidats ICE
+      if (type === "ice-candidate") {
+        const targetWs = users.get(targetId)?.ws;
+        if (targetWs && targetWs.readyState === WebSocket.OPEN) {
+          targetWs.send(
+            JSON.stringify({
+              type: "ice-candidate",
+              candidate: candidate,
+            }),
+          );
+        }
+        return;
+      }
+
+      // 6. Refus d'un appel
+      if (type === "call-refused") {
+        const targetWs = users.get(targetId)?.ws;
+        if (targetWs && targetWs.readyState === WebSocket.OPEN) {
+          targetWs.send(
+            JSON.stringify({
+              type: "call-refused",
+              from: ws.userId,
+            }),
+          );
+        }
+        return;
+      }
+
+      // 7. Fin d'un appel
+      if (type === "call-end") {
+        // Recherche si l'appel était toujours au statut RINGING lors du raccrochage
+        for (const [cId, callData] of pendingCalls.entries()) {
+          if (callData.from === ws.userId && callData.targetId === targetId) {
+            if (callData.status === "RINGING") {
+              const targetUser = users.get(targetId);
+              if (targetUser && targetUser.pushToken) {
+                // Envoi de la notification d'appel manqué avec le même notId pour remplacer l'ancienne
+                envoyerNotificationAppelManque(
+                  targetUser.pushToken,
+                  ws.userId,
+                  callData.isVideo,
+                  callData.notId,
+                );
+              }
+
+              if (targetUser && targetUser.voipToken) {
+                // Annuler le push token et fermer le callkit
+                envoyerAnnulationVoipIOS(targetUser.voipToken, ws.userId, cId);
+              }
+            }
+            pendingCalls.delete(cId);
+            break;
+          }
+        }
+
+        const targetUser = users.get(targetId);
+        const targetWs = targetUser?.ws;
+
+        if (targetWs && targetWs.readyState === WebSocket.OPEN) {
+          targetWs.send(
+            JSON.stringify({
+              type: type,
+              from: ws.userId,
+              target: targetId,
+            }),
+          );
+        }
+      }
+
+      // 8. Informer le correspondant du statut du micro sans renégocier WebRTC
+      if (type === "microphone-status") {
+        const targetWs = users.get(targetId)?.ws;
+        if (targetWs && targetWs.readyState === WebSocket.OPEN) {
+          targetWs.send(
+            JSON.stringify({
+              type: "microphone-status",
+              muted: muted === true,
+            }),
+          );
+        }
+        return;
+      }
+
+      // 9. Restart ICE
+      // 9. Restart ICE ou passage audio -> vidéo
+      if (type === "restart-offer") {
+        const targetWs = users.get(targetId)?.ws;
+        if (targetWs && targetWs.readyState === WebSocket.OPEN) {
+          targetWs.send(
+            JSON.stringify({
+              type: "restart-offer",
+              offer: offer,
+              isVideoUpgrade: !!isVideo,
+            }),
+          );
+        }
+        return;
+      }
+
+      // 10. Demande de confirmation avant de passer en appel vidéo
+      if (type === "video-upgrade-request") {
+        const targetWs = users.get(targetId)?.ws;
+        if (targetWs && targetWs.readyState === WebSocket.OPEN) {
+          targetWs.send(
+            JSON.stringify({
+              type: "video-upgrade-request",
+              from: ws.userId,
+            }),
+          );
+        }
+        return;
+      }
+
+      // 11. Réponse à la demande (accepté ou refusé)
+      if (type === "video-upgrade-response") {
+        const targetWs = users.get(targetId)?.ws;
+        if (targetWs && targetWs.readyState === WebSocket.OPEN) {
+          targetWs.send(
+            JSON.stringify({
+              type: "video-upgrade-response",
+              accepted: !!accepted,
+            }),
+          );
+        }
+        return;
+      }
+    } catch (error) {
+      console.error("❌ Erreur de lecture du message :", error);
+    }
+  });
+
+  // Nettoyage à la déconnexion
+  ws.on("close", () => {
+    if (ws.userId) {
+      const existingUser = users.get(ws.userId);
+      if (existingUser?.ws === ws) {
+        users.set(ws.userId, {
+          ...existingUser,
+          ws: null,
+        });
+        console.log(
+          `❌ Socket déconnecté pour ${ws.userId} (Utilisateur et Tokens conservés)`,
+        );
+      }
+    }
+  });
+
+  ws.on("error", (error) => {
+    console.error(
+      `❌ Erreur WebSocket sur l'utilisateur ${ws.userId || "Inconnu"} :`,
+      error,
+    );
+  });
 });
+
+/**
+ * Fonction d'envoi de notification "Appel Entrant" via HTTP REST Bearer FCM v1
+ */
+async function envoyerNotificationPush(
+  tokenDestinataire,
+  nomExpediteur,
+  texteMessage,
+  from,
+  callId,
+  isVideo = false,
+  notId = null,
+) {
+  if (!tokenDestinataire) {
+    console.warn(
+      "⚠️ Impossible d'envoyer la notification : Aucun token FCM fourni.",
+    );
+    return;
+  }
+
+  const currentNotId = notId || Math.floor(100000 + Math.random() * 900000);
+
+  const payload = {
+    token: tokenDestinataire,
+    data: {
+      title: isVideo ? "📹 Appel vidéo entrant" : "📞 Appel entrant",
+      message: texteMessage || `Appel de ${from}`,
+      type: "incoming-call",
+      callerId: String(from),
+      callerName: String(nomExpediteur || from),
+      callId: String(callId),
+      isVideo: String(isVideo),
+      notId: String(currentNotId),
+      actions: JSON.stringify([
+        {
+          title: "Refuser",
+          callback: "reject",
+          foreground: false,
+        },
+        {
+          title: "Accepter",
+          callback: "accept",
+          foreground: true,
+        },
+      ]),
+    },
+    android: {
+      priority: "high",
+    },
+    apns: {
+      headers: {
+        "apns-priority": "10",
+        "apns-push-type": "alert",
+      },
+      payload: {
+        aps: {
+          alert: {
+            title: isVideo ? "📹 Appel vidéo entrant" : "📞 Appel entrant",
+            body: texteMessage || `Appel de ${from}`,
+          },
+          sound: "default",
+          badge: 1,
+          "content-available": 1,
+        },
+      },
+    },
+  };
+
+  const result = await sendFcmHttpV1Message(payload);
+  if (result) {
+    console.log("📲 Notification Push FCM envoyée avec succès :", result.name);
+  }
+}
+
+/**
+ * Fonction d'envoi de notification "Appel Manqué" via HTTP REST Bearer FCM v1
+ */
+async function envoyerNotificationAppelManque(
+  tokenDestinataire,
+  nomExpediteur,
+  isVideo,
+  notId,
+) {
+  if (!tokenDestinataire) return;
+
+  const payload = {
+    token: tokenDestinataire,
+    // Pas de champ "notification" de premier niveau : si l'app Android est en
+    // arrière-plan ou tuée, un message hybride notification+data est affiché
+    // directement par le système et n'invoque JAMAIS onMessageReceived(), donc
+    // la notification d'appel entrant ne serait jamais annulée. En restant en
+    // data-only (comme pour "incoming-call"), CallMessagingService reçoit
+    // toujours ce message et gère lui-même l'annulation + l'affichage.
+    data: {
+      type: "missed-call",
+      callerId: String(nomExpediteur),
+      isVideo: String(isVideo),
+      notId: String(notId),
+    },
+    android: {
+      priority: "high",
+    },
+
+    apns: {
+      headers: {
+        "apns-priority": "10",
+        "apns-push-type": "alert",
+        "apns-collapse-id": String(notId),
+      },
+      payload: {
+        aps: {
+          alert: {
+            title: "Appel manqué",
+            body: `Vous avez manqué un appel ${isVideo ? "vidéo" : "audio"} de ${nomExpediteur}`,
+          },
+          sound: "default",
+          badge: 1,
+        },
+      },
+    },
+  };
+
+  const result = await sendFcmHttpV1Message(payload);
+  if (result) {
+    console.log(`📵 Notification Appel Manqué envoyée pour notId : ${notId}`);
+  }
+}
+
+// =========================================================
+// ENVOI PUSH VOIP APPLE DIRECT (iOS CallKit)
+// =========================================================
+async function envoyerNotificationVoipIOS(
+  voipToken,
+  callerId,
+  callId,
+  isVideo = false,
+) {
+  if (!apnProvider || !voipToken) return;
+
+  const note = new apn.Notification();
+  note.topic = `${APP_BUNDLE_ID}.voip`;
+  note.priority = 10;
+  note.pushType = "voip";
+
+  // CordovaCall.m (didReceiveIncomingPushWithPayload) lit :
+  //   payload["aps"]["alert"]  -> doit être une string non-nil (sinon crash)
+  //   payload["data"]          -> doit être une STRING contenant du JSON,
+  //                                pas un objet imbriqué directement.
+  note.alert = "Appel entrant"; // valeur peu importe le contenu, juste non-nil
+  note.payload = {
+    data: JSON.stringify({
+      Caller: {
+        Username: String(callerId),
+        ConnectionId: String(callId),
+        isVideo: !!isVideo,
+      },
+    }),
+  };
+
+  try {
+    const result = await apnProvider.send(note, voipToken);
+    console.log(
+      "🍏 Push VoIP envoyé :",
+      result.sent.length,
+      "| échecs :",
+      result.failed.length,
+    );
+    if (result.failed.length > 0) {
+      console.error(
+        "❌ Détail échec VoIP :",
+        JSON.stringify(result.failed, null, 2),
+      );
+    }
+  } catch (error) {
+    console.error("❌ Erreur Push VoIP APNs :", error);
+  }
+}
+
+// Notification d'annulation pour fermer l'écran CallKit si l'émetteur raccroche
+async function envoyerAnnulationVoipIOS(voipToken, callerId, callId) {
+  if (!apnProvider || !voipToken) return;
+
+  const note = new apn.Notification();
+  note.topic = `${APP_BUNDLE_ID}.voip`;
+  note.priority = 10;
+  note.pushType = "voip";
+
+  note.alert = "Appel annulé";
+  note.payload = {
+    data: JSON.stringify({
+      Caller: {
+        Username: String(callerId),
+        ConnectionId: String(callId),
+        CancelPush: "true",
+      },
+    }),
+  };
+
+  try {
+    await apnProvider.send(note, voipToken);
+  } catch (error) {
+    console.error("❌ Erreur annulation VoIP APNs :", error);
+  }
+}
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () =>
+  console.log(`🚀 Serveur WebSocket actif sur le port ${PORT}`),
+);
