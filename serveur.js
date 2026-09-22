@@ -2,6 +2,7 @@ const express = require("express");
 const http = require("http");
 const { WebSocketServer, WebSocket } = require("ws");
 const apn = require("@parse/node-apn"); // Integration APNs
+const { GoogleAuth } = require("google-auth-library");
 
 const app = express();
 const server = http.createServer(app);
@@ -14,53 +15,46 @@ let apnProvider = null;
 try {
   apnProvider = new apn.Provider({
     token: {
-      key:process.env.APNS_KEY_CONTENT, // Chemin vers la clé p8
-      keyId: "48YTL8938V", // Key ID Apple
-      teamId: "C55D4CX59A", // Team ID Apple
+      key: process.env.APNS_KEY_CONTENT?.replace(/\\n/g, "\n"), // Clé .p8 Apple
+      keyId: process.env.APNS_KEY_ID || "48YTL8938V", // Key ID Apple
+      teamId: process.env.APNS_TEAM_ID || "C55D4CX59A", // Team ID Apple
     },
     production: false, // Passer à true pour la production / App Store
   });
   console.log("🍏 Configuration APNs VoIP initialisée.");
 } catch (err) {
   console.warn(
-    "⚠️ Impossible d'initialiser APNs VoIP (Vérifiez le fichier AuthKey p8) :",
+    "⚠️ Impossible d'initialiser APNs VoIP (Vérifiez la clé p8) :",
     err.message,
   );
 }
 
-const APP_BUNDLE_ID = "NGOKO.CEDRIC.fm"; // Remplacez par votre Bundle ID iOS
+const APP_BUNDLE_ID = "NGOKO.CEDRIC.fm"; // Bundle ID iOS
 
 // Carte globale persistante (RAM) pour conserver les utilisateurs, leurs tokens FCM et VoIP
 const users = new Map();
 
-// Stockage temporaire en mémoire RAM pour les offres d'appel (évite de surcharger FCM)
+// Stockage temporaire en mémoire RAM pour les offres d'appel
 const pendingCalls = new Map();
 
 // =========================================================
 // ENVOI NOTIFICATION FCM VIA HTTP REST (v1)
 // =========================================================
-
-
-const { GoogleAuth } = require("google-auth-library");
-const path = require("path");
-
-// Chargement sécurisé du fichier de compte de service
-const serviceAccount = require(process.env.APNS_KEY_CONTENT);
-const PROJECT_ID = serviceAccount.project_id; // Récupère l'ID exact du projet dynamiquement
+const PROJECT_ID = process.env.FIREBASE_PROJECT_ID || "fmmm-51566";
 
 // Initialisation de l'authentification Google OAuth 2.0
-
-
 const auth = new GoogleAuth({
   credentials: {
-    client_email: "firebase-adminsdk-fbsvc@fmmm-51566.iam.gserviceaccount.com",
-    private_key: process.env.APNS_KEY_CONTENT,
+    client_email:
+      process.env.FIREBASE_CLIENT_EMAIL ||
+      "firebase-adminsdk-fbsvc@fmmm-51566.iam.gserviceaccount.com",
+    private_key: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, "\n"),
   },
   scopes: ["https://www.googleapis.com/auth/firebase.messaging"],
 });
 
 /**
- * Récupère dynamiquement un jeton d'accès OAuth 2.0 valide et à jour
+ * Récupère dynamiquement un jeton d'accès OAuth 2.0 valide
  */
 async function getAccessToken() {
   const client = await auth.getClient();
@@ -73,7 +67,7 @@ async function getAccessToken() {
  */
 async function sendFcmHttpV1Message(messagePayload) {
   try {
-    const accessToken = await getAccessToken(); // Récupération dynamique sans code en dur
+    const accessToken = await getAccessToken();
     const url = `https://fcm.googleapis.com/v1/projects/${PROJECT_ID}/messages:send`;
 
     const response = await fetch(url, {
@@ -97,7 +91,7 @@ async function sendFcmHttpV1Message(messagePayload) {
   }
 }
 
-//-------------------------------------------------
+// -------------------------------------------------
 
 app.get("/", (req, res) => {
   res.send("Serveur WebSocket actif");
@@ -111,7 +105,6 @@ const interval = setInterval(() => {
     if (ws.isAlive === false) {
       console.log(`⚠️ Client inactif expulsé : ${ws.userId || "Inconnu"}`);
       if (ws.userId && users.get(ws.userId)?.ws === ws) {
-        // Déconnexion : Passe le socket à null sans supprimer l'utilisateur de la Map
         const existingUser = users.get(ws.userId);
         users.set(ws.userId, {
           ...existingUser,
@@ -151,7 +144,6 @@ wss.on("connection", (ws) => {
 
     try {
       const data = JSON.parse(message);
-      // Récupération de la propriété isVideo transmise par le client
       const {
         type,
         userId,
@@ -179,27 +171,23 @@ wss.on("connection", (ws) => {
       if (type === "register-user") {
         ws.userId = userId;
 
-        // VÉRIFICATION DE LA PRÉSENCE DANS LA MAP
         if (users.has(userId)) {
           const existingUser = users.get(userId);
           console.log(
             `🔄 Utilisateur ${userId} déjà présent dans la Map. Mise à jour de la connexion...`,
           );
 
-          // Fermer l'ancien socket s'il existe et qu'il est encore actif
           if (existingUser.ws && existingUser.ws !== ws) {
             existingUser.ws.userId = null;
             existingUser.ws.terminate();
           }
 
-          // Mise à jour : Nouveau socket + mise à jour du token
           users.set(userId, {
             ...existingUser,
             ws: ws,
             pushToken: pushToken || existingUser.pushToken || null,
           });
         } else {
-          // Nouvel utilisateur
           console.log(
             `✨ Nouvel utilisateur enregistré dans la Map : ${userId}`,
           );
@@ -213,10 +201,6 @@ wss.on("connection", (ws) => {
         const currentUser = users.get(userId);
         console.log(
           `👤 Statut : ${userId} | Token FCM : ${currentUser.pushToken || "Aucun"} | Token VoIP : ${currentUser.voipToken || "Aucun"}`,
-        );
-        console.log(
-          "👥 Liste globale des utilisateurs enregistrés :",
-          Array.from(users.keys()),
         );
 
         ws.send(
@@ -252,7 +236,6 @@ wss.on("connection", (ws) => {
         const notificationId =
           data.notId || Math.floor(100000 + Math.random() * 900000);
 
-        // Enregistrement de l'appel avec le statut RINGING
         pendingCalls.set(newCallId, {
           from: ws.userId,
           targetId: targetId,
@@ -276,7 +259,6 @@ wss.on("connection", (ws) => {
             }),
           );
 
-          // Envoi Push APNs VoIP si l'utilisateur possède un token VoIP iOS
           if (targetUser?.voipToken) {
             await envoyerNotificationVoipIOS(
               targetUser.voipToken,
@@ -315,14 +297,18 @@ wss.on("connection", (ws) => {
             );
           }
 
-          ws.send(JSON.stringify({ type: "user-offline", targetId: targetId }));
+          ws.send(
+            JSON.stringify({ type: "user-offline", targetId: targetId }),
+          );
         } else {
-          ws.send(JSON.stringify({ type: "user-offline", targetId: targetId }));
+          ws.send(
+            JSON.stringify({ type: "user-offline", targetId: targetId }),
+          );
         }
         return;
       }
 
-      // 3. Récupérer l'offre SDP complète si l'application est ouverte via la notification FCM
+      // 3. Récupérer l'offre SDP
       if (type === "get-offer") {
         const callData = pendingCalls.get(callId);
         if (callData) {
@@ -348,7 +334,6 @@ wss.on("connection", (ws) => {
 
       // 4. Transmettre la réponse (B -> A)
       if (type === "answer-call") {
-        // Retrouver l'appel associé et passer son statut à ACCEPTED
         for (const [cId, callData] of pendingCalls.entries()) {
           if (callData.from === targetId || callData.targetId === ws.userId) {
             callData.status = "ACCEPTED";
@@ -359,20 +344,12 @@ wss.on("connection", (ws) => {
         const targetUserForAnswer = users.get(targetId);
         const targetWs = targetUserForAnswer?.ws;
         if (targetWs && targetWs.readyState === WebSocket.OPEN) {
-          console.log("le recepteur a decrocher");
+          console.log("Le récepteur a décroché");
           targetWs.send(
             JSON.stringify({
               type: "call-answered",
               answer: answer,
             }),
-          );
-        } else if (!targetUserForAnswer) {
-          console.warn(
-            `⚠️ answer-call : aucun utilisateur "${targetId}" trouvé dans la Map (émetteur introuvable).`,
-          );
-        } else {
-          console.warn(
-            `⚠️ answer-call : émetteur "${targetId}" trouvé mais son socket est fermé (readyState=${targetWs?.readyState}). La notification "call-answered" n'a pas pu être envoyée.`,
           );
         }
         return;
@@ -408,13 +385,11 @@ wss.on("connection", (ws) => {
 
       // 7. Fin d'un appel
       if (type === "call-end") {
-        // Recherche si l'appel était toujours au statut RINGING lors du raccrochage
         for (const [cId, callData] of pendingCalls.entries()) {
           if (callData.from === ws.userId && callData.targetId === targetId) {
             if (callData.status === "RINGING") {
               const targetUser = users.get(targetId);
               if (targetUser && targetUser.pushToken) {
-                // Envoi de la notification d'appel manqué avec le même notId pour remplacer l'ancienne
                 envoyerNotificationAppelManque(
                   targetUser.pushToken,
                   ws.userId,
@@ -424,7 +399,6 @@ wss.on("connection", (ws) => {
               }
 
               if (targetUser && targetUser.voipToken) {
-                // Annuler le push token et fermer le callkit
                 envoyerAnnulationVoipIOS(targetUser.voipToken, ws.userId, cId);
               }
             }
@@ -447,7 +421,7 @@ wss.on("connection", (ws) => {
         }
       }
 
-      // 8. Informer le correspondant du statut du micro sans renégocier WebRTC
+      // 8. Statut du micro
       if (type === "microphone-status") {
         const targetWs = users.get(targetId)?.ws;
         if (targetWs && targetWs.readyState === WebSocket.OPEN) {
@@ -462,7 +436,6 @@ wss.on("connection", (ws) => {
       }
 
       // 9. Restart ICE
-      // 9. Restart ICE ou passage audio -> vidéo
       if (type === "restart-offer") {
         const targetWs = users.get(targetId)?.ws;
         if (targetWs && targetWs.readyState === WebSocket.OPEN) {
@@ -477,7 +450,7 @@ wss.on("connection", (ws) => {
         return;
       }
 
-      // 10. Demande de confirmation avant de passer en appel vidéo
+      // 10. Demande de passage vidéo
       if (type === "video-upgrade-request") {
         const targetWs = users.get(targetId)?.ws;
         if (targetWs && targetWs.readyState === WebSocket.OPEN) {
@@ -491,7 +464,7 @@ wss.on("connection", (ws) => {
         return;
       }
 
-      // 11. Réponse à la demande (accepté ou refusé)
+      // 11. Réponse passage vidéo
       if (type === "video-upgrade-response") {
         const targetWs = users.get(targetId)?.ws;
         if (targetWs && targetWs.readyState === WebSocket.OPEN) {
@@ -509,7 +482,6 @@ wss.on("connection", (ws) => {
     }
   });
 
-  // Nettoyage à la déconnexion
   ws.on("close", () => {
     if (ws.userId) {
       const existingUser = users.get(ws.userId);
@@ -534,7 +506,7 @@ wss.on("connection", (ws) => {
 });
 
 /**
- * Fonction d'envoi de notification "Appel Entrant" via HTTP REST Bearer FCM v1
+ * Notification Push FCM v1 "Appel Entrant"
  */
 async function envoyerNotificationPush(
   tokenDestinataire,
@@ -545,12 +517,7 @@ async function envoyerNotificationPush(
   isVideo = false,
   notId = null,
 ) {
-  if (!tokenDestinataire) {
-    console.warn(
-      "⚠️ Impossible d'envoyer la notification : Aucun token FCM fourni.",
-    );
-    return;
-  }
+  if (!tokenDestinataire) return;
 
   const currentNotId = notId || Math.floor(100000 + Math.random() * 900000);
 
@@ -566,26 +533,13 @@ async function envoyerNotificationPush(
       isVideo: String(isVideo),
       notId: String(currentNotId),
       actions: JSON.stringify([
-        {
-          title: "Refuser",
-          callback: "reject",
-          foreground: false,
-        },
-        {
-          title: "Accepter",
-          callback: "accept",
-          foreground: true,
-        },
+        { title: "Refuser", callback: "reject", foreground: false },
+        { title: "Accepter", callback: "accept", foreground: true },
       ]),
     },
-    android: {
-      priority: "high",
-    },
+    android: { priority: "high" },
     apns: {
-      headers: {
-        "apns-priority": "10",
-        "apns-push-type": "alert",
-      },
+      headers: { "apns-priority": "10", "apns-push-type": "alert" },
       payload: {
         aps: {
           alert: {
@@ -607,7 +561,7 @@ async function envoyerNotificationPush(
 }
 
 /**
- * Fonction d'envoi de notification "Appel Manqué" via HTTP REST Bearer FCM v1
+ * Notification Push FCM v1 "Appel Manqué"
  */
 async function envoyerNotificationAppelManque(
   tokenDestinataire,
@@ -619,22 +573,13 @@ async function envoyerNotificationAppelManque(
 
   const payload = {
     token: tokenDestinataire,
-    // Pas de champ "notification" de premier niveau : si l'app Android est en
-    // arrière-plan ou tuée, un message hybride notification+data est affiché
-    // directement par le système et n'invoque JAMAIS onMessageReceived(), donc
-    // la notification d'appel entrant ne serait jamais annulée. En restant en
-    // data-only (comme pour "incoming-call"), CallMessagingService reçoit
-    // toujours ce message et gère lui-même l'annulation + l'affichage.
     data: {
       type: "missed-call",
       callerId: String(nomExpediteur),
       isVideo: String(isVideo),
       notId: String(notId),
     },
-    android: {
-      priority: "high",
-    },
-
+    android: { priority: "high" },
     apns: {
       headers: {
         "apns-priority": "10",
@@ -676,11 +621,7 @@ async function envoyerNotificationVoipIOS(
   note.priority = 10;
   note.pushType = "voip";
 
-  // CordovaCall.m (didReceiveIncomingPushWithPayload) lit :
-  //   payload["aps"]["alert"]  -> doit être une string non-nil (sinon crash)
-  //   payload["data"]          -> doit être une STRING contenant du JSON,
-  //                                pas un objet imbriqué directement.
-  note.alert = "Appel entrant"; // valeur peu importe le contenu, juste non-nil
+  note.alert = "Appel entrant";
   note.payload = {
     data: JSON.stringify({
       Caller: {
@@ -699,18 +640,11 @@ async function envoyerNotificationVoipIOS(
       "| échecs :",
       result.failed.length,
     );
-    if (result.failed.length > 0) {
-      console.error(
-        "❌ Détail échec VoIP :",
-        JSON.stringify(result.failed, null, 2),
-      );
-    }
   } catch (error) {
     console.error("❌ Erreur Push VoIP APNs :", error);
   }
 }
 
-// Notification d'annulation pour fermer l'écran CallKit si l'émetteur raccroche
 async function envoyerAnnulationVoipIOS(voipToken, callerId, callId) {
   if (!apnProvider || !voipToken) return;
 
