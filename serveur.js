@@ -49,10 +49,7 @@ const serviceAccount = require(process.env.APNS_KEY_CONTENT);
 const PROJECT_ID = serviceAccount.project_id; // Récupère l'ID exact du projet dynamiquement
 
 // Initialisation de l'authentification Google OAuth 2.0
-const auth = new GoogleAuth({
-  keyFile: path.join(__dirname, "serviceAccountKey.json"),
-  scopes: ["https://www.googleapis.com/auth/firebase.messaging"],
-});
+
 
 const auth = new GoogleAuth({
   credentials: {
