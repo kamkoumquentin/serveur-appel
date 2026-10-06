@@ -44,6 +44,7 @@
   },
   "dependencies": {
     "cordova-plugin-audiotoggle": "1.0.3",
-    "firebase-admin": "^14.5.0"
+    "firebase-admin": "^14.5.0",
+    "ws": "^8.22.0"
   }
 }
