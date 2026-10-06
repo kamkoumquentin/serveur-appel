@@ -7,6 +7,11 @@ const path = require("path");
 const PORT = process.env.PORT || 8080;
 
 // ======================================================
+// CONFIGURATION GLOBALE - SOURCE DE VÉRITÉ UNIQUE
+// ======================================================
+const RINGING_TIMEOUT_MS = 35000; // Durée de sonnerie avant expiration (35 secondes)
+
+// ======================================================
 // TOKENS & SESSIONS EN MEMOIRE & PERSISTANCE DISQUE
 // ======================================================
 const fcmTokens = new Map();
@@ -62,6 +67,10 @@ function markCallEnded(callId) {
     endedCalls.set(String(callId), Date.now());
     const session = callSessions.get(String(callId));
     if (session) {
+        if (session.timeoutTimer) {
+            clearTimeout(session.timeoutTimer);
+            session.timeoutTimer = null;
+        }
         session.state = "ENDED";
     }
 }
@@ -213,7 +222,8 @@ function envoyerPushTest1Banniere(tokenDestinataire, to, from, callId, offerStr,
             sound: "default",
             vibrate: "true",
             vibrationPattern: "[0, 500, 250, 500]",
-            category: "call"
+            category: "call",
+            ringingTimeoutMs: String(RINGING_TIMEOUT_MS)
         },
         android: {
             priority: "high",
@@ -259,7 +269,8 @@ function envoyerPushTest2Veille(tokenDestinataire, to, from, callId, offerStr, n
             app_name: "KamSoft",
             offer: offerStr || "",
             "force-start": "1",
-            "content-available": "1"
+            "content-available": "1",
+            ringingTimeoutMs: String(RINGING_TIMEOUT_MS)
         },
         android: {
             priority: "high",
@@ -686,7 +697,8 @@ wss.on("connection", (ws) => {
                 from: from,
                 to: to,
                 offer: message.offer,
-                callId: callId
+                callId: callId,
+                ringingTimeoutMs: RINGING_TIMEOUT_MS
             });
             if (transmisWs) {
                 logCall("WS_RECEIVED", { callId, from, to, state: "RINGING", info: "Transmis par WS direct (app au 1er plan)" });
@@ -707,15 +719,16 @@ wss.on("connection", (ws) => {
             const screenState = userScreenStates.get(to);
 
             // ── SÉPARATION STRICTE TEST 1 vs TEST 2 ──────────────────────────
-            // Si le destinataire a son écran EXPLICITEMENT allumé en arrière-plan :
+            // Si le destinataire a son écran EXPLICITEMENT allumé en arrière-plan ET est connecté en WS :
             // 👉 Utiliser TEST 1 (Bannière interactive avec [Refuser] et [Accepter], sans forçage)
-            // Dans TOUS les autres cas (veille, écran noir avec schéma, app fermée) :
-            // 👉 Utiliser TEST 2 (Réveil physique de l'écran + Interface 2 au-dessus du lockscreen)
-            if (screenState === "SCREEN_ON") {
-                console.log(`☀️ [TEST 1] Destinataire ${to} écran allumé -> Push bannière interactive`);
+            // Dans TOUS les autres cas (veille, écran noir avec schéma, app fermée, hors-ligne) :
+            // 👉 Utiliser TEST 2 (Réveil physique de l'écran + Interface 2 active au-dessus du lockscreen)
+            const isStrictementEcranAllume = (screenState === "SCREEN_ON") && destinataireEnLigne;
+            if (isStrictementEcranAllume) {
+                console.log(`☀️ [TEST 1] Destinataire ${to} écran allumé et en ligne -> Push bannière interactive`);
                 envoyerPushTest1Banniere(tokenDestinataire, to, from, callId, offerStr, notIdVal);
             } else {
-                console.log(`🌙 [TEST 2] Destinataire ${to} en veille (${screenState || "défaut"}) -> Push réveil écran`);
+                console.log(`🌙 [TEST 2] Destinataire ${to} en veille ou hors ligne (${screenState || "défaut"}) -> Push réveil écran`);
                 envoyerPushTest2Veille(tokenDestinataire, to, from, callId, offerStr, notIdVal);
             }
         } else if (isDestinataireAuPremierPlan) {
@@ -736,11 +749,11 @@ wss.on("connection", (ws) => {
             return;
         }
 
-        // Timeout de sécurité : si le destinataire ne répond pas après 60 secondes
-        setTimeout(() => {
+        // Timeout de sécurité : si le destinataire ne répond pas après RINGING_TIMEOUT_MS
+        const ringingTimer = setTimeout(() => {
             const currentSession = callSessions.get(callId);
             if (currentSession && currentSession.state === "RINGING") {
-                logCall("TIMEOUT", { callId, from, to, info: "Délai d'attente 60s dépassé" });
+                logCall("TIMEOUT", { callId, from, to, info: `Délai d'attente sonnerie (${RINGING_TIMEOUT_MS}ms) dépassé sans réponse` });
                 markCallEnded(callId);
                 pendingOffers.delete(to);
                 supprimerAppel(from, to);
@@ -767,9 +780,11 @@ wss.on("connection", (ws) => {
                     }).catch(() => { });
                 }
             }
-        }, 60000);
+        }, RINGING_TIMEOUT_MS);
 
-        logCall("CREATED", { callId, from, to, state: "RINGING", info: `WS direct: ${transmisWs}, Push FCM: ${pushTente}` });
+        session.timeoutTimer = ringingTimer;
+
+        logCall("CREATED", { callId, from, to, state: "RINGING", info: `WS direct: ${transmisWs}, Push FCM: ${pushTente}, Timeout: ${RINGING_TIMEOUT_MS}ms` });
     }
 
     // ==================================================
@@ -792,6 +807,10 @@ wss.on("connection", (ws) => {
             if (session.state === "CONNECTED") {
                 logCall("ACCEPT_IGNORED_DUPLICATE", { callId, from, to, state: "CONNECTED", info: "Session déjà connectée" });
                 return;
+            }
+            if (session.timeoutTimer) {
+                clearTimeout(session.timeoutTimer);
+                session.timeoutTimer = null;
             }
             session.state = "CONNECTED";
         }
@@ -927,6 +946,7 @@ wss.on("connection", (ws) => {
         if (utilisateurs.get(id) === wsOrigine) {
             utilisateurs.delete(id);
             userAppStates.delete(id);
+            userScreenStates.set(id, "SCREEN_OFF");
         }
 
         const correspondant = appels.get(id);
