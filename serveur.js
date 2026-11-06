@@ -53,9 +53,27 @@ const MAX_JOIN_ATTEMPTS_PER_CONNECTION = 10;
 const ROOM_STATE_INTERVAL_MS = 100;
 const CHAT_RATE_LIMIT_COUNT = 5;
 const CHAT_RATE_LIMIT_WINDOW_MS = 5000;
+const MAX_ROOM_ATTACHMENT_SIZE = 10 * 1024 * 1024;
+const MAX_ROOM_VOICE_DURATION_MS = 120000;
+const ROOM_ATTACHMENT_AUTH_TTL_MS = 10 * 60 * 1000;
+const ROOM_ATTACHMENT_ORPHAN_TTL_MS = 2 * 60 * 60 * 1000;
+const ROOM_ATTACHMENT_PURGE_INTERVAL_MS = 10 * 60 * 1000;
+const ROOM_UPLOADS_DIR = path.join(__dirname, "uploads", "rooms");
+const ROOM_FILE_MIME_TYPES = new Set([
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+    "application/pdf"
+]);
+const ROOM_VOICE_MIME_TYPES = new Set([
+    "audio/webm",
+    "audio/ogg",
+    "audio/mp4"
+]);
 const ROOM_CODE_CHARACTERS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const rooms = new Map();
 const roomCodes = new Map();
+const roomAttachments = new Map();
 
 // MACHINE À ÉTATS SERVEUR & DÉDUPLICATION
 // callSessions : callId -> { callId, from, to, state: "RINGING" | "ACCEPTING" | "CONNECTED" | "REJECTED" | "ENDED", offer, createdAt }
@@ -299,13 +317,487 @@ function envoyerPushTest2Veille(tokenDestinataire, to, from, callId, offerStr, h
 // ======================================================
 // SERVEUR HTTP (Pour le reveil Render, Diagnostic & Health Check)
 // ======================================================
-const server = http.createServer(async (req, res) => {
-    res.writeHead(200, {
-        "Content-Type": "application/json",
-        "Access-Control-Allow-Origin": "*"
+function repondreJsonHttp(res, statusCode, payload) {
+    if (res.headersSent) return;
+    res.writeHead(statusCode, { "Content-Type": "application/json; charset=utf-8" });
+    res.end(JSON.stringify(payload));
+}
+
+function authentifierAccesSalleHttp(req, roomId) {
+    const userId = String(req.headers["x-user-id"] || "").trim();
+    const sessionToken = String(req.headers["x-session-token"] || "").trim();
+    if (!userId || !sessionToken || sessionTokens.get(userId) !== sessionToken) {
+        return { error: { status: 401, code: "AUTH_REQUIRED", message: "Session invalide ou expirée." } };
+    }
+
+    const room = rooms.get(roomId);
+    const participant = room && room.participants.get(userId);
+    if (!participant) {
+        return { error: { status: 403, code: "NOT_IN_ROOM", message: "Vous ne participez pas à cette salle." } };
+    }
+    return { userId, room, participant };
+}
+
+async function lireCorpsJsonHttp(req, maxBytes = 16 * 1024) {
+    const chunks = [];
+    let size = 0;
+    for await (const chunk of req) {
+        size += chunk.length;
+        if (size > maxBytes) {
+            const error = new Error("La requête est trop volumineuse.");
+            error.code = "REQUEST_TOO_LARGE";
+            throw error;
+        }
+        chunks.push(chunk);
+    }
+    try {
+        return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    } catch (error) {
+        if (error.code === "REQUEST_TOO_LARGE") throw error;
+        const invalidJson = new Error("Le corps JSON est invalide.");
+        invalidJson.code = "INVALID_JSON";
+        throw invalidJson;
+    }
+}
+
+function ecrireFluxPieceJointe(req, fileHandle, maxBytes) {
+    return new Promise((resolve, reject) => {
+        let receivedSize = 0;
+        let signatureSize = 0;
+        const signatureChunks = [];
+        let writing = false;
+        let ended = false;
+        let settled = false;
+
+        const cleanup = () => {
+            req.off("data", onData);
+            req.off("end", onEnd);
+            req.off("error", onError);
+            req.off("aborted", onAborted);
+        };
+        const fail = (error, drainRequest = false) => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            if (drainRequest) req.resume();
+            reject(error);
+        };
+        const finish = () => {
+            if (settled || !ended || writing) return;
+            settled = true;
+            cleanup();
+            resolve({
+                size: receivedSize,
+                signature: Buffer.concat(signatureChunks)
+            });
+        };
+        const onData = chunk => {
+            if (settled) return;
+            receivedSize += chunk.length;
+            if (receivedSize > maxBytes) {
+                const error = new Error("La taille maximale est de 10 MiB.");
+                error.code = "FILE_TOO_LARGE";
+                fail(error, true);
+                return;
+            }
+            if (signatureSize < 16) {
+                const part = chunk.subarray(0, 16 - signatureSize);
+                signatureChunks.push(part);
+                signatureSize += part.length;
+            }
+
+            writing = true;
+            req.pause();
+            (async () => {
+                let offset = 0;
+                while (offset < chunk.length) {
+                    const result = await fileHandle.write(chunk, offset, chunk.length - offset, null);
+                    offset += result.bytesWritten;
+                }
+            })().then(() => {
+                writing = false;
+                if (ended) finish();
+                else req.resume();
+            }, error => fail(error, true));
+        };
+        const onEnd = () => {
+            ended = true;
+            finish();
+        };
+        const onError = error => fail(error);
+        const onAborted = () => {
+            const error = new Error("Le transfert a été interrompu.");
+            error.code = "UPLOAD_ABORTED";
+            fail(error);
+        };
+
+        req.on("data", onData);
+        req.once("end", onEnd);
+        req.once("error", onError);
+        req.once("aborted", onAborted);
     });
+}
+
+function nettoyerNomPieceJointe(name) {
+    const basename = path.basename(String(name || "").replace(/\\/g, "/"));
+    const cleaned = basename
+        .replace(/[\u0000-\u001F\u007F-\u009F]/g, "")
+        .trim()
+        .slice(0, 120);
+    return cleaned || "fichier";
+}
+
+function cheminRepertoireSalle(roomId) {
+    return path.join(ROOM_UPLOADS_DIR, roomId);
+}
+
+function cheminPieceJointe(roomId, attachmentId) {
+    return path.join(cheminRepertoireSalle(roomId), attachmentId);
+}
+
+function verifierSignaturePieceJointe(mimeType, signature) {
+    if (mimeType === "image/jpeg") {
+        return signature.length >= 3 && signature[0] === 0xff &&
+            signature[1] === 0xd8 && signature[2] === 0xff;
+    }
+    if (mimeType === "image/png") {
+        return signature.length >= 8 &&
+            signature.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+    }
+    if (mimeType === "image/webp") {
+        return signature.length >= 12 &&
+            signature.toString("ascii", 0, 4) === "RIFF" &&
+            signature.toString("ascii", 8, 12) === "WEBP";
+    }
+    if (mimeType === "application/pdf") {
+        return signature.toString("ascii", 0, 5) === "%PDF-";
+    }
+    if (mimeType === "audio/webm") {
+        return signature.length >= 4 &&
+            signature.subarray(0, 4).equals(Buffer.from([0x1a, 0x45, 0xdf, 0xa3]));
+    }
+    if (mimeType === "audio/ogg") {
+        return signature.toString("ascii", 0, 4) === "OggS";
+    }
+    if (mimeType === "audio/mp4") {
+        return signature.length >= 12 && signature.toString("ascii", 4, 8) === "ftyp";
+    }
+    return false;
+}
+
+async function supprimerPieceJointe(record) {
+    const paths = [
+        cheminPieceJointe(record.roomId, record.id),
+        `${cheminPieceJointe(record.roomId, record.id)}.uploading`
+    ];
+    for (const filePath of paths) {
+        try {
+            await fs.promises.unlink(filePath);
+        } catch (error) {
+            if (error.code !== "ENOENT") {
+                console.warn(`[RoomUpload] Suppression impossible (${filePath}) :`, error.message);
+            }
+        }
+    }
+}
+
+async function supprimerPiecesJointesSalle(roomId) {
+    for (const [attachmentId, record] of roomAttachments) {
+        if (record.roomId !== roomId) continue;
+        roomAttachments.delete(attachmentId);
+    }
+    try {
+        await fs.promises.rm(cheminRepertoireSalle(roomId), { recursive: true, force: true });
+    } catch (error) {
+        console.error(`[RoomUpload] Purge de la salle ${roomId} impossible :`, error);
+    }
+}
+
+async function purgerPiecesJointesOrphelines() {
+    let roomDirectories;
+    try {
+        roomDirectories = await fs.promises.readdir(ROOM_UPLOADS_DIR, { withFileTypes: true });
+    } catch (error) {
+        if (error.code !== "ENOENT") {
+            console.error("[RoomUpload] Lecture du dossier des uploads impossible :", error);
+        }
+        return;
+    }
+
+    const now = Date.now();
+    for (const [attachmentId, record] of roomAttachments) {
+        const roomClosed = !rooms.has(record.roomId);
+        const authorizationExpired = record.status === "authorized" && record.expiresAt <= now;
+        if (!roomClosed && !authorizationExpired) continue;
+        roomAttachments.delete(attachmentId);
+        await supprimerPieceJointe(record);
+    }
+
+    for (const roomDirectory of roomDirectories) {
+        if (!roomDirectory.isDirectory() || !/^[0-9a-f-]{36}$/i.test(roomDirectory.name)) continue;
+        const roomId = roomDirectory.name;
+        let files;
+        try {
+            files = await fs.promises.readdir(cheminRepertoireSalle(roomId), { withFileTypes: true });
+        } catch (error) {
+            console.warn(`[RoomUpload] Lecture des uploads de ${roomId} impossible :`, error.message);
+            continue;
+        }
+
+        for (const file of files) {
+            if (!file.isFile()) continue;
+            const isTemporary = file.name.endsWith(".uploading");
+            const attachmentId = isTemporary ? file.name.slice(0, -".uploading".length) : file.name;
+            const record = roomAttachments.get(attachmentId);
+            const isTracked = record && record.roomId === roomId;
+            let modifiedAt;
+            try {
+                const stat = await fs.promises.stat(path.join(cheminRepertoireSalle(roomId), file.name));
+                modifiedAt = stat.mtimeMs;
+            } catch (error) {
+                console.warn(`[RoomUpload] Métadonnées indisponibles pour ${file.name} :`, error.message);
+                continue;
+            }
+            const expiredAuthorization = isTracked &&
+                record.status !== "uploaded" &&
+                record.expiresAt <= now;
+            const orphanTooOld = !isTracked && now - modifiedAt > ROOM_ATTACHMENT_ORPHAN_TTL_MS;
+            if (!expiredAuthorization && !orphanTooOld) continue;
+
+            try {
+                await fs.promises.unlink(path.join(cheminRepertoireSalle(roomId), file.name));
+            } catch (error) {
+                if (error.code !== "ENOENT") {
+                    console.warn(`[RoomUpload] Suppression de ${file.name} impossible :`, error.message);
+                }
+            }
+            if (isTracked && expiredAuthorization) roomAttachments.delete(attachmentId);
+        }
+    }
+}
+
+const server = http.createServer(async (req, res) => {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-User-Id, X-Session-Token");
+    res.setHeader("Vary", "Origin");
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
 
     const parsedUrl = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+
+    if (req.method === "OPTIONS") {
+        res.writeHead(204);
+        return res.end();
+    }
+
+    if (parsedUrl.pathname === "/room-upload-auth") {
+        if (req.method !== "POST") {
+            return repondreJsonHttp(res, 405, { code: "METHOD_NOT_ALLOWED", message: "Méthode non autorisée." });
+        }
+        let payload;
+        try {
+            payload = await lireCorpsJsonHttp(req);
+        } catch (error) {
+            const tooLarge = error.code === "REQUEST_TOO_LARGE";
+            return repondreJsonHttp(res, tooLarge ? 413 : 400, {
+                code: tooLarge ? "REQUEST_TOO_LARGE" : "INVALID_JSON",
+                message: error.message
+            });
+        }
+
+        if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+            return repondreJsonHttp(res, 400, { code: "INVALID_JSON", message: "Le corps de la requête est invalide." });
+        }
+        const roomId = typeof payload.roomId === "string" ? payload.roomId : "";
+        const access = authentifierAccesSalleHttp(req, roomId);
+        if (access.error) {
+            return repondreJsonHttp(res, access.error.status, access.error);
+        }
+
+        const attachmentType = payload.type;
+        const mimeType = typeof payload.mimeType === "string" ? payload.mimeType.trim().toLowerCase() : "";
+        const size = payload.size;
+        if (!Number.isSafeInteger(size) || size <= 0) {
+            return repondreJsonHttp(res, 400, { code: "INVALID_SIZE", message: "La taille du fichier est invalide." });
+        }
+        if (size > MAX_ROOM_ATTACHMENT_SIZE) {
+            return repondreJsonHttp(res, 413, { code: "FILE_TOO_LARGE", message: "La taille maximale est de 10 MiB." });
+        }
+
+        const allowedMimeTypes = attachmentType === "voice"
+            ? ROOM_VOICE_MIME_TYPES
+            : attachmentType === "file"
+                ? ROOM_FILE_MIME_TYPES
+                : null;
+        if (!allowedMimeTypes || !allowedMimeTypes.has(mimeType)) {
+            return repondreJsonHttp(res, 415, { code: "INVALID_MIME", message: "Ce type de fichier n’est pas autorisé." });
+        }
+
+        let durationMs = null;
+        if (attachmentType === "voice") {
+            durationMs = payload.durationMs;
+            if (!Number.isSafeInteger(durationMs) || durationMs <= 0) {
+                return repondreJsonHttp(res, 400, { code: "INVALID_DURATION", message: "La durée du message vocal est invalide." });
+            }
+            if (durationMs > MAX_ROOM_VOICE_DURATION_MS) {
+                return repondreJsonHttp(res, 400, { code: "VOICE_TOO_LONG", message: "Un message vocal ne peut pas dépasser 120 secondes." });
+            }
+        } else if (payload.durationMs !== undefined) {
+            return repondreJsonHttp(res, 400, { code: "INVALID_METADATA", message: "Une durée n’est autorisée que pour un message vocal." });
+        }
+
+        const attachmentId = crypto.randomUUID();
+        const expiresAt = Date.now() + ROOM_ATTACHMENT_AUTH_TTL_MS;
+        roomAttachments.set(attachmentId, {
+            id: attachmentId,
+            roomId,
+            userId: access.userId,
+            type: attachmentType,
+            mimeType,
+            size,
+            durationMs,
+            name: attachmentType === "file" ? nettoyerNomPieceJointe(payload.name) : null,
+            status: "authorized",
+            createdAt: Date.now(),
+            expiresAt
+        });
+        return repondreJsonHttp(res, 201, {
+            attachmentId,
+            uploadUrl: `/room-upload/${attachmentId}`,
+            expiresAt
+        });
+    }
+
+    const uploadMatch = parsedUrl.pathname.match(/^\/room-upload\/([0-9a-f-]{36})$/i);
+    if (uploadMatch) {
+        if (req.method !== "PUT") {
+            return repondreJsonHttp(res, 405, { code: "METHOD_NOT_ALLOWED", message: "Méthode non autorisée." });
+        }
+        const attachmentId = uploadMatch[1];
+        const record = roomAttachments.get(attachmentId);
+        if (!record) {
+            return repondreJsonHttp(res, 404, { code: "ATTACHMENT_NOT_FOUND", message: "Pièce jointe introuvable." });
+        }
+        const access = authentifierAccesSalleHttp(req, record.roomId);
+        if (access.error) {
+            return repondreJsonHttp(res, access.error.status, access.error);
+        }
+        if (record.userId !== access.userId) {
+            return repondreJsonHttp(res, 403, { code: "ATTACHMENT_FORBIDDEN", message: "Cette autorisation d’upload ne vous appartient pas." });
+        }
+        if (record.status !== "authorized" || record.expiresAt <= Date.now()) {
+            return repondreJsonHttp(res, 409, { code: "ATTACHMENT_NOT_READY", message: "L’autorisation d’upload est expirée ou déjà utilisée." });
+        }
+
+        const contentType = String(req.headers["content-type"] || "").split(";")[0].trim().toLowerCase();
+        if (contentType && contentType !== record.mimeType) {
+            return repondreJsonHttp(res, 415, { code: "INVALID_MIME", message: "Le type envoyé ne correspond pas à l’autorisation." });
+        }
+        const contentLength = Number(req.headers["content-length"]);
+        if (Number.isFinite(contentLength) && contentLength > MAX_ROOM_ATTACHMENT_SIZE) {
+            return repondreJsonHttp(res, 413, { code: "FILE_TOO_LARGE", message: "La taille maximale est de 10 MiB." });
+        }
+
+        record.status = "uploading";
+        const roomDirectory = cheminRepertoireSalle(record.roomId);
+        const destination = cheminPieceJointe(record.roomId, record.id);
+        const temporaryPath = `${destination}.uploading`;
+        let output = null;
+        try {
+            await fs.promises.mkdir(roomDirectory, { recursive: true });
+            output = await fs.promises.open(temporaryPath, "wx");
+            const uploaded = await ecrireFluxPieceJointe(req, output, MAX_ROOM_ATTACHMENT_SIZE);
+            const receivedSize = uploaded.size;
+            await output.close();
+            output = null;
+
+            if (receivedSize !== record.size) {
+                await fs.promises.unlink(temporaryPath).catch(error => {
+                    if (error.code !== "ENOENT") console.warn("[RoomUpload] Suppression du fichier invalide impossible :", error.message);
+                });
+                record.status = "authorized";
+                return repondreJsonHttp(res, 400, {
+                    code: "ATTACHMENT_METADATA_MISMATCH",
+                    message: "La taille réelle ne correspond pas à la taille autorisée."
+                });
+            }
+            if (!verifierSignaturePieceJointe(record.mimeType, uploaded.signature)) {
+                await fs.promises.unlink(temporaryPath).catch(error => {
+                    if (error.code !== "ENOENT") console.warn("[RoomUpload] Suppression du fichier de type invalide impossible :", error.message);
+                });
+                record.status = "authorized";
+                return repondreJsonHttp(res, 415, { code: "INVALID_MIME", message: "Le contenu ne correspond pas au type de fichier annoncé." });
+            }
+            await fs.promises.rename(temporaryPath, destination);
+            record.status = "uploaded";
+            record.uploadedAt = Date.now();
+            return repondreJsonHttp(res, 201, { attachmentId, status: "uploaded" });
+        } catch (error) {
+            if (output) {
+                await output.close().catch(closeError => {
+                    console.warn("[RoomUpload] Fermeture du fichier incomplet impossible :", closeError.message);
+                });
+            }
+            record.status = "authorized";
+            await fs.promises.unlink(temporaryPath).catch(unlinkError => {
+                if (unlinkError.code !== "ENOENT") console.warn("[RoomUpload] Nettoyage du transfert échoué impossible :", unlinkError.message);
+            });
+            if (error.code === "FILE_TOO_LARGE") {
+                return repondreJsonHttp(res, 413, { code: "FILE_TOO_LARGE", message: error.message });
+            }
+            if (error.code === "EEXIST") {
+                return repondreJsonHttp(res, 409, { code: "ATTACHMENT_NOT_READY", message: "Un transfert est déjà en cours." });
+            }
+            console.error(`[RoomUpload] Échec du transfert ${attachmentId} :`, error);
+            return repondreJsonHttp(res, 500, { code: "UPLOAD_FAILED", message: "Le transfert de la pièce jointe a échoué." });
+        }
+    }
+
+    const attachmentMatch = parsedUrl.pathname.match(/^\/room-attachment\/([0-9a-f-]{36})$/i);
+    if (attachmentMatch) {
+        if (req.method !== "GET") {
+            return repondreJsonHttp(res, 405, { code: "METHOD_NOT_ALLOWED", message: "Méthode non autorisée." });
+        }
+        const attachmentId = attachmentMatch[1];
+        const record = roomAttachments.get(attachmentId);
+        if (!record) {
+            return repondreJsonHttp(res, 404, { code: "ATTACHMENT_NOT_FOUND", message: "Pièce jointe introuvable." });
+        }
+        const access = authentifierAccesSalleHttp(req, record.roomId);
+        if (access.error) {
+            return repondreJsonHttp(res, access.error.status, access.error);
+        }
+        if (record.status !== "uploaded") {
+            return repondreJsonHttp(res, 409, { code: "ATTACHMENT_NOT_READY", message: "La pièce jointe n’est pas disponible." });
+        }
+        const filePath = cheminPieceJointe(record.roomId, record.id);
+        try {
+            await fs.promises.access(filePath, fs.constants.R_OK);
+        } catch (error) {
+            if (error.code === "ENOENT") {
+                roomAttachments.delete(attachmentId);
+                return repondreJsonHttp(res, 404, { code: "ATTACHMENT_NOT_FOUND", message: "Pièce jointe introuvable." });
+            }
+            console.error(`[RoomUpload] Vérification de lecture impossible pour ${attachmentId} :`, error);
+            return repondreJsonHttp(res, 500, { code: "ATTACHMENT_READ_FAILED", message: "Lecture de la pièce jointe impossible." });
+        }
+
+        const isImage = record.mimeType.startsWith("image/");
+        res.writeHead(200, {
+            "Content-Type": record.mimeType,
+            "Content-Length": record.size,
+            "Content-Disposition": isImage ? "inline" : "attachment",
+            "X-Content-Type-Options": "nosniff",
+            "Cache-Control": "private, no-store"
+        });
+        const fileStream = fs.createReadStream(filePath);
+        fileStream.on("error", error => {
+            console.error(`[RoomUpload] Lecture de ${attachmentId} interrompue :`, error);
+            if (!res.headersSent) repondreJsonHttp(res, 500, { code: "ATTACHMENT_READ_FAILED", message: "Lecture de la pièce jointe impossible." });
+            else res.destroy(error);
+        });
+        return fileStream.pipe(res);
+    }
 
     // Endpoint d'enregistrement de token FCM direct via HTTP
     if (parsedUrl.pathname === "/register-token") {
@@ -395,6 +887,13 @@ const server = http.createServer(async (req, res) => {
 // SERVEUR WEBSOCKET
 // ======================================================
 const wss = new WebSocket.Server({ server });
+
+void purgerPiecesJointesOrphelines();
+const roomAttachmentPurgeTimer = setInterval(
+    () => void purgerPiecesJointesOrphelines(),
+    ROOM_ATTACHMENT_PURGE_INTERVAL_MS
+);
+if (typeof roomAttachmentPurgeTimer.unref === "function") roomAttachmentPurgeTimer.unref();
 
 // ======================================================
 // DEMARRAGE DU SERVEUR
@@ -486,6 +985,7 @@ function roomPayload(room) {
         code: room.code,
         hostId: room.hostId,
         state: room.state,
+        locked: room.locked,
         participants: Array.from(room.participants.values())
     };
 }
@@ -518,6 +1018,7 @@ function fermerSalle(room, reason) {
     room.state = "closed";
     rooms.delete(room.id);
     roomCodes.delete(room.code);
+    void supprimerPiecesJointesSalle(room.id);
     for (const participantId of room.participants.keys()) {
         envoyerAUtilisateur(participantId, {
             type: "ROOM_CLOSED",
@@ -645,8 +1146,10 @@ wss.on("connection", (ws) => {
         if (
             (type === "CREATE_ROOM" || type === "JOIN_ROOM" || type === "LEAVE_ROOM" ||
                 type === "ROOM_OFFER" || type === "ROOM_ANSWER" || type === "ROOM_ICE" ||
-                type === "ROOM_STATE" || type === "CHAT_MESSAGE") &&
-            !wsClient.sessionAuthenticated
+            type === "ROOM_STATE" || type === "CHAT_MESSAGE" ||
+            type === "RAISE_HAND" || type === "MUTE_ALL" ||
+            type === "KICK_PARTICIPANT" || type === "LOCK_ROOM") &&
+        !wsClient.sessionAuthenticated
         ) {
             envoyerErreurSalle(wsClient, "AUTH_REQUIRED", "Un jeton de session est requis pour gérer les salles.", type);
             return;
@@ -662,6 +1165,10 @@ wss.on("connection", (ws) => {
         if (type === "LEAVE_ROOM") return quitterSalle(wsClient, identifiant, message);
         if (type === "ROOM_STATE") return mettreAJourEtatSalle(wsClient, identifiant, message);
         if (type === "CHAT_MESSAGE") return traiterMessageChat(wsClient, identifiant, message);
+        if (type === "RAISE_HAND") return traiterLeverMain(wsClient, identifiant, message);
+        if (type === "MUTE_ALL") return traiterCouperTousMicros(wsClient, identifiant, message);
+        if (type === "KICK_PARTICIPANT") return traiterExpulserParticipant(wsClient, identifiant, message);
+        if (type === "LOCK_ROOM") return traiterVerrouillerSalle(wsClient, identifiant, message);
         if (type === "ROOM_OFFER" || type === "ROOM_ANSWER" || type === "ROOM_ICE") {
             return relayerRoomSignalisation(wsClient, identifiant, message);
         }
@@ -690,6 +1197,7 @@ wss.on("connection", (ws) => {
             code: genererCodeSalle(),
             hostId: participantId,
             state: "open",
+            locked: false,
             participants: new Map(),
             createdAt: Date.now()
         };
@@ -698,6 +1206,7 @@ wss.on("connection", (ws) => {
             displayName: nettoyerDisplayName(message.displayName),
             audio: message.audio !== false,
             video: message.video !== false,
+            raised: false,
             role: "host",
             joinedAt: Date.now()
         });
@@ -731,6 +1240,10 @@ wss.on("connection", (ws) => {
             envoyerErreurSalle(wsClient, "ROOM_NOT_FOUND", "Salle introuvable.", "JOIN_ROOM");
             return;
         }
+        if (room.locked) {
+            envoyerErreurSalle(wsClient, "ROOM_LOCKED", "Cette réunion est verrouillée.", "JOIN_ROOM");
+            return;
+        }
         if (trouverSalleParticipant(participantId)) {
             envoyerErreurSalle(wsClient, "ALREADY_IN_ROOM", "Vous êtes déjà dans une salle.", "JOIN_ROOM");
             return;
@@ -745,6 +1258,7 @@ wss.on("connection", (ws) => {
             displayName: nettoyerDisplayName(message.displayName),
             audio: message.audio !== false,
             video: message.video !== false,
+            raised: false,
             role: "participant",
             joinedAt: Date.now()
         };
@@ -795,6 +1309,93 @@ wss.on("connection", (ws) => {
         }
     }
 
+    function trouverSalleControle(wsClient, participantId, message, requestType, hostOnly = false) {
+        const room = rooms.get(String(message.roomId || ""));
+        if (!room || !room.participants.has(participantId)) {
+            envoyerErreurSalle(wsClient, "NOT_IN_ROOM", "Vous ne participez pas à cette salle.", requestType);
+            return null;
+        }
+        if (hostOnly && room.hostId !== participantId) {
+            envoyerErreurSalle(wsClient, "HOST_REQUIRED", "Seul l’hôte peut effectuer cette action.", requestType);
+            return null;
+        }
+        return room;
+    }
+
+    function traiterLeverMain(wsClient, participantId, message) {
+        const room = trouverSalleControle(wsClient, participantId, message, "RAISE_HAND");
+        if (!room) return;
+        if (typeof message.raised !== "boolean") {
+            envoyerErreurSalle(wsClient, "INVALID_STATE", "L’état de la main levée doit être booléen.", "RAISE_HAND");
+            return;
+        }
+
+        const participant = room.participants.get(participantId);
+        participant.raised = message.raised;
+        for (const recipientId of room.participants.keys()) {
+            envoyerAUtilisateur(recipientId, {
+                type: "PARTICIPANT_HAND",
+                roomId: room.id,
+                participantId,
+                raised: participant.raised,
+                displayName: participant.displayName
+            });
+        }
+    }
+
+    function traiterCouperTousMicros(wsClient, participantId, message) {
+        const room = trouverSalleControle(wsClient, participantId, message, "MUTE_ALL", true);
+        if (!room) return;
+        for (const participant of room.participants.values()) {
+            participant.audio = false;
+            for (const recipientId of room.participants.keys()) {
+                envoyerAUtilisateur(recipientId, {
+                    type: "PARTICIPANT_MUTED",
+                    roomId: room.id,
+                    participantId: participant.id
+                });
+            }
+        }
+    }
+
+    function traiterExpulserParticipant(wsClient, participantId, message) {
+        const room = trouverSalleControle(wsClient, participantId, message, "KICK_PARTICIPANT", true);
+        if (!room) return;
+        const targetId = typeof message.targetId === "string" ? message.targetId.trim() : "";
+        if (!targetId || targetId === room.hostId || !room.participants.has(targetId)) {
+            envoyerErreurSalle(wsClient, "INVALID_TARGET", "Le participant à expulser est invalide.", "KICK_PARTICIPANT");
+            return;
+        }
+
+        for (const recipientId of room.participants.keys()) {
+            envoyerAUtilisateur(recipientId, {
+                type: "PARTICIPANT_KICKED",
+                roomId: room.id,
+                participantId: targetId,
+                reason: "kicked"
+            });
+        }
+        room.participants.delete(targetId);
+    }
+
+    function traiterVerrouillerSalle(wsClient, participantId, message) {
+        const room = trouverSalleControle(wsClient, participantId, message, "LOCK_ROOM", true);
+        if (!room) return;
+        if (typeof message.locked !== "boolean") {
+            envoyerErreurSalle(wsClient, "INVALID_STATE", "L’état du verrouillage doit être booléen.", "LOCK_ROOM");
+            return;
+        }
+
+        room.locked = message.locked;
+        for (const recipientId of room.participants.keys()) {
+            envoyerAUtilisateur(recipientId, {
+                type: "ROOM_LOCKED",
+                roomId: room.id,
+                locked: room.locked
+            });
+        }
+    }
+
     function traiterMessageChat(wsClient, participantId, message) {
         const roomId = String(message.roomId || "");
         const room = rooms.get(roomId);
@@ -804,16 +1405,118 @@ wss.on("connection", (ws) => {
             return;
         }
 
-        const text = (typeof message.text === "string" ? message.text : "")
-            .replace(/[\u0000-\u0009\u000B-\u001F\u007F-\u009F]/g, "")
-            .trim();
-        if (!text) {
-            envoyerErreurSalle(wsClient, "CHAT_EMPTY", "Le message ne peut pas être vide.", "CHAT_MESSAGE");
+        const versionTwo = message.version === 2;
+        if (message.version !== undefined && !versionTwo) {
+            envoyerErreurSalle(wsClient, "CHAT_VERSION_UNSUPPORTED", "Version de message chat non prise en charge.", "CHAT_MESSAGE");
             return;
         }
-        if (text.length > 500) {
-            envoyerErreurSalle(wsClient, "CHAT_TOO_LONG", "Le message dépasse la limite de 500 caractères.", "CHAT_MESSAGE");
-            return;
+
+        let content;
+        let text;
+        let attachmentRecord = null;
+        if (!versionTwo) {
+            text = (typeof message.text === "string" ? message.text : "")
+                .replace(/[\u0000-\u0009\u000B-\u001F\u007F-\u009F]/g, "")
+                .trim();
+            if (!text) {
+                envoyerErreurSalle(wsClient, "CHAT_EMPTY", "Le message ne peut pas être vide.", "CHAT_MESSAGE");
+                return;
+            }
+            if (text.length > 500) {
+                envoyerErreurSalle(wsClient, "CHAT_TOO_LONG", "Le message dépasse la limite de 500 caractères.", "CHAT_MESSAGE");
+                return;
+            }
+        } else {
+            const payload = message.message;
+            if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+                envoyerErreurSalle(wsClient, "INVALID_CHAT_MESSAGE", "Le contenu du message est invalide.", "CHAT_MESSAGE");
+                return;
+            }
+            if (typeof message.clientMessageId !== "string" ||
+                !/^[A-Za-z0-9._:-]{1,128}$/.test(message.clientMessageId)) {
+                envoyerErreurSalle(wsClient, "INVALID_MESSAGE_ID", "L’identifiant du message est invalide.", "CHAT_MESSAGE");
+                return;
+            }
+
+            if (payload.type === "text") {
+                text = (typeof payload.text === "string" ? payload.text : "")
+                    .replace(/[\u0000-\u0009\u000B-\u001F\u007F-\u009F]/g, "")
+                    .trim();
+                if (!text) {
+                    envoyerErreurSalle(wsClient, "CHAT_EMPTY", "Le message ne peut pas être vide.", "CHAT_MESSAGE");
+                    return;
+                }
+                if (text.length > 500) {
+                    envoyerErreurSalle(wsClient, "CHAT_TOO_LONG", "Le message dépasse la limite de 500 caractères.", "CHAT_MESSAGE");
+                    return;
+                }
+                content = { type: "text", text };
+            } else if (payload.type === "file" || payload.type === "voice") {
+                const attachmentId = typeof payload.attachmentId === "string" ? payload.attachmentId : "";
+                attachmentRecord = roomAttachments.get(attachmentId);
+                if (!attachmentRecord) {
+                    envoyerErreurSalle(wsClient, "ATTACHMENT_NOT_FOUND", "Pièce jointe introuvable.", "CHAT_MESSAGE");
+                    return;
+                }
+                if (attachmentRecord.userId !== participantId || attachmentRecord.roomId !== roomId ||
+                    attachmentRecord.type !== payload.type) {
+                    envoyerErreurSalle(wsClient, "ATTACHMENT_FORBIDDEN", "Cette pièce jointe ne vous appartient pas ou n’est pas destinée à cette salle.", "CHAT_MESSAGE");
+                    return;
+                }
+                if (attachmentRecord.status !== "uploaded") {
+                    envoyerErreurSalle(wsClient, "ATTACHMENT_NOT_READY", "La pièce jointe n’est pas encore disponible.", "CHAT_MESSAGE");
+                    return;
+                }
+
+                if (!Number.isSafeInteger(payload.size) || payload.size > MAX_ROOM_ATTACHMENT_SIZE) {
+                    envoyerErreurSalle(wsClient, "FILE_TOO_LARGE", "La taille maximale est de 10 MiB.", "CHAT_MESSAGE");
+                    return;
+                }
+                const allowedMimeTypes = payload.type === "voice"
+                    ? ROOM_VOICE_MIME_TYPES
+                    : ROOM_FILE_MIME_TYPES;
+                if (typeof payload.mimeType !== "string" ||
+                    !allowedMimeTypes.has(payload.mimeType) ||
+                    payload.mimeType !== attachmentRecord.mimeType) {
+                    envoyerErreurSalle(wsClient, "INVALID_MIME", "Le type de fichier ne correspond pas à la pièce jointe.", "CHAT_MESSAGE");
+                    return;
+                }
+                if (payload.size !== attachmentRecord.size) {
+                    envoyerErreurSalle(wsClient, "ATTACHMENT_METADATA_MISMATCH", "La taille annoncée ne correspond pas à la pièce jointe.", "CHAT_MESSAGE");
+                    return;
+                }
+                if (payload.type === "voice") {
+                    if (!Number.isSafeInteger(payload.durationMs) || payload.durationMs <= 0) {
+                        envoyerErreurSalle(wsClient, "INVALID_DURATION", "La durée du message vocal est invalide.", "CHAT_MESSAGE");
+                        return;
+                    }
+                    if (payload.durationMs > MAX_ROOM_VOICE_DURATION_MS) {
+                        envoyerErreurSalle(wsClient, "VOICE_TOO_LONG", "Un message vocal ne peut pas dépasser 120 secondes.", "CHAT_MESSAGE");
+                        return;
+                    }
+                    if (payload.durationMs !== attachmentRecord.durationMs) {
+                        envoyerErreurSalle(wsClient, "ATTACHMENT_METADATA_MISMATCH", "La durée annoncée ne correspond pas au message vocal.", "CHAT_MESSAGE");
+                        return;
+                    }
+                }
+
+                content = {
+                    type: payload.type,
+                    attachmentId,
+                    mimeType: attachmentRecord.mimeType,
+                    size: attachmentRecord.size
+                };
+                if (payload.type === "file") {
+                    content.name = attachmentRecord.name;
+                    text = `Fichier joint : ${attachmentRecord.name}`.slice(0, 500);
+                } else {
+                    content.durationMs = attachmentRecord.durationMs;
+                    text = "Message vocal";
+                }
+            } else {
+                envoyerErreurSalle(wsClient, "INVALID_CHAT_MESSAGE", "Type de contenu chat non pris en charge.", "CHAT_MESSAGE");
+                return;
+            }
         }
 
         const now = Date.now();
@@ -835,6 +1538,14 @@ wss.on("connection", (ws) => {
             text,
             sentAt: now
         };
+        if (versionTwo) {
+            chatMessage.version = 2;
+            chatMessage.message = content;
+            chatMessage.clientMessageId = message.clientMessageId;
+        } else if (typeof message.clientMessageId === "string" &&
+            /^[A-Za-z0-9._:-]{1,128}$/.test(message.clientMessageId)) {
+            chatMessage.clientMessageId = message.clientMessageId;
+        }
         for (const recipientId of room.participants.keys()) {
             envoyerAUtilisateur(recipientId, chatMessage);
         }
@@ -1131,7 +1842,6 @@ wss.on("connection", (ws) => {
 
         logCall("CREATED", { callId, from, to, state: "RINGING", info: `WS direct: ${transmisWs}, Push FCM: ${pushTente}` });
     }
-
     // ==================================================
     // TRAITER CALL ACCEPTED (ATOMIQUE)
     // ==================================================
