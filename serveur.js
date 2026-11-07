@@ -6,41 +6,67 @@ const crypto = require("crypto");
 
 // MODIFICATION RENDER : Utilisation du port dynamique
 const PORT = process.env.PORT || 8080;
+let pool = null;
+let bcrypt = null;
+
+function normaliserTelephone(value) {
+    const phone = String(value || "").replace(/[\s().-]/g, "");
+    return /^\+[1-9]\d{7,14}$/.test(phone) ? phone : null;
+}
+
+function signerJwt(phone) {
+    const now = Math.floor(Date.now() / 1000);
+    const header = Buffer.from(JSON.stringify({ alg: "HS256", typ: "JWT" })).toString("base64url");
+    const payload = Buffer.from(JSON.stringify({
+        sub: phone,
+        iat: now,
+        exp: now + 30 * 24 * 60 * 60
+    })).toString("base64url");
+    const unsigned = `${header}.${payload}`;
+    const signature = crypto.createHmac("sha256", process.env.JWT_SECRET).update(unsigned).digest("base64url");
+    return `${unsigned}.${signature}`;
+}
+
+function verifierJwt(token) {
+    if (typeof token !== "string" || !process.env.JWT_SECRET) return null;
+    const parts = token.split(".");
+    if (parts.length !== 3) return null;
+    const unsigned = `${parts[0]}.${parts[1]}`;
+    const expected = crypto.createHmac("sha256", process.env.JWT_SECRET).update(unsigned).digest();
+    let supplied;
+    let header;
+    let payload;
+    try {
+        supplied = Buffer.from(parts[2], "base64url");
+        header = JSON.parse(Buffer.from(parts[0], "base64url").toString("utf8"));
+        payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+    } catch (error) {
+        return null;
+    }
+    if (header.alg !== "HS256" || supplied.length !== expected.length ||
+        !crypto.timingSafeEqual(supplied, expected) ||
+        typeof payload.sub !== "string" || !normaliserTelephone(payload.sub) ||
+        !Number.isInteger(payload.exp) || payload.exp <= Math.floor(Date.now() / 1000)) {
+        return null;
+    }
+    return payload;
+}
+
+function jwtDepuisRequete(req) {
+    const match = /^Bearer\s+(.+)$/i.exec(String(req.headers.authorization || ""));
+    return match ? verifierJwt(match[1]) : null;
+}
+
+async function getUtilisateur(phone) {
+    if (!pool) throw new Error("La base de données n’est pas initialisée.");
+    const result = await pool.query("SELECT phone, name FROM app_users WHERE phone = $1", [phone]);
+    return result.rows[0] || null;
+}
 
 // ======================================================
 // TOKENS & SESSIONS EN MEMOIRE & PERSISTANCE DISQUE
 // ======================================================
 const fcmTokens = new Map();
-const TOKENS_CACHE_FILE = path.join(__dirname, "fcm_tokens_cache.json");
-
-function chargerTokensFCM() {
-    try {
-        if (fs.existsSync(TOKENS_CACHE_FILE)) {
-            const data = fs.readFileSync(TOKENS_CACHE_FILE, "utf-8");
-            const parsed = JSON.parse(data);
-            Object.entries(parsed).forEach(([id, token]) => {
-                if (id && token) fcmTokens.set(String(id), String(token));
-            });
-            console.log(`💾 ${fcmTokens.size} tokens FCM chargés depuis le cache local (${TOKENS_CACHE_FILE})`);
-        }
-    } catch (e) {
-        console.warn("⚠️ Impossible de charger fcm_tokens_cache.json :", e.message);
-    }
-}
-
-function sauvegarderTokensFCM() {
-    try {
-        const obj = {};
-        fcmTokens.forEach((token, id) => {
-            obj[id] = token;
-        });
-        fs.writeFileSync(TOKENS_CACHE_FILE, JSON.stringify(obj, null, 2), "utf-8");
-    } catch (e) {
-        console.warn("⚠️ Impossible d'écrire dans fcm_tokens_cache.json :", e.message);
-    }
-}
-
-chargerTokensFCM();
 
 const utilisateurs = new Map();
 const sessionTokens = new Map(); // identifiant -> jeton de session client
@@ -106,7 +132,7 @@ function isCallEnded(callId) {
 }
 
 // Nettoyage périodique (toutes les 30s) des appels terminés et sessions expirées (> 60s / 5min)
-setInterval(() => {
+const callCleanupInterval = setInterval(() => {
     const now = Date.now();
     endedCalls.forEach((timestamp, callId) => {
         if (now - timestamp > 60000) {
@@ -114,11 +140,12 @@ setInterval(() => {
         }
     });
     callSessions.forEach((session, callId) => {
-        if (now - session.createdAt > 300000) { // 5 minutes max par session
+        if (session.state !== "CONNECTED" && now - session.createdAt > 300000) {
             callSessions.delete(callId);
         }
     });
 }, 30000);
+if (typeof callCleanupInterval.unref === "function") callCleanupInterval.unref();
 
 // ======================================================
 // INITIALISATION FIREBASE notification firebase
@@ -194,7 +221,10 @@ function gererErreurFCM(error, to) {
         error.code === "messaging/invalid-registration-token") {
         console.log(`🗑️ Suppression du token périmé pour ${to}`);
         fcmTokens.delete(to);
-        sauvegarderTokensFCM();
+        if (pool) {
+            void pool.query("UPDATE app_users SET fcm_token = NULL WHERE phone = $1", [to])
+                .catch((dbError) => console.error(`[Postgres] Suppression du token FCM impossible pour ${to} :`, dbError));
+        }
     }
 }
 
@@ -204,7 +234,7 @@ function gererErreurFCM(error, to) {
 // - Affiche les deux boutons [Refuser] et [Accepter]
 // - Ne force PAS l'ouverture de l'application (zéro concurrence avec l'interface)
 // =============================================================================
-function envoyerPushTest1Banniere(tokenDestinataire, to, from, callId, offerStr, hasVideo, notIdVal) {
+function envoyerPushTest1Banniere(tokenDestinataire, to, from, callId, offerStr, hasVideo, notIdVal, callerName = from) {
     if (!messaging) {
         console.error("⚠️ Firebase Messaging n'est pas initialisé.");
         return;
@@ -216,13 +246,14 @@ function envoyerPushTest1Banniere(tokenDestinataire, to, from, callId, offerStr,
             mode: "TEST_1_BANNIERE",
             callId: String(callId),
             callerId: String(from),
-            caller_name: String(from),
+            caller_name: String(callerName),
+            callerName: String(callerName),
             appelant: String(from),
             app_name: "KamSoft",
             title: "KamSoft - Appel entrant",
             subText: "Appel entrant",
-            message: `${from} vous appelle`,
-            body: `${from} vous appelle`,
+            message: `${callerName} vous appelle`,
+            body: `${callerName} vous appelle`,
             notId: String(notIdVal),
             icon: "ic_launcher",
             color: "#00A884",
@@ -272,7 +303,7 @@ function envoyerPushTest1Banniere(tokenDestinataire, to, from, callId, offerStr,
 // - Payload Data-Only silencieux (AUCUNE notification système affichée dans la barre)
 // - Déclenche le réveil matériel de l'écran via backgroundMode.wakeUp() et l'Interface 2
 // =============================================================================
-function envoyerPushTest2Veille(tokenDestinataire, to, from, callId, offerStr, hasVideo, notIdVal) {
+function envoyerPushTest2Veille(tokenDestinataire, to, from, callId, offerStr, hasVideo, notIdVal, callerName = from) {
     if (!messaging) {
         console.error("⚠️ Firebase Messaging n'est pas initialisé.");
         return;
@@ -289,7 +320,8 @@ function envoyerPushTest2Veille(tokenDestinataire, to, from, callId, offerStr, h
             target_mode: "LOCKSCREEN_WAKE",
             callId: String(callId),
             callerId: String(from),
-            caller_name: String(from),
+            caller_name: String(callerName),
+            callerName: String(callerName),
             appelant: String(from),
             app_name: "KamSoft",
             offer: offerStr || "",
@@ -579,7 +611,7 @@ async function purgerPiecesJointesOrphelines() {
 const server = http.createServer(async (req, res) => {
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-User-Id, X-Session-Token");
+    res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type, X-User-Id, X-Session-Token");
     res.setHeader("Vary", "Origin");
     res.setHeader("Content-Type", "application/json; charset=utf-8");
 
@@ -588,6 +620,175 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "OPTIONS") {
         res.writeHead(204);
         return res.end();
+    }
+
+    if (req.method === "POST" && (parsedUrl.pathname === "/register" || parsedUrl.pathname === "/login")) {
+        let payload;
+        try {
+            payload = await lireCorpsJsonHttp(req);
+        } catch (error) {
+            return repondreJsonHttp(res, error.code === "REQUEST_TOO_LARGE" ? 413 : 400, {
+                code: error.code || "INVALID_JSON",
+                message: error.message
+            });
+        }
+        const phone = normaliserTelephone(payload?.phone);
+        const pin = typeof payload?.pin === "string" ? payload.pin : "";
+        if (!phone || !/^\d{4,12}$/.test(pin)) {
+            return repondreJsonHttp(res, 400, {
+                code: "INVALID_CREDENTIALS",
+                message: "Le numéro doit être au format international et le PIN doit contenir 4 à 12 chiffres."
+            });
+        }
+
+        try {
+            if (!bcrypt) bcrypt = require("bcryptjs");
+            let user;
+            if (parsedUrl.pathname === "/register") {
+                const name = typeof payload.name === "string"
+                    ? payload.name.replace(/[\u0000-\u001F\u007F-\u009F]/g, "").trim()
+                    : "";
+                if (!name || name.length > 60) {
+                    return repondreJsonHttp(res, 400, {
+                        code: "INVALID_NAME",
+                        message: "Le nom doit contenir de 1 à 60 caractères."
+                    });
+                }
+                const pinHash = await bcrypt.hash(pin, 12);
+                const result = await pool.query(
+                    "INSERT INTO app_users (phone, name, pin_hash) VALUES ($1, $2, $3) RETURNING phone, name",
+                    [phone, name, pinHash]
+                );
+                user = result.rows[0];
+            } else {
+                const result = await pool.query(
+                    "SELECT phone, name, pin_hash FROM app_users WHERE phone = $1",
+                    [phone]
+                );
+                const stored = result.rows[0];
+                if (!stored || !(await bcrypt.compare(pin, stored.pin_hash))) {
+                    return repondreJsonHttp(res, 401, {
+                        code: "INVALID_CREDENTIALS",
+                        message: "Numéro ou PIN incorrect."
+                    });
+                }
+                user = { phone: stored.phone, name: stored.name };
+            }
+            return repondreJsonHttp(res, parsedUrl.pathname === "/register" ? 201 : 200, {
+                token: signerJwt(user.phone),
+                user
+            });
+        } catch (error) {
+            if (error.code === "23505") {
+                return repondreJsonHttp(res, 409, {
+                    code: "PHONE_ALREADY_REGISTERED",
+                    message: "Ce numéro est déjà associé à un compte."
+                });
+            }
+            console.error(`[Auth] ${parsedUrl.pathname} impossible :`, error);
+            return repondreJsonHttp(res, 500, {
+                code: "AUTH_FAILED",
+                message: "Le service d’authentification est temporairement indisponible."
+            });
+        }
+    }
+
+    if (parsedUrl.pathname === "/me" || /^\/users\/.+$/.test(parsedUrl.pathname)) {
+        if (req.method !== "GET") {
+            return repondreJsonHttp(res, 405, { code: "METHOD_NOT_ALLOWED", message: "Méthode non autorisée." });
+        }
+        const claims = jwtDepuisRequete(req);
+        if (!claims) {
+            return repondreJsonHttp(res, 401, { code: "AUTH_REQUIRED", message: "Jeton invalide ou expiré." });
+        }
+        let phone = claims.sub;
+        if (parsedUrl.pathname !== "/me") {
+            try {
+                phone = normaliserTelephone(decodeURIComponent(parsedUrl.pathname.slice("/users/".length)));
+            } catch (error) {
+                phone = null;
+            }
+            if (!phone) {
+                return repondreJsonHttp(res, 400, { code: "INVALID_PHONE", message: "Numéro invalide." });
+            }
+        }
+        try {
+            const user = await getUtilisateur(phone);
+            if (!user) {
+                return repondreJsonHttp(res, 404, { code: "USER_NOT_FOUND", message: "Compte introuvable." });
+            }
+            return repondreJsonHttp(res, 200, { user });
+        } catch (error) {
+            console.error("[Auth] Recherche du compte impossible :", error);
+            return repondreJsonHttp(res, 500, { code: "USER_LOOKUP_FAILED", message: "Recherche du compte impossible." });
+        }
+    }
+
+    if (parsedUrl.pathname === "/register-token") {
+        if (req.method !== "POST") {
+            return repondreJsonHttp(res, 405, { code: "METHOD_NOT_ALLOWED", message: "Méthode non autorisée." });
+        }
+        const claims = jwtDepuisRequete(req);
+        if (!claims) {
+            return repondreJsonHttp(res, 401, { code: "AUTH_REQUIRED", message: "Jeton invalide ou expiré." });
+        }
+        let payload;
+        try {
+            payload = await lireCorpsJsonHttp(req);
+        } catch (error) {
+            return repondreJsonHttp(res, error.code === "REQUEST_TOO_LARGE" ? 413 : 400, {
+                code: error.code || "INVALID_JSON",
+                message: error.message
+            });
+        }
+        const token = typeof payload?.token === "string" ? payload.token.trim() : "";
+        if (!token || token.length > 4096) {
+            return repondreJsonHttp(res, 400, { code: "INVALID_TOKEN", message: "Token FCM invalide." });
+        }
+        try {
+            if (!(await getUtilisateur(claims.sub))) {
+                return repondreJsonHttp(res, 401, { code: "USER_NOT_FOUND", message: "Compte introuvable." });
+            }
+            await pool.query("UPDATE app_users SET fcm_token = $2 WHERE phone = $1", [claims.sub, token]);
+            fcmTokens.set(claims.sub, token);
+            console.log(`📲 [HTTP] Token FCM synchronisé pour ${claims.sub}`);
+            return repondreJsonHttp(res, 200, { success: true });
+        } catch (error) {
+            console.error("[Auth] Enregistrement du token FCM impossible :", error);
+            return repondreJsonHttp(res, 500, { code: "TOKEN_REGISTRATION_FAILED", message: "Enregistrement du token impossible." });
+        }
+    }
+
+    if (parsedUrl.pathname === "/set-screen-state") {
+        if (req.method !== "POST") {
+            return repondreJsonHttp(res, 405, { code: "METHOD_NOT_ALLOWED", message: "Méthode non autorisée." });
+        }
+        const claims = jwtDepuisRequete(req);
+        if (!claims) {
+            return repondreJsonHttp(res, 401, { code: "AUTH_REQUIRED", message: "Jeton invalide ou expiré." });
+        }
+        let payload;
+        try {
+            payload = await lireCorpsJsonHttp(req);
+        } catch (error) {
+            return repondreJsonHttp(res, error.code === "REQUEST_TOO_LARGE" ? 413 : 400, {
+                code: error.code || "INVALID_JSON",
+                message: error.message
+            });
+        }
+        if (!["SCREEN_ON", "SCREEN_OFF"].includes(payload?.state)) {
+            return repondreJsonHttp(res, 400, { code: "INVALID_STATE", message: "État d’écran invalide." });
+        }
+        try {
+            if (!(await getUtilisateur(claims.sub))) {
+                return repondreJsonHttp(res, 401, { code: "USER_NOT_FOUND", message: "Compte introuvable." });
+            }
+            userScreenStates.set(claims.sub, payload.state);
+            return repondreJsonHttp(res, 200, { success: true, userId: claims.sub, screenState: payload.state });
+        } catch (error) {
+            console.error("[Auth] Mise à jour de l’état écran impossible :", error);
+            return repondreJsonHttp(res, 500, { code: "SCREEN_STATE_FAILED", message: "Mise à jour de l’état écran impossible." });
+        }
     }
 
     if (parsedUrl.pathname === "/room-upload-auth") {
@@ -799,88 +1000,7 @@ const server = http.createServer(async (req, res) => {
         return fileStream.pipe(res);
     }
 
-    // Endpoint d'enregistrement de token FCM direct via HTTP
-    if (parsedUrl.pathname === "/register-token") {
-        const userId = parsedUrl.searchParams.get("id");
-        const token = parsedUrl.searchParams.get("token");
-
-        if (userId && token) {
-            fcmTokens.set(String(userId).trim(), String(token).trim());
-            sauvegarderTokensFCM();
-            console.log(`📲 [HTTP] Token FCM synchronisé pour ${userId} : ${token.substring(0, 15)}...`);
-            return res.end(JSON.stringify({ success: true, message: `Token enregistré pour ${userId}` }));
-        } else {
-            return res.end(JSON.stringify({ error: "Paramètres 'id' et 'token' requis." }));
-        }
-    }
-
-    // Endpoint de synchronisation de l'état de l'écran (veille vs allumé) via HTTP
-    if (parsedUrl.pathname === "/set-screen-state") {
-        const userId = parsedUrl.searchParams.get("id");
-        const state = parsedUrl.searchParams.get("state"); // "SCREEN_ON" ou "SCREEN_OFF"
-        if (userId && state) {
-            userScreenStates.set(String(userId).trim(), state);
-            console.log(`📱 [HTTP] État écran mis à jour pour ${userId} : ${state}`);
-            return res.end(JSON.stringify({ success: true, userId, screenState: state }));
-        }
-        return res.end(JSON.stringify({ error: "Paramètres 'id' et 'state' requis." }));
-    }
-
-    // Endpoint de diagnostic
-    if (parsedUrl.pathname === "/status" || parsedUrl.pathname === "/") {
-        const tokensList = {};
-        fcmTokens.forEach((token, id) => {
-            tokensList[id] = token ? `${token.substring(0, 15)}...` : null;
-        });
-
-        return res.end(JSON.stringify({
-            status: "ok",
-            message: "Serveur d'appel operationnel",
-            firebaseAdminReady: messaging !== null,
-            connectedUsers: Array.from(utilisateurs.keys()),
-            activeCallsCount: appels.size / 2,
-            activeSessionsCount: callSessions.size,
-            registeredFcmTokensCount: fcmTokens.size,
-            registeredFcmTokens: tokensList
-        }, null, 2));
-    }
-
-    // Endpoints de test push FCM directs :
-    // - /test-push-banniere?to=ID-123456 (Test 1 : Bannière interactive sans forcer l'app)
-    // - /test-push-veille?to=ID-123456   (Test 2 : Réveil de l'écran en veille)
-    // - /test-push?to=ID-123456          (Par défaut : Test 1)
-    if (parsedUrl.pathname === "/test-push" || parsedUrl.pathname === "/test-push-banniere" || parsedUrl.pathname === "/test-push-veille") {
-        const targetId = parsedUrl.searchParams.get("to");
-        if (!targetId) {
-            return res.end(JSON.stringify({ error: "Parametre 'to' manquant. Exemple: /test-push?to=ID-123456" }));
-        }
-
-        const token = fcmTokens.get(targetId);
-        if (!token) {
-            return res.end(JSON.stringify({ error: `Aucun token FCM enregistre pour l'ID ${targetId}` }));
-        }
-
-        if (!messaging) {
-            return res.end(JSON.stringify({ error: "Firebase Admin n'est pas initialise sur le serveur." }));
-        }
-
-        const isTestVeille = parsedUrl.pathname === "/test-push-veille";
-        const notIdVal = "9999";
-
-        try {
-            if (isTestVeille) {
-                envoyerPushTest2Veille(token, targetId, "TEST-APPELANT", "CALL-TEST-VEILLE", "", false, notIdVal);
-                return res.end(JSON.stringify({ success: true, mode: "TEST 2 (Réveil Veille)", target: targetId }));
-            } else {
-                envoyerPushTest1Banniere(token, targetId, "TEST-APPELANT", "CALL-TEST-BANNIERE", "", false, notIdVal);
-                return res.end(JSON.stringify({ success: true, mode: "TEST 1 (Bannière Interactive)", target: targetId }));
-            }
-        } catch (pushErr) {
-            return res.end(JSON.stringify({ success: false, error: pushErr.message }));
-        }
-    }
-
-    res.end(JSON.stringify({ status: "ok" }));
+    return repondreJsonHttp(res, 404, { code: "NOT_FOUND", message: "Route introuvable." });
 });
 
 // ======================================================
@@ -898,9 +1018,45 @@ if (typeof roomAttachmentPurgeTimer.unref === "function") roomAttachmentPurgeTim
 // ======================================================
 // DEMARRAGE DU SERVEUR
 // ======================================================
-server.listen(PORT, "0.0.0.0", () => {
+async function startServer() {
+    if (!process.env.DATABASE_URL) {
+        throw new Error("DATABASE_URL est obligatoire pour le stockage PostgreSQL.");
+    }
+    if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32) {
+        throw new Error("JWT_SECRET doit contenir au moins 32 caractères.");
+    }
+
+    const { Pool } = require("pg");
+    pool = new Pool({ connectionString: process.env.DATABASE_URL });
+    pool.on("error", (error) => console.error("[Postgres] Erreur de pool :", error));
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS app_users (
+            phone VARCHAR(16) PRIMARY KEY,
+            name VARCHAR(60) NOT NULL,
+            pin_hash TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    `);
+    await pool.query("ALTER TABLE app_users ADD COLUMN IF NOT EXISTS fcm_token TEXT");
+    const storedTokens = await pool.query("SELECT phone, fcm_token FROM app_users WHERE fcm_token IS NOT NULL");
+    for (const row of storedTokens.rows) {
+        fcmTokens.set(row.phone, row.fcm_token);
+    }
+
+    await new Promise((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(PORT, "0.0.0.0", resolve);
+    });
     console.log(`🚀 Serveur WebSocket & HTTP demarre sur le port ${PORT}`);
-});
+}
+
+if (typeof module !== "undefined" && require.main === module) {
+    startServer().catch((error) => {
+        console.error("[Startup] Démarrage impossible :", error);
+        if (pool) void pool.end();
+        process.exitCode = 1;
+    });
+}
 
 // ======================================================
 // UTILITAIRE : ENVOYER UN MESSAGE WEBSOCKET
@@ -1155,7 +1311,13 @@ wss.on("connection", (ws) => {
             return;
         }
 
-        if (type === "CALLING") return traiterCalling(message);
+        if (type === "CALLING") {
+            void traiterCalling(message).catch((error) => {
+                console.error("[CALL] Création de l’appel impossible :", error);
+                envoyer(wsClient, { type: "ERROR", message: "Impossible de démarrer l’appel." });
+            });
+            return;
+        }
         if (type === "CALL_ACCEPTED") return traiterCallAccepted(message);
         if (type === "CALL_REJECTED") return traiterCallRejected(message);
         if (type === "CALL_ENDED") return traiterCallEnded(message);
@@ -1564,45 +1726,33 @@ wss.on("connection", (ws) => {
     // ENREGISTRER UTILISATEUR ET TOKEN FCM
     // ==================================================
     function enregistrerUtilisateur(wsClient, message) {
-        const nouvelIdentifiant = String(message.id || message.userId || "").trim();
-
-        if (nouvelIdentifiant === "") {
+        const claims = verifierJwt(message.jwt);
+        if (!claims) {
             envoyer(wsClient, {
                 type: "ERROR",
-                message: "Identifiant obligatoire."
+                code: "AUTH_REQUIRED",
+                message: "Un JWT valide est requis pour la connexion."
             });
+            wsClient.close(1008, "JWT invalide");
             return;
         }
 
-        const sessionToken = typeof message.sessionToken === "string"
+        const nouvelIdentifiant = claims.sub;
+        const sessionToken = typeof message.sessionToken === "string" && message.sessionToken.length <= 256
             ? message.sessionToken.trim()
             : "";
-        const registeredToken = sessionTokens.get(nouvelIdentifiant);
-
         if (!sessionToken) {
-            if (registeredToken) {
-                envoyer(wsClient, {
-                    type: "ERROR",
-                    code: "ID_ALREADY_CONNECTED",
-                    message: "Un jeton de session est requis pour cet identifiant."
-                });
-                wsClient.close(1008, "Jeton de session requis");
-                return;
-            }
-            console.warn(`⚠️ Client ancien sans jeton de session : ${nouvelIdentifiant}`);
-        } else if (registeredToken && registeredToken !== sessionToken) {
             envoyer(wsClient, {
                 type: "ERROR",
-                code: "ID_ALREADY_CONNECTED",
-                message: "Jeton de session invalide pour cet identifiant."
+                code: "INVALID_SESSION",
+                message: "Jeton de session de réunion manquant."
             });
-            wsClient.close(1008, "Jeton de session invalide");
+            wsClient.close(1008, "Jeton de session manquant");
             return;
-        } else if (!registeredToken) {
-            sessionTokens.set(nouvelIdentifiant, sessionToken);
         }
-
-        wsClient.sessionAuthenticated = !!sessionToken;
+        sessionTokens.set(nouvelIdentifiant, sessionToken);
+        wsClient.sessionAuthenticated = true;
+        wsClient.authenticatedUserId = nouvelIdentifiant;
 
         // Marquer l'ancienne socket avec isReplaced = true AVANT de la fermer
         if (utilisateurs.has(nouvelIdentifiant)) {
@@ -1618,10 +1768,14 @@ wss.on("connection", (ws) => {
         utilisateurs.set(identifiant, wsClient);
 
         // Sauvegarde du token FCM
-        if (message.fcmToken) {
-            fcmTokens.set(identifiant, message.fcmToken);
-            sauvegarderTokensFCM();
-            console.log(`📲 TOKEN FCM ENREGISTRE pour ${identifiant} : ${message.fcmToken.substring(0, 20)}...`);
+        const fcmToken = typeof message.fcmToken === "string" && message.fcmToken.length <= 4096
+            ? message.fcmToken.trim()
+            : "";
+        if (fcmToken) {
+            fcmTokens.set(identifiant, fcmToken);
+            void pool.query("UPDATE app_users SET fcm_token = $2 WHERE phone = $1", [identifiant, fcmToken])
+                .catch((error) => console.error(`[Postgres] Enregistrement du token FCM impossible pour ${identifiant} :`, error));
+            console.log(`📲 TOKEN FCM ENREGISTRE pour ${identifiant} : ${fcmToken.substring(0, 20)}...`);
         } else if (fcmTokens.has(identifiant)) {
             console.log(`📲 Token FCM deja conserve en memoire pour ${identifiant}`);
         } else {
@@ -1660,6 +1814,7 @@ wss.on("connection", (ws) => {
                         from: pending.from,
                         to: identifiant,
                         offer: pending.offer,
+                        callerName: pending.callerName || pending.from,
                         hasVideo: normaliserHasVideo(pending.hasVideo),
                         callId: callId
                     });
@@ -1675,14 +1830,14 @@ wss.on("connection", (ws) => {
     // ==================================================
     // TRAITER L'APPEL
     // ==================================================
-    function traiterCalling(message) {
+    async function traiterCalling(message) {
         const from = identifiant;
-        const to = String(message.to || "").trim();
-        const callId = String(message.callId || (Date.now().toString() + "-" + Math.random().toString(36).substring(2, 9)));
+        const to = normaliserTelephone(message.to);
+        const callId = typeof message.callId === "string" ? message.callId : "";
         const hasVideo = normaliserHasVideo(message.hasVideo);
 
-        if (to === "") {
-            envoyer(ws, { type: "ERROR", message: "Destinataire manquant." });
+        if (!to || !/^[A-Za-z0-9._-]{1,128}$/.test(callId)) {
+            envoyer(ws, { type: "ERROR", message: "Numéro du destinataire invalide." });
             return;
         }
 
@@ -1693,6 +1848,19 @@ wss.on("connection", (ws) => {
 
         if (isCallEnded(callId)) {
             logCall("CALLING_IGNORED", { callId, from, to, info: "callId présent dans endedCalls" });
+            return;
+        }
+        if (callSessions.has(callId)) {
+            envoyer(ws, { type: "ERROR", message: "Identifiant d’appel déjà utilisé." });
+            return;
+        }
+
+        const [caller, recipient] = await Promise.all([
+            getUtilisateur(from),
+            getUtilisateur(to)
+        ]);
+        if (!caller || !recipient) {
+            envoyer(ws, { type: "ERROR", message: "Le compte appelant ou le destinataire est introuvable." });
             return;
         }
 
@@ -1738,6 +1906,7 @@ wss.on("connection", (ws) => {
         if (message.offer) {
             pendingOffers.set(to, {
                 from: from,
+                callerName: caller.name,
                 offer: message.offer,
                 hasVideo: hasVideo,
                 callId: callId,
@@ -1755,6 +1924,7 @@ wss.on("connection", (ws) => {
                 from: from,
                 to: to,
                 offer: message.offer,
+                callerName: caller.name,
                 hasVideo: hasVideo,
                 callId: callId
             });
@@ -1784,10 +1954,10 @@ wss.on("connection", (ws) => {
             const isStrictementEcranAllume = (screenState === "SCREEN_ON") && destinataireEnLigne;
             if (isStrictementEcranAllume) {
                 console.log(`☀️ [TEST 1] Destinataire ${to} écran allumé et en ligne -> Push bannière interactive`);
-                envoyerPushTest1Banniere(tokenDestinataire, to, from, callId, offerStr, hasVideo, notIdVal);
+                envoyerPushTest1Banniere(tokenDestinataire, to, from, callId, offerStr, hasVideo, notIdVal, caller.name);
             } else {
                 console.log(`🌙 [TEST 2] Destinataire ${to} en veille ou hors ligne (${screenState || "défaut"}) -> Push réveil écran`);
-                envoyerPushTest2Veille(tokenDestinataire, to, from, callId, offerStr, hasVideo, notIdVal);
+                envoyerPushTest2Veille(tokenDestinataire, to, from, callId, offerStr, hasVideo, notIdVal, caller.name);
             }
         } else if (isDestinataireAuPremierPlan) {
             console.log(`ℹ️ Destinataire ${to} a l'application ouverte au premier plan : push FCM non requis.`);
@@ -1849,22 +2019,20 @@ wss.on("connection", (ws) => {
         const from = identifiant;
         const to = String(message.to || "").trim();
         const callId = String(message.callId || "");
-
-        if (to === "") return;
-
-        if (callId && isCallEnded(callId)) {
-            logCall("ACCEPT_IGNORED_DUPLICATE", { callId, from, to, info: "callId dans endedCalls" });
+        const session = callSessions.get(callId);
+        if (!to || !session || session.from !== to || session.to !== from ||
+            session.state !== "RINGING" || isCallEnded(callId)) {
+            logCall("ACCEPT_REFUSED", {
+                callId,
+                from,
+                to,
+                state: session?.state,
+                info: "Acceptation sans session de sonnerie valide pour ce couple"
+            });
+            envoyer(ws, { type: "ERROR", message: "Cet appel ne peut plus être accepté." });
             return;
         }
-
-        const session = callId ? callSessions.get(callId) : null;
-        if (session) {
-            if (session.state === "CONNECTED") {
-                logCall("ACCEPT_IGNORED_DUPLICATE", { callId, from, to, state: "CONNECTED", info: "Session déjà connectée" });
-                return;
-            }
-            session.state = "CONNECTED";
-        }
+        session.state = "CONNECTED";
 
         // Suppression immédiate et absolue des pendingOffers pour les deux parties
         pendingOffers.delete(from);
@@ -1888,14 +2056,21 @@ wss.on("connection", (ws) => {
         const from = identifiant;
         const to = String(message.to || "").trim();
         const callId = String(message.callId || "");
-
-        if (to === "") return;
-
-        if (callId) {
-            markCallEnded(callId);
-            const session = callSessions.get(callId);
-            if (session) session.state = "REJECTED";
+        const session = callSessions.get(callId);
+        if (!to || !session || session.to !== from || session.from !== to ||
+            session.state !== "RINGING" || isCallEnded(callId)) {
+            logCall("REJECT_REFUSED", {
+                callId,
+                from,
+                to,
+                state: session?.state,
+                info: "Refus sans session de sonnerie valide pour ce couple"
+            });
+            envoyer(ws, { type: "ERROR", message: "Cet appel ne peut plus être refusé." });
+            return;
         }
+        markCallEnded(callId);
+        session.state = "REJECTED";
 
         pendingOffers.delete(from);
         pendingOffers.delete(to);
@@ -1917,14 +2092,24 @@ wss.on("connection", (ws) => {
         const from = identifiant;
         const to = String(message.to || "").trim();
         const callId = String(message.callId || "");
-
-        if (to === "") return;
-
-        if (callId) {
-            markCallEnded(callId);
-            const session = callSessions.get(callId);
-            if (session) session.state = "ENDED";
+        const session = callSessions.get(callId);
+        const validPair = session &&
+            ((session.from === from && session.to === to) ||
+                (session.from === to && session.to === from));
+        if (!to || !validPair || !["RINGING", "CONNECTED"].includes(session.state) ||
+            isCallEnded(callId)) {
+            logCall("END_REFUSED", {
+                callId,
+                from,
+                to,
+                state: session?.state,
+                info: "Fin sans session active valide pour ce couple"
+            });
+            envoyer(ws, { type: "ERROR", message: "Cet appel ne peut pas être terminé." });
+            return;
         }
+        markCallEnded(callId);
+        session.state = "ENDED";
 
         // Si l'appel était en attente (destinataire n'avait pas encore répondu), envoyer un push d'annulation
         if (pendingOffers.has(to)) {
@@ -2061,9 +2246,21 @@ wss.on("connection", (ws) => {
     function relayerSignalisation(message) {
         const from = identifiant;
         const to = String(message.to || "").trim();
-        const callId = message.callId;
-
-        if (to === "" || appels.get(from) !== to) return;
+        const callId = typeof message.callId === "string" ? message.callId : "";
+        const session = callSessions.get(callId);
+        const validPair = session &&
+            ((session.from === from && session.to === to) ||
+                (session.from === to && session.to === from));
+        if (!validPair || !["RINGING", "CONNECTED"].includes(session.state) || isCallEnded(callId)) {
+            logCall("SIGNAL_REFUSED", {
+                callId,
+                from,
+                to,
+                state: session?.state,
+                info: "Signal sans session d’appel active pour ce couple"
+            });
+            return;
+        }
 
         const eventType = (message.type === "ICE_CANDIDATE") ? "ice-candidate" : message.type;
 
@@ -2137,6 +2334,7 @@ const intervalKeepAlive = setInterval(() => {
         ws.ping();
     });
 }, 30000);
+if (typeof intervalKeepAlive.unref === "function") intervalKeepAlive.unref();
 
 wss.on("close", () => {
     clearInterval(intervalKeepAlive);
