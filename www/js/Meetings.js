@@ -57,8 +57,11 @@ Meetings.prototype.normalizeMeetingCode = function(code) {
 Meetings.prototype.handleMeetingCreated = function(data) {
   console.log("📅 [MEETING] Réunion créée:", data);
   this.meetingCreateSubmitting = false;
+  this._meetingCreateHandled = true;
   clearTimeout(this.meetingCreateTimeout);
+  clearTimeout(this.meetingCreateFallbackTimeout);
   this.meetingCreateTimeout = null;
+  this.meetingCreateFallbackTimeout = null;
   this.closeMeetingCreateView();
 
   // Réunion instantanée : on va directement à l'aperçu caméra, sans écran intermédiaire
@@ -2195,34 +2198,6 @@ Meetings.prototype.openMeetingDetails = function(meetingId) {
 Meetings.prototype.createMeeting = function(title, scheduledAt, durationMin, isVideo, participants, description = "", accessPolicy = "direct", waitingMusicTracks = []) {
   console.log("📅 [MEETING] createMeeting appelé - wsReadyState:", this.wsReadyState, "wsId:", this.wsId);
 
-  // Pour Cordova : utiliser wsReadyState, pour navigateur : utiliser ws.readyState
-  const isConnected = this.wsReadyState === WebSocket.OPEN || (this.ws && this.ws.readyState === WebSocket.OPEN);
-
-  if (!isConnected) {
-    if (this.meetingConnectionRetryPending) return;
-    this.meetingConnectionRetryPending = true;
-    this.showCallToast("Connexion au serveur…");
-    console.log("📅 [MEETING] WebSocket non connecté, tentative de connexion...");
-    this.connectWebSocket();
-
-    const deadline = Date.now() + 20000;
-    const retryCreate = () => {
-      const nowConnected = this.wsReadyState === WebSocket.OPEN || (this.ws && this.ws.readyState === WebSocket.OPEN);
-      if (nowConnected) {
-        this.meetingConnectionRetryPending = false;
-        this.createMeeting(title, scheduledAt, durationMin, isVideo, participants, description, accessPolicy, waitingMusicTracks);
-      } else if (Date.now() < deadline) {
-        setTimeout(retryCreate, 200);
-      } else {
-        this.meetingConnectionRetryPending = false;
-        console.error("📅 [MEETING] WebSocket toujours non connecté après tentative");
-        this.showCallToast("Connexion au serveur impossible. Réessayez.");
-      }
-    };
-    setTimeout(retryCreate, 150);
-    return;
-  }
-
   if (!this.myId) {
     this.showCallToast("ID utilisateur requis - veuillez patienter");
     return;
@@ -2234,27 +2209,77 @@ Meetings.prototype.createMeeting = function(title, scheduledAt, durationMin, isV
     return;
   }
 
-  this.sendSignal({
-    type: "meeting-create",
+  const payload = {
     title,
     description,
     scheduledAt: scheduledAtTimestamp,
-    durationMin: parseInt(durationMin),
+    durationMin: parseInt(durationMin, 10),
     isVideo: !!isVideo,
     participants: participants || [],
     accessPolicy: accessPolicy || "direct",
     waitingMusicTracks,
+  };
+
+  this._meetingCreateHandled = false;
+  clearTimeout(this.meetingCreateTimeout);
+  clearTimeout(this.meetingCreateFallbackTimeout);
+
+  const createViaHttpFallback = async () => {
+    if (this._meetingCreateHandled) return;
+    console.log("🌐 [MEETING] Bascule création via API HTTP REST POST /api/meeting");
+    this.showCallToast("Planification via HTTP en cours…");
+    try {
+      const response = await fetch(`${CallManager.HTTP_SERVER_URL}/api/meeting`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...payload, createdBy: this.myId }),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok || result.success === false) {
+        throw new Error(result.error || result.reason || `Erreur HTTP ${response.status}`);
+      }
+      if (!this._meetingCreateHandled) {
+        this.handleMeetingCreated(result);
+      }
+    } catch (err) {
+      console.error("❌ [MEETING] Échec création HTTP:", err);
+      this.meetingCreateSubmitting = false;
+      this.instantMeetingPending = false;
+      this.showCallToast(err.message || "Impossible de planifier la réunion. Réessayez.");
+    }
+  };
+
+  const isConnected = this.wsReadyState === WebSocket.OPEN || (this.ws && this.ws.readyState === WebSocket.OPEN);
+
+  if (!isConnected) {
+    // Socket déconnecté ou en reconnexion : bascule directe sur l'API HTTP REST
+    createViaHttpFallback();
+    if (!this.isReconnecting) {
+      this.connectWebSocket();
+    }
+    return;
+  }
+
+  this.sendSignal({
+    type: "meeting-create",
+    ...payload,
   });
 
-  clearTimeout(this.meetingCreateTimeout);
+  // Fallback automatique vers HTTP REST si aucune réponse WS sous 5 secondes
+  this.meetingCreateFallbackTimeout = setTimeout(() => {
+    this.meetingCreateFallbackTimeout = null;
+    if (!this._meetingCreateHandled) {
+      createViaHttpFallback();
+    }
+  }, 5000);
+
   this.meetingCreateTimeout = setTimeout(() => {
     this.meetingCreateTimeout = null;
-    this.meetingCreateSubmitting = false;
-    this.instantMeetingPending = false;
-    const connected = this.wsReadyState === WebSocket.OPEN || (this.ws && this.ws.readyState === WebSocket.OPEN);
-    this.showCallToast(connected
-      ? "Aucune réponse du serveur. Vérifie ta connexion puis réessaie."
-      : "Connexion au serveur interrompue. Vérifie ta connexion puis réessaie.");
+    if (!this._meetingCreateHandled) {
+      this.meetingCreateSubmitting = false;
+      this.instantMeetingPending = false;
+      this.showCallToast("Aucune réponse du serveur. Vérifie ta connexion puis réessaie.");
+    }
   }, 20000);
 
   console.log("📅 [MEETING] Demande de création de réunion envoyée avec politique:", accessPolicy);

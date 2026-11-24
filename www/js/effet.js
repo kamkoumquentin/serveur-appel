@@ -10,8 +10,8 @@ document.addEventListener("DOMContentLoaded", () => {
     if (!acceptBtn) return;
     acceptBtn.classList.add("vibrating");
 
-    // Vibration physique du téléphone (sur mobile)
-    if ("vibrate" in navigator) {
+    // Vibration physique du téléphone (sur mobile, uniquement après interaction utilisateur)
+    if ("vibrate" in navigator && navigator.userActivation?.hasBeenActive) {
       navigator.vibrate([200, 100, 200, 100, 200, 800]);
     }
   }

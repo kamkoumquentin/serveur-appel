@@ -2460,12 +2460,11 @@ button, [role="button"] { cursor: pointer; }
 ========================================================= */
 
   initPushNotifications = () => {
-    console.log("🔔 ===== INITIALISATION PUSH =====");
-
-    if (typeof PushNotification === "undefined") {
-      console.error("❌ PushNotification est undefined");
+    if (window.cordova?.platformId === "browser" || typeof PushNotification === "undefined") {
+      console.debug("🔔 PushNotification ignoré (plateforme browser ou plugin absent)");
       return;
     }
+    console.log("🔔 ===== INITIALISATION PUSH =====");
 
     try {
       this.push = PushNotification.init({
@@ -2665,20 +2664,16 @@ button, [role="button"] { cursor: pointer; }
   connectWebSocket = async () => {
     if (
       this.wsReadyState === WebSocket.OPEN ||
-      this.wsReadyState === WebSocket.CONNECTING
+      this.wsReadyState === WebSocket.CONNECTING ||
+      this._isConnectingSocket
     ) {
       return;
     }
 
+    this._isConnectingSocket = true;
+    this.wsReadyState = WebSocket.CONNECTING;
     this.manuallyClosed = false;
     this.updateStatus("Connexion au serveur...");
-
-    // Débogage : vérifier si le plugin est disponible
-    console.log("🔍 Vérification plugin WebSocket :");
-    console.log("  - window.cordova:", !!window.cordova);
-    console.log("  - window.CordovaWebsocketPlugin:", !!window.CordovaWebsocketPlugin);
-    console.log("  - cordova.plugins:", !!cordova?.plugins);
-    console.log("  - cordova.plugins.CordovaWebsocketPlugin:", !!cordova?.plugins?.CordovaWebsocketPlugin);
 
     try {
       await fetch(CallManager.HTTP_SERVER_URL, { method: "GET", cache: "no-cache" });
@@ -2692,6 +2687,7 @@ button, [role="button"] { cursor: pointer; }
       const settleOnce = () => {
         if (settled) return;
         settled = true;
+        this._isConnectingSocket = false;
         resolve();
       };
       setTimeout(settleOnce, 15000);
@@ -2795,7 +2791,9 @@ button, [role="button"] { cursor: pointer; }
       // Le transport natif était bien connecté, mais son état restait
       // CONNECTING : les écrans de réunion refusaient alors d'envoyer leurs messages.
       this.wsReadyState = WebSocket.OPEN;
+      this.isReconnecting = false;
       this.reconnectAttempts = 0; // Réinitialiser les tentatives de reconnexion
+      clearTimeout(this.reconnectTimer);
 
       // Le serveur coupe la connexion après ~30 s d'inactivité → ping JSON
       // toutes les 20 s.
@@ -2840,7 +2838,9 @@ button, [role="button"] { cursor: pointer; }
       this.ws.onopen = () => {
         console.log("✅ WebSocket natif connecté");
         this.wsReadyState = WebSocket.OPEN;
+        this.isReconnecting = false;
         this.reconnectAttempts = 0; // Réinitialiser les tentatives de reconnexion
+        clearTimeout(this.reconnectTimer);
         this.startHeartbeat();
         this.sendRegistration();
         if (typeof onSettle === "function") onSettle();
@@ -2855,20 +2855,18 @@ button, [role="button"] { cursor: pointer; }
         this.updateStatus("Erreur réseau WebSocket");
         this.wsReadyState = WebSocket.CLOSED;
         this.stopHeartbeat();
-        if (!this.manuallyClosed) {
-          this.scheduleReconnect();
-        }
         if (typeof onSettle === "function") onSettle();
       };
 
-      this.ws.onclose = () => {
-        console.log("🔌 WebSocket natif fermé");
+      this.ws.onclose = (event) => {
+        console.log("🔌 WebSocket natif fermé (code:", event?.code, ")");
         this.wsReadyState = WebSocket.CLOSED;
         this.stopHeartbeat();
         if (!this.manuallyClosed) {
           this.updateStatus("Hors ligne");
           this.scheduleReconnect();
         }
+        if (typeof onSettle === "function") onSettle();
       };
     } catch (error) {
       console.error("❌ Erreur création WebSocket natif :", error);
@@ -2941,14 +2939,14 @@ button, [role="button"] { cursor: pointer; }
       // Fallback pour le navigateur
       if (!window.cordova || !wsPlugin) {
         if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-          this.ws.send(JSON.stringify({ action: "ping" }));
+          this.ws.send(JSON.stringify({ type: "ping", action: "ping" }));
         }
       } else {
         // Utiliser le plugin Cordova
         if (this.wsId != null) {
           wsPlugin.wsSend(
             this.wsId,
-            JSON.stringify({ action: "ping" }),
+            JSON.stringify({ type: "ping", action: "ping" }),
           );
         }
       }
@@ -3284,9 +3282,13 @@ button, [role="button"] { cursor: pointer; }
   };
 
   scheduleReconnect = () => {
+    if (this.manuallyClosed || this.isReconnecting) {
+      return;
+    }
+    this.isReconnecting = true;
     clearTimeout(this.reconnectTimer);
 
-    // Backoff exponentiel: 1s, 2s, 4s, 8s, 16s, max 30s
+    // Backoff exponentiel: 1s, 2s, 4s, 8s, max 15s
     if (!this.reconnectAttempts) {
       this.reconnectAttempts = 0;
     }
@@ -3294,7 +3296,7 @@ button, [role="button"] { cursor: pointer; }
 
     const delay = Math.min(
       Math.pow(2, this.reconnectAttempts - 1) * 1000,
-      30000
+      15000
     );
 
     console.log(`🔄 Reconnexion WebSocket dans ${delay}ms (tentative ${this.reconnectAttempts})`);
@@ -3302,10 +3304,10 @@ button, [role="button"] { cursor: pointer; }
     // Afficher indicateur visuel de reconnexion
     this.updateStatus(`Reconnexion en cours... (${this.reconnectAttempts})`);
 
-    this.reconnectTimer = setTimeout(
-      () => this.connectWebSocket(),
-      delay,
-    );
+    this.reconnectTimer = setTimeout(() => {
+      this.isReconnecting = false;
+      this.connectWebSocket();
+    }, delay);
   };
 
   sendSignal = (data, _retries = 0) => {
@@ -4890,8 +4892,7 @@ showLocalStorageOnScreen = () => {
 
   // Écoute les changements automatiques (Bluetooth connecté/déconnecté)
   startAudioRouteListening = () => {
-    if (!window.cordova || !cordova.exec) {
-      console.warn("⚠️ AudioRoute: cordova.exec indisponible");
+    if (!window.cordova || cordova.platformId === "browser" || !cordova.exec) {
       return;
     }
 
@@ -9360,8 +9361,11 @@ showLocalStorageOnScreen = () => {
    (compatibilité avec les attributs onclick="..." du HTML)
 ========================================================= */
 
-const callManager = new CallManager();
-window.callManager = callManager;
+if (!window.__callManagerInitialized) {
+  window.__callManagerInitialized = true;
+
+  const callManager = new CallManager();
+  window.callManager = callManager;
 
 window.makeCall = callManager.makeCall;
 window.acceptCall = callManager.acceptCall;
@@ -9443,3 +9447,4 @@ window.disconnectWebSocket = () => {
   callManager.wsReadyState = WebSocket.CLOSED;
   callManager.updateStatus("Hors ligne");
 };
+}

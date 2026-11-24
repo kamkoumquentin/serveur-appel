@@ -2652,6 +2652,76 @@ app.get("/.well-known/apple-app-site-association", (req, res) => {
 // API REST POUR MEETING SERVICE
 // =========================================================
 
+// Créer une réunion planifiée via HTTP REST (fallback si WebSocket instable)
+app.post("/api/meeting", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const createdBy = typeof body.createdBy === "string" ? body.createdBy.trim() : (typeof body.userId === "string" ? body.userId.trim() : "");
+    if (!createdBy) {
+      return res.status(400).json({ error: "createdBy (userId) requis" });
+    }
+
+    const validation = validateMeetingMessage(body, "meeting-create");
+    if (!validation.valid) {
+      return res.status(400).json({ error: validation.reason });
+    }
+
+    const sanitizedTitle = sanitizeString(body.title, 100);
+    const sanitizedDescription = body.description ? sanitizeString(body.description, 500) : "";
+    const policy = body.accessPolicy === "approval" ? "approval" : "direct";
+    const waitingMusicTracks = Array.isArray(body.waitingMusicTracks) ? body.waitingMusicTracks : [];
+    const validWaitingMusic = waitingMusicTracks.every((track) =>
+      track && typeof track.dataUrl === "string" && /^data:audio\/[a-zA-Z0-9.+-]+;base64,/.test(track.dataUrl)
+    ) && waitingMusicTracks.reduce((sum, track) => sum + track.dataUrl.length, 0) <= MAX_WAITING_MUSIC_TRANSFER_BYTES;
+    if (!validWaitingMusic) {
+      return res.status(400).json({ error: "Liste audio invalide ou trop volumineuse" });
+    }
+
+    const meeting = await meetingManager.create({
+      title: sanitizedTitle,
+      description: sanitizedDescription,
+      scheduledAt: body.scheduledAt,
+      durationMin: body.durationMin,
+      isVideo: !!body.isVideo,
+      createdBy,
+      participants: Array.isArray(body.participants) ? body.participants : [],
+      accessPolicy: policy,
+    });
+
+    if (meeting.success === false) {
+      return res.status(400).json({ error: meeting.reason || "Création refusée" });
+    }
+
+    if (waitingMusicTracks.length) {
+      meetingWaitingMusic.set(meeting.meetingId, {
+        syncAt: Date.now(),
+        tracks: waitingMusicTracks.map((track) => ({
+          dataUrl: track.dataUrl,
+          name: String(track.name || "Musique d’attente").slice(0, 120),
+        })),
+      });
+    }
+
+    res.status(201).json({
+      success: true,
+      meetingId: meeting.meetingId,
+      code: meeting.code,
+      link: meeting.link,
+      title: meeting.title,
+      description: meeting.description,
+      scheduledAt: meeting.scheduledAt,
+      endsAt: meeting.endsAt,
+      isVideo: meeting.isVideo,
+      createdBy: meeting.createdBy,
+      participants: meeting.participants,
+      accessPolicy: meeting.accessPolicy,
+    });
+  } catch (error) {
+    console.error("❌ Erreur API POST /api/meeting:", error);
+    res.status(500).json({ error: "Erreur serveur" });
+  }
+});
+
 // Obtenir une réunion par code
 app.get("/api/meeting/by-code/:code", async (req, res) => {
   try {
@@ -3080,7 +3150,7 @@ const interval = setInterval(() => {
       console.error("Erreur envoi ping :", e);
     }
   });
-}, 30000);
+}, 22000);
 
 wss.on("close", () => {
   clearInterval(interval);
@@ -3120,6 +3190,13 @@ wss.on("connection", (ws) => {
         return;
       }
 
+      if (type === "ping" || data.action === "ping") {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "pong" }));
+        }
+        return;
+      }
+
       // 1. Enregistrement / Reconnexion de l'utilisateur
       if (type === "register-user") {
         const { authToken } = data;
@@ -3151,10 +3228,19 @@ wss.on("connection", (ws) => {
             `🔄 Utilisateur ${userId} déjà présent dans la Map. Mise à jour de la connexion...`,
           );
 
-          // Fermer l'ancien socket s'il existe et qu'il est encore actif
+          // Fermer proprement l'ancien socket s'il existe encore (éviter 1006 brutal)
           if (existingUser.ws && existingUser.ws !== ws) {
-            existingUser.ws.userId = null;
-            existingUser.ws.terminate();
+            const oldWs = existingUser.ws;
+            oldWs.userId = null;
+            try {
+              if (oldWs.readyState === WebSocket.OPEN) {
+                oldWs.close(4001, "Replaced by new connection");
+              } else if (oldWs.readyState === WebSocket.CONNECTING) {
+                oldWs.terminate();
+              }
+            } catch (e) {
+              try { oldWs.terminate(); } catch (_) {}
+            }
           }
 
           // Mise à jour : Nouveau socket + mise à jour du token
