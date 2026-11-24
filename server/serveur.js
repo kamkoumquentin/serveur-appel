@@ -188,6 +188,25 @@ function sanitizeString(str, maxLength = 1000) {
  * @param {string} type - Type de message
  * @returns {object} {valid: boolean, reason: string}
  */
+function normalizeScheduledAt(scheduledAt) {
+  if (scheduledAt === null || scheduledAt === undefined || scheduledAt === "") {
+    return { valid: true, value: Date.now() };
+  }
+  if (typeof scheduledAt === "number") {
+    return Number.isFinite(scheduledAt)
+      ? { valid: true, value: scheduledAt }
+      : { valid: false, reason: "Date invalide" };
+  }
+  if (typeof scheduledAt === "string") {
+    const trimmed = scheduledAt.trim();
+    const parsed = /^\d+$/.test(trimmed) ? Number(trimmed) : Date.parse(trimmed);
+    return Number.isFinite(parsed)
+      ? { valid: true, value: parsed }
+      : { valid: false, reason: "Date invalide" };
+  }
+  return { valid: false, reason: "Date invalide" };
+}
+
 function validateMeetingMessage(data, type) {
   if (!data || typeof data !== 'object') {
     return { valid: false, reason: 'Données invalides' };
@@ -195,17 +214,21 @@ function validateMeetingMessage(data, type) {
 
   switch (type) {
     case 'meeting-create':
-      if (!data.title || typeof data.title !== 'string' || data.title.length > 100) {
-        return { valid: false, reason: 'Titre invalide (max 100 caractères)' };
+    case 'create-meeting':
+      if (!data.title || typeof data.title !== 'string' || data.title.trim().length === 0 || data.title.length > 100) {
+        return { valid: false, reason: 'Titre invalide (1 à 100 caractères)' };
       }
       if (data.description && typeof data.description === 'string' && data.description.length > 500) {
         return { valid: false, reason: 'Description trop longue (max 500 caractères)' };
       }
-      if (data.scheduledAt && typeof data.scheduledAt !== 'number') {
+      if (!normalizeScheduledAt(data.scheduledAt).valid) {
         return { valid: false, reason: 'Date invalide' };
       }
-      if (data.durationMin && (typeof data.durationMin !== 'number' || data.durationMin < 15 || data.durationMin > 480)) {
-        return { valid: false, reason: 'Durée invalide (entre 15 et 480 minutes)' };
+      if (data.durationMin !== undefined && data.durationMin !== null && data.durationMin !== '') {
+        const dur = Number(data.durationMin);
+        if (!Number.isFinite(dur) || dur < 15 || dur > 480) {
+          return { valid: false, reason: 'Durée invalide (entre 15 et 480 minutes)' };
+        }
       }
       break;
 
@@ -1240,9 +1263,9 @@ class MeetingManager {
    * @param {Array<string>} params.participants - Liste des participants invités
    * @returns {Promise<object>} Réunion créée avec meetingId, code, link
    */
-  async create({ title, description, scheduledAt, durationMin, isVideo, createdBy, participants, accessPolicy }) {
+  async create({ title, description, scheduledAt, durationMin, isVideo, createdBy, hostName, participants, accessPolicy }) {
     // Validation des paramètres
-    if (!title || title.trim().length === 0) {
+    if (!title || typeof title !== "string" || title.trim().length === 0) {
       return { success: false, reason: "Le titre est requis" };
     }
 
@@ -1254,13 +1277,20 @@ class MeetingManager {
       return { success: false, reason: "La description ne peut pas dépasser 500 caractères" };
     }
 
+    const parsedSchedule = normalizeScheduledAt(scheduledAt);
+    if (!parsedSchedule.valid) {
+      return { success: false, reason: "Date invalide" };
+    }
+    const normalizedScheduledAt = parsedSchedule.value;
+
     // Validation de la date: doit être dans le futur OU dans les 5 dernières secondes (réunion immédiate)
     const now = Date.now();
-    if (!scheduledAt || (scheduledAt <= now - 5000 && scheduledAt < now + 60000)) {
+    if (normalizedScheduledAt <= now - 5000 && normalizedScheduledAt < now + 60000) {
       return { success: false, reason: "L'heure doit être dans le futur (au moins 1 minute)" };
     }
 
-    if (!durationMin || durationMin < 15 || durationMin > 480) {
+    const normalizedDuration = (durationMin === undefined || durationMin === null || durationMin === "") ? 60 : Number(durationMin);
+    if (!Number.isFinite(normalizedDuration) || normalizedDuration < 15 || normalizedDuration > 480) {
       return { success: false, reason: "La durée doit être entre 15 et 480 minutes" };
     }
 
@@ -1270,7 +1300,7 @@ class MeetingManager {
     
     const meetingId = `meeting_${Date.now()}_${createdBy}`;
     const code = await this._generateCode();
-    const endsAt = scheduledAt + (durationMin * 60 * 1000);
+    const endsAt = normalizedScheduledAt + (normalizedDuration * 60 * 1000);
     const link = `https://app-appel.onrender.com/join/${code}`;
 
     const meeting = {
@@ -1278,11 +1308,12 @@ class MeetingManager {
       code,
       title: title.trim(),
       description: description ? description.trim() : "",
-      scheduledAt,
-      durationMin,
+      scheduledAt: normalizedScheduledAt,
+      durationMin: normalizedDuration,
       endsAt,
       isVideo: !!isVideo,
       createdBy,
+      hostName: typeof hostName === "string" && hostName.trim() ? sanitizeString(hostName, 60) : (userDisplayNames.get(createdBy) || createdBy),
       participants: participants || [],
       status: "scheduled",
       roomId: null,
@@ -2653,17 +2684,24 @@ app.get("/.well-known/apple-app-site-association", (req, res) => {
 // =========================================================
 
 // Créer une réunion planifiée via HTTP REST (fallback si WebSocket instable)
-app.post("/api/meeting", async (req, res) => {
+async function handleCreateMeetingHttp(req, res) {
   try {
     const body = req.body || {};
-    const createdBy = typeof body.createdBy === "string" ? body.createdBy.trim() : (typeof body.userId === "string" ? body.userId.trim() : "");
+    const createdBy = typeof body.createdBy === "string"
+      ? body.createdBy.trim()
+      : (typeof body.userId === "string" ? body.userId.trim() : "");
     if (!createdBy) {
-      return res.status(400).json({ error: "createdBy (userId) requis" });
+      return res.status(400).json({ success: false, error: "createdBy (userId) requis" });
     }
 
     const validation = validateMeetingMessage(body, "meeting-create");
     if (!validation.valid) {
-      return res.status(400).json({ error: validation.reason });
+      return res.status(400).json({ success: false, error: validation.reason });
+    }
+
+    const scheduleCheck = normalizeScheduledAt(body.scheduledAt);
+    if (!scheduleCheck.valid) {
+      return res.status(400).json({ success: false, error: scheduleCheck.reason });
     }
 
     const sanitizedTitle = sanitizeString(body.title, 100);
@@ -2674,22 +2712,23 @@ app.post("/api/meeting", async (req, res) => {
       track && typeof track.dataUrl === "string" && /^data:audio\/[a-zA-Z0-9.+-]+;base64,/.test(track.dataUrl)
     ) && waitingMusicTracks.reduce((sum, track) => sum + track.dataUrl.length, 0) <= MAX_WAITING_MUSIC_TRANSFER_BYTES;
     if (!validWaitingMusic) {
-      return res.status(400).json({ error: "Liste audio invalide ou trop volumineuse" });
+      return res.status(400).json({ success: false, error: "Liste audio invalide ou trop volumineuse" });
     }
 
     const meeting = await meetingManager.create({
       title: sanitizedTitle,
       description: sanitizedDescription,
-      scheduledAt: body.scheduledAt,
+      scheduledAt: scheduleCheck.value,
       durationMin: body.durationMin,
       isVideo: !!body.isVideo,
       createdBy,
+      hostName: body.hostName,
       participants: Array.isArray(body.participants) ? body.participants : [],
       accessPolicy: policy,
     });
 
     if (meeting.success === false) {
-      return res.status(400).json({ error: meeting.reason || "Création refusée" });
+      return res.status(400).json({ success: false, error: meeting.reason || "Création refusée" });
     }
 
     if (waitingMusicTracks.length) {
@@ -2704,6 +2743,7 @@ app.post("/api/meeting", async (req, res) => {
 
     res.status(201).json({
       success: true,
+      meeting,
       meetingId: meeting.meetingId,
       code: meeting.code,
       link: meeting.link,
@@ -2711,16 +2751,21 @@ app.post("/api/meeting", async (req, res) => {
       description: meeting.description,
       scheduledAt: meeting.scheduledAt,
       endsAt: meeting.endsAt,
+      durationMin: meeting.durationMin,
       isVideo: meeting.isVideo,
       createdBy: meeting.createdBy,
+      hostName: meeting.hostName,
       participants: meeting.participants,
       accessPolicy: meeting.accessPolicy,
     });
   } catch (error) {
     console.error("❌ Erreur API POST /api/meeting:", error);
-    res.status(500).json({ error: "Erreur serveur" });
+    res.status(500).json({ success: false, error: error.message || "Erreur serveur" });
   }
-});
+}
+
+app.post("/api/meeting", handleCreateMeetingHttp);
+app.post("/api/meetings", handleCreateMeetingHttp);
 
 // Obtenir une réunion par code
 app.get("/api/meeting/by-code/:code", async (req, res) => {
@@ -4086,41 +4131,46 @@ wss.on("connection", (ws) => {
       // 16. Créer une réunion planifiée
       // Envoyé par : Utilisateur -> Reçu par : Utilisateur (confirmation)
       // Pourquoi : Créer une réunion planifiée avec un code partageable
-      if (type === "meeting-create") {
+      if (type === "meeting-create" || type === "create-meeting") {
+        const sendMeetingError = (msg) => {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+              type: "meeting-error",
+              reason: msg,
+              message: msg,
+            }));
+          }
+        };
         try {
           // Validation des données
           const validation = validateMeetingMessage(data, "meeting-create");
           if (!validation.valid) {
-            console.warn(`[MEETING] meeting-create refusé : ${validation.reason}`);
-            ws.send(
-              JSON.stringify({
-                type: "meeting-error",
-                reason: validation.reason,
-              }),
-            );
+            console.warn(`[MEETING] ${type} refusé : ${validation.reason}`);
+            sendMeetingError(validation.reason);
             return;
           }
 
-          const { title, description, scheduledAt, durationMin, isVideo, participants, accessPolicy } = data;
+          const { title, description, scheduledAt, durationMin, isVideo, participants, accessPolicy, hostName } = data;
+          const scheduleCheck = normalizeScheduledAt(scheduledAt);
+          if (!scheduleCheck.valid) {
+            sendMeetingError(scheduleCheck.reason);
+            return;
+          }
+
           const waitingMusicTracks = Array.isArray(data.waitingMusicTracks) ? data.waitingMusicTracks : [];
           const validWaitingMusic = waitingMusicTracks.every((track) =>
             track && typeof track.dataUrl === "string" && /^data:audio\/[a-zA-Z0-9.+-]+;base64,/.test(track.dataUrl)
           ) && waitingMusicTracks.reduce((sum, track) => sum + track.dataUrl.length, 0) <= MAX_WAITING_MUSIC_TRANSFER_BYTES;
           if (!validWaitingMusic) {
-            ws.send(JSON.stringify({ type: "meeting-error", reason: "La liste audio est trop volumineuse pour être transmise" }));
+            sendMeetingError("La liste audio est trop volumineuse pour être transmise");
             return;
           }
 
-          console.log(`[MEETING] meeting-create reçu de ${ws.userId || "?"} accessPolicy=${accessPolicy || "direct"}`);
+          console.log(`[MEETING] ${type} reçu de ${ws.userId || "?"} accessPolicy=${accessPolicy || "direct"}`);
 
           if (!ws.userId) {
-            console.error(`[MEETING] meeting-create refusé : utilisateur non enregistré`);
-            ws.send(
-              JSON.stringify({
-                type: "meeting-error",
-                reason: "Non enregistré",
-              }),
-            );
+            console.error(`[MEETING] ${type} refusé : utilisateur non enregistré`);
+            sendMeetingError("Non enregistré");
             return;
           }
 
@@ -4133,23 +4183,19 @@ wss.on("connection", (ws) => {
           const meeting = await meetingManager.create({
             title: sanitizedTitle,
             description: sanitizedDescription,
-            scheduledAt,
+            scheduledAt: scheduleCheck.value,
             durationMin,
             isVideo: !!isVideo,
             createdBy: ws.userId,
+            hostName,
             participants: participants || [],
             accessPolicy: policy,
           });
 
           // Vérifier si la création a réussi
           if (meeting.success === false) {
-            ws.send(
-              JSON.stringify({
-                type: "meeting-error",
-                reason: meeting.reason,
-              }),
-            );
-            console.log(`[MEETING] meeting-create refusé: ${meeting.reason}`);
+            sendMeetingError(meeting.reason);
+            console.log(`[MEETING] ${type} refusé: ${meeting.reason}`);
             return;
           }
 
@@ -4163,30 +4209,27 @@ wss.on("connection", (ws) => {
             });
           }
 
-
-          ws.send(
-            JSON.stringify({
-              type: "meeting-created",
-              meetingId: meeting.meetingId,
-              code: meeting.code,
-              link: meeting.link,
-              title: meeting.title,
-              description: meeting.description,
-              scheduledAt: meeting.scheduledAt,
-              endsAt: meeting.endsAt,
-              durationMin: meeting.durationMin,
-              isVideo: meeting.isVideo,
-            }),
-          );
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(
+              JSON.stringify({
+                type: "meeting-created",
+                meetingId: meeting.meetingId,
+                code: meeting.code,
+                link: meeting.link,
+                title: meeting.title,
+                description: meeting.description,
+                scheduledAt: meeting.scheduledAt,
+                endsAt: meeting.endsAt,
+                durationMin: meeting.durationMin,
+                isVideo: meeting.isVideo,
+                hostName: meeting.hostName,
+              }),
+            );
+          }
           console.log(`[MEETING] meeting-created envoyé à ${ws.userId}`);
         } catch (error) {
-          console.error(`[MEETING] Erreur dans meeting-create :`, error);
-          ws.send(
-            JSON.stringify({
-              type: "meeting-error",
-              reason: error.message || "Erreur serveur",
-            }),
-          );
+          console.error(`[MEETING] Erreur dans ${type} :`, error);
+          sendMeetingError(error.message || "Erreur serveur");
         }
         return;
       }
