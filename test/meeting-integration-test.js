@@ -27,7 +27,7 @@ const testMeetingFlow = () => {
       status: "scheduled",
       roomId: null,
       createdAt: Date.now(),
-      link: "https://app-appel.onrender.com/join/ABC-123-XYZ"
+      link: "https://serveur-appel.onrender.com/join/ABC-123-XYZ"
     };
     
     const requiredFields = [

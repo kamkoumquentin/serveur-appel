@@ -60,6 +60,7 @@ initializeApp({
 
 // Initialisation de Firestore pour la persistance des réunions
 const db = getFirestore();
+db.settings({ ignoreUndefinedProperties: true });
 
 const app = express();
 
@@ -1303,7 +1304,7 @@ class MeetingManager {
     const meetingId = `meeting_${Date.now()}_${createdBy}`;
     const code = await this._generateCode();
     const endsAt = normalizedScheduledAt + (normalizedDuration * 60 * 1000);
-    const link = `https://app-appel.onrender.com/join/${code}`;
+    const link = `https://serveur-appel.onrender.com/join/${code}`;
 
     const meeting = {
       meetingId,
@@ -2660,7 +2661,7 @@ app.get("/join/:code", (req, res) => {
     </p>
     <a href="callapp://join/${safeLinkCode}" class="btn">Ouvrir dans l'application</a>
     <br>
-    <a href="https://app-appel.onrender.com" class="btn btn-secondary">Télécharger l'application</a>
+    <a href="https://serveur-appel.onrender.com" class="btn btn-secondary">Télécharger l'application</a>
   </div>
 </body>
 </html>
@@ -4360,12 +4361,15 @@ wss.on("connection", (ws) => {
           }
         } catch (error) {
           console.error(`[MEETING] Erreur dans meeting-join :`, error);
-          ws.send(
-            JSON.stringify({
-              type: "meeting-error",
-              reason: error.message || "Erreur serveur",
-            }),
-          );
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(
+              JSON.stringify({
+                type: "meeting-error",
+                reason: error.message || "Erreur serveur",
+                message: error.message || "Erreur serveur",
+              }),
+            );
+          }
         }
         return;
       }
@@ -4418,59 +4422,63 @@ wss.on("connection", (ws) => {
         return;
       }
 
-      if (type === "meeting-force-start") {
+      if (type === "meeting-force-start" || type === "meeting-start") {
+        const sendStartError = (msg) => {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: "meeting-error", reason: msg, message: msg }));
+          }
+        };
         try {
           // Validation des données
           const validation = validateMeetingMessage(data, "meeting-force-start");
           if (!validation.valid) {
-            console.warn(`[MEETING] meeting-force-start refusé : ${validation.reason}`);
-            ws.send(JSON.stringify({ type: "meeting-error", reason: validation.reason }));
+            console.warn(`[MEETING] ${type} refusé : ${validation.reason}`);
+            sendStartError(validation.reason);
             return;
           }
 
           const { code } = data;
 
-          console.log(`[MEETING] meeting-force-start reçu de ${ws.userId || "?"} pour code ${code}`);
+          console.log(`[MEETING] ${type} reçu de ${ws.userId || "?"} pour code ${code}`);
 
           if (!ws.userId) {
-            ws.send(JSON.stringify({ type: "meeting-error", reason: "Non enregistré" }));
+            sendStartError("Non enregistré");
             return;
           }
 
           // Vérifier que l'utilisateur est autorisé (hôte)
           const meetingDoc = await db.collection("meetings").where("code", "==", code).limit(1).get();
           if (meetingDoc.empty) {
-            ws.send(JSON.stringify({ type: "meeting-error", reason: "Réunion introuvable" }));
+            sendStartError("Réunion introuvable");
             return;
           }
           const meeting = meetingDoc.docs[0].data();
           if (meeting.createdBy !== ws.userId) {
-            ws.send(JSON.stringify({ type: "meeting-error", reason: "Non autorisé (seul l'hôte peut démarrer)" }));
+            sendStartError("Non autorisé (seul l'hôte peut démarrer)");
             return;
           }
 
           const result = await meetingManager.forceStart(code, ws.userId);
 
           if (result.success) {
-            ws.send(JSON.stringify({
-              type: "meeting-joined",
-              meetingId: result.meetingId,
-              roomId: result.roomId,
-              isVideo: result.isVideo,
-              title: result.title,
-              code: result.code,
-              createdBy: result.createdBy || ws.userId,
-            }));
-            console.log(`[MEETING] meeting-force-start OK: ${result.roomId} pour ${ws.userId}`);
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({
+                type: "meeting-joined",
+                meetingId: result.meetingId,
+                roomId: result.roomId,
+                isVideo: result.isVideo,
+                title: result.title,
+                code: result.code,
+                createdBy: result.createdBy || ws.userId,
+              }));
+            }
+            console.log(`[MEETING] ${type} OK: ${result.roomId} pour ${ws.userId}`);
           } else {
-            ws.send(JSON.stringify({
-              type: "meeting-error",
-              reason: result.reason,
-            }));
+            sendStartError(result.reason);
           }
         } catch (error) {
-          console.error(`[MEETING] Erreur dans meeting-force-start :`, error);
-          ws.send(JSON.stringify({ type: "meeting-error", reason: error.message || "Erreur serveur" }));
+          console.error(`[MEETING] Erreur dans ${type} :`, error);
+          sendStartError(error.message || "Erreur serveur");
         }
         return;
       }
@@ -4480,11 +4488,15 @@ wss.on("connection", (ws) => {
       // Pourquoi : Annuler une réunion planifiée (réservé à l'hôte)
       // Retirer un visiteur de la liste d'attente lorsqu'il quitte.
       if (type === "meeting-waiting-leave") {
-        if (!ws.userId || typeof data.meetingId !== "string" || data.meetingId.length > 100) return;
-        const meetingDoc = await db.collection("meetings").doc(data.meetingId).get();
-        if (!meetingDoc.exists) return;
-        const waitingUsers = Array.isArray(meetingDoc.data().waitingUsers) ? meetingDoc.data().waitingUsers : [];
-        if (waitingUsers.includes(ws.userId)) await meetingManager._removeWaitingUser(data.meetingId, ws.userId);
+        try {
+          if (!ws.userId || typeof data.meetingId !== "string" || data.meetingId.length > 100) return;
+          const meetingDoc = await db.collection("meetings").doc(data.meetingId).get();
+          if (!meetingDoc.exists) return;
+          const waitingUsers = Array.isArray(meetingDoc.data().waitingUsers) ? meetingDoc.data().waitingUsers : [];
+          if (waitingUsers.includes(ws.userId)) await meetingManager._removeWaitingUser(data.meetingId, ws.userId);
+        } catch (error) {
+          console.error("[MEETING] Erreur dans meeting-waiting-leave :", error);
+        }
         return;
       }
 

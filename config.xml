@@ -29,7 +29,7 @@
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
-                <data android:scheme="https" android:host="app-appel.onrender.com" android:pathPrefix="/join" />
+                <data android:scheme="https" android:host="serveur-appel.onrender.com" android:pathPrefix="/join" />
             </intent-filter>
         </config-file>
     </platform>

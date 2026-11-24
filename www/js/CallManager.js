@@ -4,8 +4,8 @@
 
 class CallManager {
   // static SIGNALING_SERVER_URL = 'wss://api.furthermarket.com:8088';
-  static SIGNALING_SERVER_URL = "wss://app-appel.onrender.com";
-  static HTTP_SERVER_URL = "https://app-appel.onrender.com";
+  static SIGNALING_SERVER_URL = "wss://serveur-appel.onrender.com";
+  static HTTP_SERVER_URL = "https://serveur-appel.onrender.com";
   static RECONNECT_DELAY = 5000;
 
   static RTC_CONFIG = {
@@ -2273,7 +2273,7 @@ button, [role="button"] { cursor: pointer; }
       const urlObj = new URL(url);
       const pathParts = urlObj.pathname.split('/').filter(part => part);
 
-      // Format: callapp://join/ABC-123-XYZ ou https://app-appel.onrender.com/join/ABC-123-XYZ
+      // Format: callapp://join/ABC-123-XYZ ou https://serveur-appel.onrender.com/join/ABC-123-XYZ
       if (pathParts[0] === 'join' && pathParts[1]) {
         const code = pathParts[1];
         console.log("🔗 Code de réunion extrait:", code);
