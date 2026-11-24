@@ -64,6 +64,21 @@ Meetings.prototype.handleMeetingCreated = function(data) {
   this.meetingCreateFallbackTimeout = null;
   this.closeMeetingCreateView();
 
+  // Envoyer la musique d'attente APRÈS la création légère pour éviter 413 / coupure WS
+  const pendingTracks = this._pendingWaitingMusicTracks;
+  this._pendingWaitingMusicTracks = null;
+  const createdMeetingId = data?.meetingId || data?.meeting?.meetingId;
+  if (Array.isArray(pendingTracks) && pendingTracks.length && createdMeetingId) {
+    const isConnected = this.wsReadyState === WebSocket.OPEN || (this.ws && this.ws.readyState === WebSocket.OPEN);
+    if (isConnected) {
+      this.sendSignal({
+        type: "meeting-waiting-music-set",
+        meetingId: createdMeetingId,
+        tracks: pendingTracks.map((t) => ({ dataUrl: t.dataUrl, name: t.name })),
+      });
+    }
+  }
+
   // Réunion instantanée : on va directement à l'aperçu caméra, sans écran intermédiaire
   if (this.instantMeetingPending) {
     this.instantMeetingPending = false;
@@ -2209,6 +2224,12 @@ Meetings.prototype.createMeeting = function(title, scheduledAt, durationMin, isV
     return;
   }
 
+  // Garder les pistes audio en attente pour les envoyer APRÈS meeting-created
+  // (le payload initial de création reste < 2 Ko pour éviter 413 / coupure WS 1006).
+  this._pendingWaitingMusicTracks = Array.isArray(waitingMusicTracks) && waitingMusicTracks.length
+    ? waitingMusicTracks
+    : null;
+
   const payload = {
     title,
     description,
@@ -2217,7 +2238,6 @@ Meetings.prototype.createMeeting = function(title, scheduledAt, durationMin, isV
     isVideo: !!isVideo,
     participants: participants || [],
     accessPolicy: accessPolicy || "direct",
-    waitingMusicTracks,
   };
 
   this._meetingCreateHandled = false;
@@ -2229,9 +2249,14 @@ Meetings.prototype.createMeeting = function(title, scheduledAt, durationMin, isV
     console.log("🌐 [MEETING] Bascule création via API HTTP REST POST /api/meeting");
     this.showCallToast("Planification via HTTP en cours…");
     try {
+      const authToken = this.authToken || window.localStorage?.getItem("app_auth_token") || "";
+      const headers = { "Content-Type": "application/json" };
+      if (authToken) {
+        headers["Authorization"] = `Bearer ${authToken}`;
+      }
       const response = await fetch(`${CallManager.HTTP_SERVER_URL}/api/meeting`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers,
         body: JSON.stringify({ ...payload, createdBy: this.myId }),
       });
       const result = await response.json().catch(() => ({}));
@@ -2660,6 +2685,10 @@ Meetings.prototype.confirmCreateMeeting = async function() {
   if (musicFiles.some((file) => !/^audio\//i.test(file.type))) {
     this.showCallToast("Choisis des fichiers audio valides");
     return;
+  }
+  const MAX_MUSIC_FILE_BYTES = 5 * 1024 * 1024;
+  if (musicFiles.some((file) => file.size > MAX_MUSIC_FILE_BYTES)) {
+    this.showCallToast("⚠️ Un fichier audio dépasse 5 Mo et risque d'être ignoré lors de l'envoi.");
   }
   this.meetingCreateSubmitting = true;
   let waitingMusicTracks;

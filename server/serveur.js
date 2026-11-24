@@ -63,10 +63,8 @@ const db = getFirestore();
 
 const app = express();
 
-// Nettoie les schémas PATCH/POST REST (qui étaient cassés : req.body undefined → 500)
-app.use(express.json({ limit: "2mb" }));
-
-// Middleware CORS permissif pour wake-up Render + tests
+// Middleware CORS permissif placé AVANT express.json() pour qu'aucune erreur
+// 413/400/500 ne soit masquée par un blocage CORS côté navigateur.
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
@@ -76,6 +74,10 @@ app.use((req, res, next) => {
   }
   next();
 });
+
+// Nettoie les schémas PATCH/POST REST avec limite relevée à 15mb
+app.use(express.json({ limit: "15mb" }));
+app.use(express.urlencoded({ extended: true, limit: "15mb" }));
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
