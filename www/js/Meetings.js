@@ -125,6 +125,7 @@ Meetings.prototype.handleMeetingJoined = async function(data) {
 
   // Marquer que c'est une réunion planifiée pour empêcher la bascule automatique
   // vers l'écran 1-à-1 lorsqu'il ne reste qu'un autre participant dans la salle.
+  this.groupIsLeaving = false;
   this.groupIsMeeting = true;
   this.groupDowngradingToOneToOne = false;
   this.groupRoomId = data.roomId;
@@ -144,7 +145,10 @@ Meetings.prototype.handleMeetingJoined = async function(data) {
   // la salle live et d'envoyer le group-join. Sans cela le client se retrouve
   // avec un roster mais sans peer WebRTC réel, ce qui provoque la fausse
   // sensation "personne présente" alors qu'un participant est en attente.
-  if (!this.groupLocalStream) {
+  const hasLiveMedia = typeof this.hasLiveGroupMedia === "function"
+    ? this.hasLiveGroupMedia(this.groupIsVideo)
+    : !!(this.groupLocalStream && this.groupLocalStream.getTracks().some((t) => t.readyState === "live"));
+  if (!hasLiveMedia) {
     try {
       await this.acquireGroupMedia(this.groupIsVideo, this._mediaDeviceOptionsForMeeting());
     } catch (error) {
@@ -178,6 +182,12 @@ Meetings.prototype.handleMeetingJoined = async function(data) {
 
   // Afficher l'écran de réunion spécifique (Google Meet style)
   this.showMeetingScreen(data);
+  if (typeof this.renderGroupGrid === "function") {
+    this.renderGroupGrid();
+  }
+  if (data.meetingId) {
+    this.sendSignal({ type: "whiteboard-sync", meetingId: data.meetingId });
+  }
 };
 
 Meetings.prototype.handleMeetingReconnect = async function(data) {
@@ -189,6 +199,7 @@ Meetings.prototype.handleMeetingReconnect = async function(data) {
   this.closeMeetingWaitingView();
 
   // Marquer que c'est une réunion planifiée
+  this.groupIsLeaving = false;
   this.groupIsMeeting = true;
   this.groupDowngradingToOneToOne = false;
   this.groupRoomId = data.roomId;
@@ -204,7 +215,10 @@ Meetings.prototype.handleMeetingReconnect = async function(data) {
   this.isMeetingHost = !!(this.meetingCreatedBy && this.meetingCreatedBy === this.myId);
 
   // Acquérir les médias
-  if (!this.groupLocalStream) {
+  const hasLiveMedia = typeof this.hasLiveGroupMedia === "function"
+    ? this.hasLiveGroupMedia(this.groupIsVideo)
+    : !!(this.groupLocalStream && this.groupLocalStream.getTracks().some((t) => t.readyState === "live"));
+  if (!hasLiveMedia) {
     try {
       await this.acquireGroupMedia(this.groupIsVideo, this._mediaDeviceOptionsForMeeting());
     } catch (error) {
@@ -935,6 +949,15 @@ Meetings.prototype.handleMeetingKicked = function(data) {
     } catch (e) { console.warn("kicked cleanup:", e); }
   }
   this.closeMeetingScreen();
+  if (this.groupLocalStream) {
+    this.groupLocalStream.getTracks().forEach((track) => { try { track.stop(); } catch (e) {} });
+    this.groupLocalStream = null;
+  }
+  if (this.localStream) {
+    this.localStream.getTracks().forEach((track) => { try { track.stop(); } catch (e) {} });
+    this.localStream = null;
+  }
+  this.groupIsLeaving = false;
   this.groupIsMeeting = false;
   this.groupRoomId = null;
   this.isMeetingHost = false;
@@ -976,6 +999,15 @@ Meetings.prototype.endGroupCall = function(message) {
   } catch (e) {
     console.warn("endGroupCall cleanup:", e);
   }
+  if (this.groupLocalStream) {
+    this.groupLocalStream.getTracks().forEach((track) => { try { track.stop(); } catch (e) {} });
+    this.groupLocalStream = null;
+  }
+  if (this.localStream) {
+    this.localStream.getTracks().forEach((track) => { try { track.stop(); } catch (e) {} });
+    this.localStream = null;
+  }
+  this.groupIsLeaving = false;
   this.pendingMeetingMediaPreferences = null;
 };
 
@@ -1165,9 +1197,19 @@ Meetings.prototype.leaveMeeting = function() {
   }
   this.stopMeetingTimer?.();
   this.closeMeetingScreen();
-  // Fermer les panneaux chat/participants (sinon résidus pour la prochaine réunion)
+  // Fermer les panneaux chat/participants/tableau blanc (sinon résidus pour la prochaine réunion)
   this.meetingChat?.reset?.();
   this.meetingParticipants?.reset?.();
+  this.resetWhiteboard?.();
+  if (this.groupLocalStream) {
+    this.groupLocalStream.getTracks().forEach((track) => { try { track.stop(); } catch (e) {} });
+    this.groupLocalStream = null;
+  }
+  if (this.localStream) {
+    this.localStream.getTracks().forEach((track) => { try { track.stop(); } catch (e) {} });
+    this.localStream = null;
+  }
+  this.groupIsLeaving = false;
   this.groupIsMeeting = false;
   this.groupRoomId = null;
   this.meetingWaitingRoomId = null;
@@ -1246,6 +1288,45 @@ Meetings.prototype.showMeetingScreen = function(data) {
         <!-- Overlay réactions flottantes -->
         <div id="meeting-reaction-overlay" class="meeting-reaction-overlay" aria-hidden="true"></div>
 
+        <!-- Panneau Tableau blanc collaboratif -->
+        <div id="meeting-whiteboard-panel" class="meeting-whiteboard-panel" style="display:none;" aria-label="Tableau blanc collaboratif">
+          <div class="whiteboard-header">
+            <span><i class="fa-solid fa-chalkboard"></i> Tableau blanc</span>
+            <div class="whiteboard-header-actions">
+              ${this.isMeetingHost ? `
+                <label class="wb-perm-toggle" title="Autoriser les participants à dessiner">
+                  <input type="checkbox" id="wb-allow-draw" checked />
+                  <span>Participants</span>
+                </label>
+              ` : `<span id="wb-readonly-badge" class="wb-readonly-badge" style="display:none;">Lecture seule</span>`}
+              <button type="button" class="wb-close-btn" onclick="window.toggleMeetingWhiteboard()" aria-label="Fermer le tableau">
+                <i class="fa-solid fa-xmark"></i>
+              </button>
+            </div>
+          </div>
+          <div class="whiteboard-toolbar" id="whiteboard-toolbar">
+            <button type="button" class="wb-tool-btn active" id="wb-tool-pen" data-tool="pen" title="Crayon"><i class="fa-solid fa-pen"></i></button>
+            <button type="button" class="wb-tool-btn" id="wb-tool-eraser" data-tool="eraser" title="Gomme"><i class="fa-solid fa-eraser"></i></button>
+            <div class="wb-colors">
+              <button type="button" class="wb-color-btn active" data-color="#111827" style="background:#111827;" aria-label="Noir"></button>
+              <button type="button" class="wb-color-btn" data-color="#ef4444" style="background:#ef4444;" aria-label="Rouge"></button>
+              <button type="button" class="wb-color-btn" data-color="#3b82f6" style="background:#3b82f6;" aria-label="Bleu"></button>
+              <button type="button" class="wb-color-btn" data-color="#22c55e" style="background:#22c55e;" aria-label="Vert"></button>
+            </div>
+            <select id="wb-size" class="wb-size-select" aria-label="Épaisseur du trait">
+              <option value="2">Fin</option>
+              <option value="4" selected>Moyen</option>
+              <option value="8">Épais</option>
+              <option value="14">Large</option>
+            </select>
+            ${this.isMeetingHost ? `<button type="button" class="wb-action-btn" id="wb-clear" title="Effacer tout"><i class="fa-solid fa-trash"></i></button>` : ""}
+            <button type="button" class="wb-action-btn" id="wb-export" title="Exporter en PNG"><i class="fa-solid fa-download"></i></button>
+          </div>
+          <div class="whiteboard-canvas-wrap">
+            <canvas id="meeting-whiteboard-canvas" class="whiteboard-canvas"></canvas>
+          </div>
+        </div>
+
         <!-- Barre de contrôle (plus haute, style Meet) -->
         <div class="meeting-controls meeting-controls-raised">
           <div class="meeting-time-display" id="meeting-time-display">00:00:00</div>
@@ -1258,6 +1339,9 @@ Meetings.prototype.showMeetingScreen = function(data) {
             </button>
             <button class="meeting-control-btn" id="meeting-screen-btn" aria-label="Partager l\u2019\u00e9cran" onclick="window.toggleMeetingScreenShare()" title="Partager l'écran">
               <i class="fa-solid fa-desktop"></i>
+            </button>
+            <button class="meeting-control-btn" id="meeting-whiteboard-btn" aria-label="Tableau blanc" onclick="window.toggleMeetingWhiteboard()" title="Tableau">
+              <i class="fa-solid fa-chalkboard"></i>
             </button>
             <button class="meeting-control-btn" id="meeting-hand-btn" aria-label="Lever ou baisser la main" onclick="window.toggleMeetingHand()" title="Lever la main">
               <i class="fa-solid fa-hand"></i>
@@ -1321,6 +1405,281 @@ Meetings.prototype.showMeetingScreen = function(data) {
   }
 
   this.updateMeetingParticipantCount();
+  this._initWhiteboardCanvas();
+};
+
+// ===== TABLEAU BLANC COLLABORATIF (WHITEBOARD) =====
+
+Meetings.prototype._initWhiteboardCanvas = function() {
+  const panel = document.getElementById("meeting-whiteboard-panel");
+  const canvas = document.getElementById("meeting-whiteboard-canvas");
+  if (!panel || !canvas) return;
+
+  this.whiteboardState = this.whiteboardState || {
+    isOpen: false,
+    allowParticipantsDraw: true,
+    strokes: [],
+    tool: "pen",
+    color: "#111827",
+    size: 4,
+    drawing: false,
+    lastX: 0,
+    lastY: 0,
+  };
+
+  const resizeCanvas = () => {
+    const wrap = canvas.parentElement;
+    if (!wrap) return;
+    const rect = wrap.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return;
+    canvas.width = Math.floor(rect.width);
+    canvas.height = Math.floor(rect.height);
+    this._redrawWhiteboard();
+  };
+  this._wbResizeHandler = resizeCanvas;
+  window.addEventListener("resize", resizeCanvas);
+
+  const canDraw = () => this.isMeetingHost || !!this.whiteboardState.allowParticipantsDraw;
+
+  const getNormPos = (e) => {
+    const rect = canvas.getBoundingClientRect();
+    if (!rect.width || !rect.height) return { x: 0, y: 0 };
+    return {
+      x: Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width)),
+      y: Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height)),
+    };
+  };
+
+  canvas.addEventListener("pointerdown", (e) => {
+    if (!this.whiteboardState.isOpen || !canDraw()) return;
+    e.preventDefault();
+    canvas.setPointerCapture?.(e.pointerId);
+    const pos = getNormPos(e);
+    this.whiteboardState.drawing = true;
+    this.whiteboardState.lastX = pos.x;
+    this.whiteboardState.lastY = pos.y;
+  });
+
+  canvas.addEventListener("pointermove", (e) => {
+    if (!this.whiteboardState.drawing || !this.whiteboardState.isOpen || !canDraw()) return;
+    e.preventDefault();
+    const pos = getNormPos(e);
+    const stroke = {
+      x0: this.whiteboardState.lastX,
+      y0: this.whiteboardState.lastY,
+      x1: pos.x,
+      y1: pos.y,
+      color: this.whiteboardState.color,
+      size: this.whiteboardState.size,
+      tool: this.whiteboardState.tool,
+    };
+    this.whiteboardState.lastX = pos.x;
+    this.whiteboardState.lastY = pos.y;
+    this.whiteboardState.strokes.push(stroke);
+    this._drawWhiteboardSegment(stroke);
+
+    if (this.currentMeetingId) {
+      this.sendSignal({
+        type: "whiteboard-draw",
+        meetingId: this.currentMeetingId,
+        ...stroke,
+      });
+    }
+  });
+
+  const stopDraw = () => {
+    this.whiteboardState.drawing = false;
+  };
+  canvas.addEventListener("pointerup", stopDraw);
+  canvas.addEventListener("pointercancel", stopDraw);
+
+  const penBtn = document.getElementById("wb-tool-pen");
+  const eraserBtn = document.getElementById("wb-tool-eraser");
+  [penBtn, eraserBtn].forEach((btn) => {
+    if (!btn) return;
+    btn.addEventListener("click", () => {
+      this.whiteboardState.tool = btn.dataset.tool || "pen";
+      penBtn?.classList.toggle("active", this.whiteboardState.tool === "pen");
+      eraserBtn?.classList.toggle("active", this.whiteboardState.tool === "eraser");
+    });
+  });
+
+  panel.querySelectorAll(".wb-color-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      this.whiteboardState.color = btn.dataset.color || "#111827";
+      this.whiteboardState.tool = "pen";
+      penBtn?.classList.add("active");
+      eraserBtn?.classList.remove("active");
+      panel.querySelectorAll(".wb-color-btn").forEach((b) => b.classList.toggle("active", b === btn));
+    });
+  });
+
+  const sizeSelect = document.getElementById("wb-size");
+  if (sizeSelect) {
+    sizeSelect.addEventListener("change", () => {
+      this.whiteboardState.size = Number(sizeSelect.value) || 4;
+    });
+  }
+
+  const clearBtn = document.getElementById("wb-clear");
+  if (clearBtn) {
+    clearBtn.addEventListener("click", () => {
+      if (!this.isMeetingHost || !this.currentMeetingId) return;
+      this.whiteboardState.strokes = [];
+      this._redrawWhiteboard();
+      this.sendSignal({ type: "whiteboard-clear", meetingId: this.currentMeetingId });
+    });
+  }
+
+  const exportBtn = document.getElementById("wb-export");
+  if (exportBtn) {
+    exportBtn.addEventListener("click", () => {
+      try {
+        const link = document.createElement("a");
+        link.download = `tableau-${this.currentMeetingCode || "reunion"}.png`;
+        link.href = canvas.toDataURL("image/png");
+        link.click();
+      } catch (err) {
+        this.showCallToast("Export PNG impossible");
+      }
+    });
+  }
+
+  const allowToggle = document.getElementById("wb-allow-draw");
+  if (allowToggle) {
+    allowToggle.addEventListener("change", () => {
+      if (!this.isMeetingHost || !this.currentMeetingId) return;
+      this.whiteboardState.allowParticipantsDraw = allowToggle.checked;
+      this.sendSignal({
+        type: "whiteboard-toggle",
+        meetingId: this.currentMeetingId,
+        isOpen: this.whiteboardState.isOpen,
+        allowParticipantsDraw: allowToggle.checked,
+      });
+    });
+  }
+};
+
+Meetings.prototype._drawWhiteboardSegment = function(s) {
+  const canvas = document.getElementById("meeting-whiteboard-canvas");
+  if (!canvas || !canvas.width || !canvas.height) return;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+
+  ctx.save();
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  ctx.lineWidth = s.size || 4;
+  ctx.strokeStyle = s.tool === "eraser" ? "#ffffff" : (s.color || "#111827");
+  ctx.beginPath();
+  ctx.moveTo(s.x0 * canvas.width, s.y0 * canvas.height);
+  ctx.lineTo(s.x1 * canvas.width, s.y1 * canvas.height);
+  ctx.stroke();
+  ctx.restore();
+};
+
+Meetings.prototype._redrawWhiteboard = function() {
+  const canvas = document.getElementById("meeting-whiteboard-canvas");
+  if (!canvas || !canvas.width || !canvas.height) return;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  const strokes = this.whiteboardState?.strokes || [];
+  for (const s of strokes) {
+    this._drawWhiteboardSegment(s);
+  }
+};
+
+Meetings.prototype._applyWhiteboardUI = function() {
+  const panel = document.getElementById("meeting-whiteboard-panel");
+  const btn = document.getElementById("meeting-whiteboard-btn");
+  const badge = document.getElementById("wb-readonly-badge");
+  const toolbar = document.getElementById("whiteboard-toolbar");
+  const allowToggle = document.getElementById("wb-allow-draw");
+  const isOpen = !!this.whiteboardState?.isOpen;
+  const canDraw = this.isMeetingHost || !!this.whiteboardState?.allowParticipantsDraw;
+
+  if (panel) panel.style.display = isOpen ? "flex" : "none";
+  if (btn) btn.classList.toggle("active", isOpen);
+  if (badge) badge.style.display = canDraw ? "none" : "inline-block";
+  if (toolbar) toolbar.style.display = canDraw ? "flex" : "none";
+  if (allowToggle) allowToggle.checked = !!this.whiteboardState?.allowParticipantsDraw;
+
+  if (isOpen && this._wbResizeHandler) {
+    requestAnimationFrame(() => this._wbResizeHandler());
+  }
+};
+
+Meetings.prototype.toggleMeetingWhiteboard = function() {
+  if (!this.whiteboardState) return;
+  if (this.isMeetingHost && this.currentMeetingId) {
+    const nextOpen = !this.whiteboardState.isOpen;
+    this.whiteboardState.isOpen = nextOpen;
+    this._applyWhiteboardUI();
+    this.sendSignal({
+      type: "whiteboard-toggle",
+      meetingId: this.currentMeetingId,
+      isOpen: nextOpen,
+      allowParticipantsDraw: this.whiteboardState.allowParticipantsDraw,
+    });
+    return;
+  }
+
+  // Un participant peut masquer/afficher localement le tableau s'il est actif
+  if (!this.whiteboardState.isOpen && this.currentMeetingId) {
+    this.sendSignal({ type: "whiteboard-sync", meetingId: this.currentMeetingId });
+  } else {
+    this.whiteboardState.isOpen = false;
+    this._applyWhiteboardUI();
+  }
+};
+
+Meetings.prototype.handleWhiteboardState = function(data) {
+  if (!this.whiteboardState) this._initWhiteboardCanvas();
+  if (!this.whiteboardState) return;
+  this.whiteboardState.isOpen = !!data.isOpen;
+  this.whiteboardState.allowParticipantsDraw = data.allowParticipantsDraw !== false;
+  if (Array.isArray(data.strokes)) {
+    this.whiteboardState.strokes = data.strokes.slice();
+  }
+  this._applyWhiteboardUI();
+  this._redrawWhiteboard();
+};
+
+Meetings.prototype.handleWhiteboardDraw = function(data) {
+  if (!this.whiteboardState) return;
+  const stroke = {
+    x0: data.x0,
+    y0: data.y0,
+    x1: data.x1,
+    y1: data.y1,
+    color: data.color,
+    size: data.size,
+    tool: data.tool,
+  };
+  this.whiteboardState.strokes.push(stroke);
+  this._drawWhiteboardSegment(stroke);
+};
+
+Meetings.prototype.handleWhiteboardCleared = function() {
+  if (!this.whiteboardState) return;
+  this.whiteboardState.strokes = [];
+  this._redrawWhiteboard();
+};
+
+Meetings.prototype.resetWhiteboard = function() {
+  if (this._wbResizeHandler) {
+    window.removeEventListener("resize", this._wbResizeHandler);
+    this._wbResizeHandler = null;
+  }
+  if (this.whiteboardState) {
+    this.whiteboardState.isOpen = false;
+    this.whiteboardState.strokes = [];
+    this.whiteboardState.drawing = false;
+  }
+  const panel = document.getElementById("meeting-whiteboard-panel");
+  if (panel) panel.style.display = "none";
 };
 
 /**
@@ -1586,7 +1945,13 @@ Meetings.prototype.hostMuteParticipant = function(targetUserId, media, muted = t
  * Cette version demande confirmation pour le bouton "quitter".
  */
 Meetings.prototype.leaveMeetingWithConfirm = async function() {
-  if (await this.confirmMeetingAction("Quitter la r\u00e9union", "Voulez-vous vraiment quitter la r\u00e9union ?")) {
+  const msg = this.isMeetingHost
+    ? "Vous êtes l'hôte. Quitter mettra fin à la réunion pour tous les participants. Voulez-vous vraiment quitter ?"
+    : "Voulez-vous vraiment quitter la réunion ?";
+  if (await this.confirmMeetingAction("Quitter la réunion", msg)) {
+    if (this.isMeetingHost && this.currentMeetingId) {
+      this.sendSignal({ type: "meeting-leave", meetingId: this.currentMeetingId });
+    }
     this.leaveMeeting();
   }
 };
@@ -1635,7 +2000,11 @@ Meetings.prototype.handleMeetingList = function(data) {
 
 Meetings.prototype.handleMeetingEnded = function(data) {
   console.log("📅 [MEETING] Réunion terminée:", data.meetingId, "raison:", data.reason);
-  this.showCallToast(data.reason || "La réunion est terminée");
+  const message = data.reason === "host_left"
+    ? "L'hôte a quitté la réunion. La réunion est terminée."
+    : (data.reason || "La réunion est terminée");
+  this.showCallToast(message);
+  this.resetWhiteboard?.();
   // Purge musique d'attente + compte à rebours + salle d'attente
   this._broadcastWaitingMusicStop();
   this.closeMeetingWaitingView();
@@ -3318,9 +3687,15 @@ window.copyMeetingCode = function(code) { window.callManager.copyMeetingCode(cod
 window.closePendingRequestDialog = function() { window.callManager.closePendingRequestDialog(); };
 window.approveMeetingRequest = function(meetingId, userId) { window.callManager.approveMeetingRequest(meetingId, userId); };
 window.rejectMeetingRequest = function(meetingId, userId) { window.callManager.rejectMeetingRequest(meetingId, userId); };
-// Bouton "quitter" : quitte directement (style WhatsApp). La confirmation
-// détaillée reste disponible via leaveMeetingWithConfirm pour le Web.
-window.leaveMeeting = function() { window.callManager.leaveMeeting ? window.callManager.leaveMeeting() : window.callManager.leaveMeetingWithConfirm(); };
+// Bouton "quitter" : demande confirmation à l'hôte car son départ termine la réunion.
+window.leaveMeeting = function() {
+  if (window.callManager?.isMeetingHost && typeof window.callManager.leaveMeetingWithConfirm === "function") {
+    window.callManager.leaveMeetingWithConfirm();
+    return;
+  }
+  window.callManager.leaveMeeting ? window.callManager.leaveMeeting() : window.callManager.leaveMeetingWithConfirm();
+};
+window.toggleMeetingWhiteboard = function() { window.callManager.toggleMeetingWhiteboard?.(); };
 window.endMeetingForEveryone = function() { window.callManager.endMeetingForEveryone(); };
 window.toggleMeetingMic = function() { window.callManager.toggleMeetingMic(); };
 window.toggleMeetingCam = function() { window.callManager.toggleMeetingCam(); };

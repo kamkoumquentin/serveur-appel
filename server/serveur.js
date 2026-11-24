@@ -2375,6 +2375,90 @@ const meetingManager = new MeetingManager();
 // Musique d'attente transmise en direct aux appareils (non persistée entre redémarrages).
 const meetingWaitingMusic = new Map();
 const MAX_WAITING_MUSIC_TRANSFER_BYTES = 90 * 1024 * 1024;
+// Tableau blanc collaboratif temporaire en mémoire (indexé par meetingId)
+const meetingWhiteboards = new Map();
+const MAX_WHITEBOARD_STROKES = 2000;
+// Délai de grâce (8s) lors d'une déconnexion brutale de l'hôte
+const hostLeaveGraceTimers = new Map();
+
+function cancelHostLeaveGraceTimers(userId) {
+  if (!userId) return;
+  const suffix = `:${userId}`;
+  for (const [key, timer] of hostLeaveGraceTimers.entries()) {
+    if (key.endsWith(suffix)) {
+      clearTimeout(timer);
+      hostLeaveGraceTimers.delete(key);
+    }
+  }
+}
+
+async function endMeetingByHost(meetingId, hostId, reason = "host_left") {
+  if (!meetingId) return;
+  const graceKey = `${meetingId}:${hostId}`;
+  const existingTimer = hostLeaveGraceTimers.get(graceKey);
+  if (existingTimer) {
+    clearTimeout(existingTimer);
+    hostLeaveGraceTimers.delete(graceKey);
+  }
+
+  try {
+    const doc = await db.collection("meetings").doc(meetingId).get();
+    if (!doc.exists) return;
+    const meeting = doc.data();
+    if (meeting.status === "ended" || meeting.status === "cancelled") return;
+
+    const liveRoomId = meeting.roomId || `room_meeting_${meetingId}`;
+    const waitingRoomId = `room_waiting_${meetingId}`;
+
+    const recipients = new Set([
+      ...(Array.isArray(meeting.participants) ? meeting.participants : []),
+      ...(Array.isArray(meeting.waitingUsers) ? meeting.waitingUsers : []),
+    ]);
+
+    const liveRoom = roomManager.rooms.get(liveRoomId);
+    if (liveRoom) {
+      for (const pid of liveRoom.participants.keys()) recipients.add(pid);
+    }
+    const waitingRoom = roomManager.rooms.get(waitingRoomId);
+    if (waitingRoom) {
+      for (const pid of waitingRoom.participants.keys()) recipients.add(pid);
+    }
+
+    await db.collection("meetings").doc(meetingId).update({
+      status: "ended",
+      endedAt: Date.now(),
+      waitingUsers: [],
+    });
+
+    const payload = JSON.stringify({
+      type: "meeting-ended",
+      meetingId,
+      reason,
+    });
+    for (const pid of recipients) {
+      const u = users.get(pid);
+      if (u?.ws && u.ws.readyState === WebSocket.OPEN) {
+        u.ws.send(payload);
+      }
+    }
+
+    const waitingUsersEnd = Array.isArray(meeting.waitingUsers) ? meeting.waitingUsers.filter(Boolean) : [];
+    notifyWaitingMusicStopped(meetingId, waitingUsersEnd, hostId);
+    meetingWhiteboards.delete(meetingId);
+
+    if (liveRoom) {
+      roomManager.closeRoom(liveRoomId, reason);
+      roomManager.rooms.delete(liveRoomId);
+    }
+    if (waitingRoom) {
+      roomManager.closeRoom(waitingRoomId, reason);
+      roomManager.rooms.delete(waitingRoomId);
+    }
+    console.log(`📅 Réunion ${meetingId} terminée automatiquement (${reason})`);
+  } catch (error) {
+    console.error(`❌ Erreur endMeetingByHost(${meetingId}):`, error);
+  }
+}
 
 function notifyWaitingMusicStopped(meetingId, waitingUsers = [], hostId = null) {
   meetingWaitingMusic.delete(meetingId);
@@ -3039,6 +3123,7 @@ wss.on("connection", (ws) => {
       // 1. Enregistrement / Reconnexion de l'utilisateur
       if (type === "register-user") {
         const { authToken } = data;
+        cancelHostLeaveGraceTimers(userId);
 
         if (typeof data.displayName === "string") {
           const cleanName = data.displayName.replace(/[<>"'`]/g, "").trim().slice(0, 40);
@@ -3777,6 +3862,16 @@ wss.on("connection", (ws) => {
               reason: "Impossible de quitter",
             }),
           );
+        }
+
+        // Si l'utilisateur qui quitte volontairement est l'hôte de la réunion, terminer pour tous
+        if (String(roomId).startsWith("room_meeting_")) {
+          const meetingId = roomId.slice("room_meeting_".length);
+          const isHost = await meetingManager.isHost(meetingId, ws.userId);
+          if (isHost) {
+            await endMeetingByHost(meetingId, ws.userId, "host_left");
+            return;
+          }
         }
 
         // Notifier les autres participants du départ (pour Meeting)
@@ -4802,6 +4897,140 @@ wss.on("connection", (ws) => {
         return;
       }
 
+      if (type === "meeting-leave") {
+        try {
+          const meetingId = typeof data.meetingId === "string" ? data.meetingId : "";
+          if (!ws.userId || !meetingId) return;
+          const isHost = await meetingManager.isHost(meetingId, ws.userId);
+          if (isHost) {
+            await endMeetingByHost(meetingId, ws.userId, "host_left");
+          }
+        } catch (error) {
+          console.error("[MEETING] Erreur meeting-leave:", error);
+        }
+        return;
+      }
+
+      // ===== TABLEAU BLANC COLLABORATIF (WHITEBOARD) =====
+      if (
+        type === "whiteboard-toggle" ||
+        type === "whiteboard-draw" ||
+        type === "whiteboard-clear" ||
+        type === "whiteboard-sync"
+      ) {
+        try {
+          const meetingId = typeof data.meetingId === "string" ? data.meetingId.trim() : "";
+          if (!ws.userId || !meetingId || meetingId.length > 100) return;
+
+          const liveRoomId = `room_meeting_${meetingId}`;
+          const room = roomManager.rooms.get(liveRoomId);
+          const doc = await db.collection("meetings").doc(meetingId).get();
+          if (!doc.exists) return;
+          const meeting = doc.data();
+
+          const isHost = meeting.createdBy === ws.userId;
+          const isCoHost = Array.isArray(meeting.coHosts) && meeting.coHosts.includes(ws.userId);
+          const inRoom = !!(room && room.participants.has(ws.userId));
+          const isListed = Array.isArray(meeting.participants) && meeting.participants.includes(ws.userId);
+          if (!inRoom && !isHost && !isCoHost && !isListed) {
+            ws.send(JSON.stringify({ type: "meeting-error", reason: "Accès tableau blanc non autorisé" }));
+            return;
+          }
+
+          if (!meetingWhiteboards.has(meetingId)) {
+            meetingWhiteboards.set(meetingId, {
+              isOpen: false,
+              allowParticipantsDraw: true,
+              strokes: [],
+            });
+          }
+          const wb = meetingWhiteboards.get(meetingId);
+
+          const broadcastToMeeting = (payloadObj, excludeUserId = null) => {
+            if (!room) return;
+            const msg = JSON.stringify(payloadObj);
+            for (const [pid] of room.participants) {
+              if (excludeUserId && pid === excludeUserId) continue;
+              const u = users.get(pid);
+              if (u?.ws && u.ws.readyState === WebSocket.OPEN) {
+                u.ws.send(msg);
+              }
+            }
+          };
+
+          if (type === "whiteboard-sync") {
+            ws.send(JSON.stringify({
+              type: "whiteboard-state",
+              meetingId,
+              isOpen: wb.isOpen,
+              allowParticipantsDraw: wb.allowParticipantsDraw,
+              strokes: wb.strokes,
+            }));
+            return;
+          }
+
+          if (type === "whiteboard-toggle") {
+            if (!isHost && !isCoHost) {
+              ws.send(JSON.stringify({ type: "meeting-error", reason: "Seul l'hôte peut ouvrir/fermer le tableau" }));
+              return;
+            }
+            if (typeof data.isOpen === "boolean") wb.isOpen = data.isOpen;
+            if (typeof data.allowParticipantsDraw === "boolean") wb.allowParticipantsDraw = data.allowParticipantsDraw;
+            broadcastToMeeting({
+              type: "whiteboard-state",
+              meetingId,
+              isOpen: wb.isOpen,
+              allowParticipantsDraw: wb.allowParticipantsDraw,
+              strokes: wb.strokes,
+            });
+            return;
+          }
+
+          if (type === "whiteboard-clear") {
+            if (!isHost && !isCoHost) {
+              ws.send(JSON.stringify({ type: "meeting-error", reason: "Seul l'hôte peut effacer le tableau" }));
+              return;
+            }
+            wb.strokes = [];
+            broadcastToMeeting({
+              type: "whiteboard-cleared",
+              meetingId,
+              by: ws.userId,
+            });
+            return;
+          }
+
+          if (type === "whiteboard-draw") {
+            if (!wb.isOpen) return;
+            if (!isHost && !isCoHost && !wb.allowParticipantsDraw) return;
+            const clamp01 = (v) => Math.max(0, Math.min(1, Number(v) || 0));
+            const stroke = {
+              x0: clamp01(data.x0),
+              y0: clamp01(data.y0),
+              x1: clamp01(data.x1),
+              y1: clamp01(data.y1),
+              color: typeof data.color === "string" ? data.color.slice(0, 20) : "#111827",
+              size: Math.max(1, Math.min(32, Number(data.size) || 3)),
+              tool: data.tool === "eraser" ? "eraser" : "pen",
+            };
+            if (wb.strokes.length >= MAX_WHITEBOARD_STROKES) {
+              wb.strokes.shift();
+            }
+            wb.strokes.push(stroke);
+            broadcastToMeeting({
+              type: "whiteboard-draw",
+              meetingId,
+              from: ws.userId,
+              ...stroke,
+            }, ws.userId);
+            return;
+          }
+        } catch (error) {
+          console.error("[WHITEBOARD] Erreur:", error);
+        }
+        return;
+      }
+
       // 19. Lister les réunions d'un utilisateur
       // Envoyé par : Utilisateur -> Reçu par : Utilisateur (liste)
       // Pourquoi : Récupérer les réunions à venir et passées
@@ -4862,6 +5091,28 @@ wss.on("connection", (ws) => {
         // =========================================================
         // APPEL DE GROUPE — Nettoyage des salles à la déconnexion
         // =========================================================
+        // Si l'utilisateur déconnecté est hôte d'une réunion live, lancer un délai de grâce de 8s
+        for (const [roomId, room] of roomManager.rooms.entries()) {
+          if (String(roomId).startsWith("room_meeting_") && room.participants.has(ws.userId)) {
+            const meetingId = roomId.slice("room_meeting_".length);
+            const disconnectedUserId = ws.userId;
+            meetingManager.isHost(meetingId, disconnectedUserId).then((isHost) => {
+              if (!isHost) return;
+              const graceKey = `${meetingId}:${disconnectedUserId}`;
+              if (hostLeaveGraceTimers.has(graceKey)) return;
+              const timer = setTimeout(async () => {
+                hostLeaveGraceTimers.delete(graceKey);
+                const current = users.get(disconnectedUserId);
+                if (current?.ws && current.ws.readyState === WebSocket.OPEN) {
+                  return; // L'hôte s'est reconnecté entre-temps
+                }
+                await endMeetingByHost(meetingId, disconnectedUserId, "host_left");
+              }, 8000);
+              hostLeaveGraceTimers.set(graceKey, timer);
+            }).catch(() => {});
+          }
+        }
+
         // Marquer l'utilisateur comme LEFT dans toutes ses salles
         roomManager.markLeftInAllRooms(ws.userId);
       }

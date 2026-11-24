@@ -3320,3 +3320,152 @@ body.meeting-ui-active .meeting-participants-panel .participant-action-btn {
   font: inherit;
   cursor: pointer;
 }
+
+/* ===== TABLEAU BLANC COLLABORATIF (WHITEBOARD) ===== */
+.meeting-whiteboard-panel {
+  position: absolute;
+  inset: 58px 12px 86px 12px;
+  z-index: 45;
+  display: flex;
+  flex-direction: column;
+  background: #ffffff;
+  border-radius: 14px;
+  box-shadow: 0 14px 40px rgba(0, 0, 0, 0.45);
+  overflow: hidden;
+}
+
+.whiteboard-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  background: #1f2937;
+  color: #f9fafb;
+  font-size: 14px;
+  font-weight: 600;
+  gap: 8px;
+}
+
+.whiteboard-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.wb-perm-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 500;
+  color: #d1d5db;
+  cursor: pointer;
+}
+
+.wb-readonly-badge {
+  font-size: 11px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: rgba(239, 68, 68, 0.2);
+  color: #fca5a5;
+}
+
+.wb-close-btn {
+  background: rgba(255, 255, 255, 0.12);
+  border: none;
+  color: #fff;
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.whiteboard-toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 8px 12px;
+  background: #f3f4f6;
+  border-bottom: 1px solid #e5e7eb;
+}
+
+.wb-tool-btn,
+.wb-action-btn {
+  width: 34px;
+  height: 34px;
+  border-radius: 8px;
+  border: 1px solid #d1d5db;
+  background: #ffffff;
+  color: #1f2937;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.wb-tool-btn.active {
+  background: #00a884;
+  border-color: #00a884;
+  color: #ffffff;
+}
+
+.wb-colors {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 4px;
+}
+
+.wb-color-btn {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  border: 2px solid transparent;
+  cursor: pointer;
+}
+
+.wb-color-btn.active {
+  border-color: #ffffff;
+  box-shadow: 0 0 0 2px #00a884;
+}
+
+.wb-size-select {
+  height: 34px;
+  border-radius: 8px;
+  border: 1px solid #d1d5db;
+  background: #ffffff;
+  color: #111827;
+  padding: 0 8px;
+  font-size: 13px;
+}
+
+.whiteboard-canvas-wrap {
+  position: relative;
+  flex: 1;
+  width: 100%;
+  min-height: 0;
+  background: #ffffff;
+}
+
+.whiteboard-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  touch-action: none;
+  cursor: crosshair;
+}
+
+@media (max-width: 640px) {
+  .meeting-whiteboard-panel {
+    inset: 52px 6px 80px 6px;
+    border-radius: 10px;
+  }
+  .whiteboard-toolbar {
+    gap: 6px;
+    padding: 6px 8px;
+  }
+}

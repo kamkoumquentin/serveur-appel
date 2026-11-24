@@ -8,8 +8,8 @@
 
 class CallApp {                                                                                                                                                  
   constructor(containerId) {
-    this.SIGNALING_SERVER_URL = "wss://node-b44u.onrender.com";
-    this.HTTP_SERVER_URL = "https://node-b44u.onrender.com";
+    this.SIGNALING_SERVER_URL = "wss://serveur-appel.onrender.com";
+    this.HTTP_SERVER_URL = "https://serveur-appel.onrender.com";
     this.RECONNECT_DELAY = 5000;
     this.rtcConfig = {
       iceServers: [

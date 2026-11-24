@@ -3178,6 +3178,24 @@ button, [role="button"] { cursor: pointer; }
         }
         break;
 
+      case "whiteboard-state":
+        if (window.callManager && window.callManager.handleWhiteboardState) {
+          window.callManager.handleWhiteboardState(data);
+        }
+        break;
+
+      case "whiteboard-draw":
+        if (window.callManager && window.callManager.handleWhiteboardDraw) {
+          window.callManager.handleWhiteboardDraw(data);
+        }
+        break;
+
+      case "whiteboard-cleared":
+        if (window.callManager && window.callManager.handleWhiteboardCleared) {
+          window.callManager.handleWhiteboardCleared(data);
+        }
+        break;
+
       case "meeting-kicked":
         if (window.callManager && window.callManager.handleMeetingKicked) {
           window.callManager.handleMeetingKicked(data);
@@ -7052,10 +7070,35 @@ showLocalStorageOnScreen = () => {
 
   // Ouvre le micro (et la caméra si appel vidéo). Résolution volontairement
   // modeste (640x480, 24 fps) : en maillage, chaque flux est envoyé N-1 fois.
+  // Vérifie si groupLocalStream existe et possède des pistes actives (non "ended").
+  hasLiveGroupMedia = (needVideo = false) => {
+    const s = this.groupLocalStream;
+    if (!s) return false;
+    const hasLiveAudio = s.getAudioTracks().some((t) => t.readyState === "live");
+    if (!hasLiveAudio) return false;
+    if (needVideo) {
+      return s.getVideoTracks().some((t) => t.readyState === "live");
+    }
+    return true;
+  };
+
   // `options` (optionnel, module Meeting) : { cameraDeviceId, microphoneDeviceId }
   // permet d'ouvrir les périphériques choisis dans l'écran de prévisualisation.
   // Sans options, le comportement historique (facingMode "user") est conservé.
   acquireGroupMedia = async (video, options = {}) => {
+    this.groupIsLeaving = false;
+
+    // Libérer proprement un éventuel flux précédent avant d'en ouvrir un nouveau
+    if (this.groupLocalStream) {
+      this.groupLocalStream.getTracks().forEach((t) => {
+        try { t.stop(); } catch (e) {}
+      });
+      this.groupLocalStream = null;
+    }
+    if (this.localStream && this.localStream !== this.groupLocalStream) {
+      this.localStream = null;
+    }
+
     if (this.isIOS()) {
       await this.ensureMediaAuthorizedIOS();
     }
@@ -8176,8 +8219,31 @@ showLocalStorageOnScreen = () => {
     // Si l'appel a démarré en audio, il doit rester en audio
     // L'utilisateur peut activer la vidéo manuellement via le bouton caméra
 
+    // Si une ancienne connexion existe pour ce pair (ex: reconnexion rapide après départ),
+    // vérifier si c'est une nouvelle session SDP ou une connexion morte, et la remplacer proprement.
+    if (existingPeer) {
+      const connState = this.isIOS()
+        ? existingPeer.pc.iceConnectionState
+        : (existingPeer.pc.connectionState || existingPeer.pc.iceConnectionState);
+      const isDeadPeer = ["closed", "failed", "disconnected"].includes(connState);
+      const getSdpSessionId = (sdpStr) => {
+        const m = typeof sdpStr === "string" ? sdpStr.match(/^o=\S+\s+(\S+)/m) : null;
+        return m ? m[1] : null;
+      };
+      const prevSessionId = getSdpSessionId(existingPeer.pc.remoteDescription?.sdp);
+      const nextSessionId = getSdpSessionId(sdp?.sdp);
+      const isNewPeerSession = !!(prevSessionId && nextSessionId && prevSessionId !== nextSessionId);
+
+      if (isDeadPeer || isNewPeerSession) {
+        console.log(`🔄 [GROUPE] Remplacement de l'ancien pair ${from} (state=${connState}, newSession=${isNewPeerSession})`);
+        this.closeGroupPeer(from);
+      }
+    }
+
+    const activePeer = this.groupPeers.get(from);
+
     // Si pas de connexion existante : nouvelle connexion
-    if (!existingPeer) {
+    if (!activePeer) {
       console.log(`🔗 [GROUPE] Nouvelle connexion avec ${from}`);
       // Création synchrone : les candidats ICE qui suivent seront mis en file d'attente.
       const peer = this.createGroupPeer(from);
@@ -8207,20 +8273,20 @@ showLocalStorageOnScreen = () => {
     // Renégociation : connexion existe déjà (ajout de piste vidéo par exemple)
     console.log(`🔄 [GROUPE] Renégociation reçue de ${from}`);
     try {
-      await existingPeer.pc.setRemoteDescription(new RTCSessionDescription(sdp));
-      existingPeer.remoteSet = true;
-      await this.flushGroupCandidates(existingPeer);
+      await activePeer.pc.setRemoteDescription(new RTCSessionDescription(sdp));
+      activePeer.remoteSet = true;
+      await this.flushGroupCandidates(activePeer);
 
-      const answer = await existingPeer.pc.createAnswer({
+      const answer = await activePeer.pc.createAnswer({
         offerToReceiveAudio: true,
         offerToReceiveVideo: true, // TOUJOURS accepter vidéo
       });
-      await existingPeer.pc.setLocalDescription(answer);
+      await activePeer.pc.setLocalDescription(answer);
       this.sendGroupSignal(from, {
         kind: "answer",
         sdp: { type: answer.type, sdp: answer.sdp },
       });
-      this.capGroupVideoBitrate(existingPeer.pc);
+      this.capGroupVideoBitrate(activePeer.pc);
 
       console.log(`✅ [GROUPE] Renégociation réussie avec ${from}`);
     } catch (error) {
@@ -8348,14 +8414,29 @@ showLocalStorageOnScreen = () => {
       peer.stream = event.streams[0];
       console.log(`✅ [GROUPE] Stream attaché pour ${peerId} - audio: ${peer.stream.getAudioTracks().length}, video: ${peer.stream.getVideoTracks().length}`);
     } else {
-      if (!peer.stream) peer.stream = new MediaStream();
-      peer.stream.addTrack(event.track);
-      console.log(`✅ [GROUPE] Track ajouté au stream existant pour ${peerId}`);
+      const existingTracks = peer.stream
+        ? peer.stream.getTracks().filter((t) => t.id !== event.track.id && t.readyState !== "ended")
+        : [];
+      peer.stream = new MediaStream([...existingTracks, event.track]);
+      console.log(`✅ [GROUPE] Track ajouté au stream pour ${peerId}`);
     }
 
     // Le son passe par un <audio> dédié ; l'image par le <video> (muet) de la tuile.
     if (event.track.kind === "audio") this.attachGroupAudio(peerId, peer);
     this.updateGroupTile(peerId);
+
+    // Force la réassignation/lecture sur la balise <video> si le track vidéo vient d'arriver
+    if (event.track.kind === "video") {
+      const tile = this.groupTiles.get(peerId);
+      const video = tile ? tile.querySelector("video") : null;
+      if (video && peer.stream) {
+        video.muted = true;
+        if (video.srcObject !== peer.stream) {
+          video.srcObject = peer.stream;
+        }
+        video.play().catch(() => {});
+      }
+    }
   };
 
   // Branche le son d'un participant sur un élément <audio> caché.
@@ -8458,12 +8539,23 @@ showLocalStorageOnScreen = () => {
       peer.pc.close();
     } catch (e) {}
 
+    peer.pendingCandidates = [];
+    peer.remoteSet = false;
+    peer.stream = null;
+
+    const tile = this.groupTiles.get(peerId);
+    if (tile) {
+      const v = tile.querySelector("video");
+      if (v) v.srcObject = null;
+    }
+
     if (peer.audioEl) {
       try {
         peer.audioEl.pause();
       } catch (e) {}
       peer.audioEl.srcObject = null;
       peer.audioEl.remove();
+      peer.audioEl = null;
     }
     this.groupAnalysers.delete(peerId);
     // NE PAS appeler updateGroupTile ici : la tuile sera supprimée par renderGroupGrid()
@@ -8659,7 +8751,7 @@ showLocalStorageOnScreen = () => {
     const micMuted = isSelf ? this.groupIsMuted : !!remoteState.micMuted;
     const camOff = isSelf ? this.groupIsCamOff : !!remoteState.camOff;
     const screenSharing = isSelf ? this.isScreenSharing : !!remoteState.screenSharing;
-    const hasVideoTrack = !!stream && stream.getVideoTracks().length > 0;
+    const hasVideoTrack = !!stream && stream.getVideoTracks().some((t) => t.readyState !== "ended");
     // Afficher la vidéo si : JOINED + piste vidéo présente + caméra non coupée
     // Indépendamment de groupIsVideo (pour permettre réception vidéo même si appel démarré en audio)
     // Un participant qui partage son écran est toujours affiché (même caméra coupée) : sa piste porte l'écran.
@@ -9018,9 +9110,22 @@ showLocalStorageOnScreen = () => {
     this.closeAllGroupPeers();
 
     if (this.groupLocalStream) {
-      this.groupLocalStream.getTracks().forEach((t) => t.stop());
+      this.groupLocalStream.getTracks().forEach((t) => {
+        try { t.stop(); } catch (e) {}
+      });
       this.groupLocalStream = null;
     }
+    if (this.localStream) {
+      this.localStream.getTracks().forEach((t) => {
+        try { t.stop(); } catch (e) {}
+      });
+      this.localStream = null;
+    }
+    if (this._groupScreenTrack) {
+      try { this._groupScreenTrack.stop(); } catch (e) {}
+      this._groupScreenTrack = null;
+    }
+    this.isScreenSharing = false;
 
     // Grille et tuiles
     this.groupTiles.forEach((tile) => {
@@ -9058,6 +9163,7 @@ showLocalStorageOnScreen = () => {
     this.groupEverHadPeer = false;
     this.groupIsMeeting = false;
     this.groupAcceptInProgress = false;
+    this.groupIsLeaving = false;
     this._groupSwitching = false;
     this.stopVibration();
   };
