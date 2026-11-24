@@ -239,8 +239,21 @@ Meetings.prototype.handleMeetingWaiting = async function(data) {
   console.log("📅 [MEETING] Réunion en attente, temps restant:", data.waitTimeMin, "min");
 
   // Ne PAS écraser l'écran live si on est déjà dans la réunion
-  if (this.groupIsMeeting && this.groupRoomId) {
+  if (this.groupIsMeeting && this.groupRoomId && !this.meetingWaitingRoomId) {
     console.log("📅 [MEETING] Déjà en réunion live, on ignore meeting-waiting");
+    return;
+  }
+
+  // Si la réunion est déjà live/active et non verrouillée, ne jamais forcer la salle d'attente
+  const current = window.meetingService?.currentMeeting;
+  const serverReportsLive = data.status === "live" || data.status === "active";
+  const currentIsLive = current && (current.status === "live" || current.status === "active");
+  const isLocked = !!(data.locked || data.lockMeeting || data.alwaysWaitingRoom || current?.lockMeeting || current?.alwaysWaitingRoom);
+  if ((serverReportsLive || currentIsLive) && !isLocked) {
+    console.log("📅 [MEETING] Réunion déjà live et non verrouillée — pas de salle d'attente");
+    if (data.roomId) {
+      await this.handleMeetingJoined(data);
+    }
     return;
   }
 

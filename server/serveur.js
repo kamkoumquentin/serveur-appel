@@ -1541,15 +1541,35 @@ class MeetingManager {
     // Lire la politique d'accès
     const meetingSnap = await db.collection("meetings").doc(meetingId).get();
     const meetingData = meetingSnap.exists ? meetingSnap.data() : {};
+    const isLocked = !!(meetingData.lockMeeting || meetingData.alwaysWaitingRoom);
+    const approvedUsers = Array.isArray(meetingData.approvedUsers) ? meetingData.approvedUsers : [];
+    const participantsList = Array.isArray(meetingData.participants) ? meetingData.participants : [];
+    const coHosts = Array.isArray(meetingData.coHosts) ? meetingData.coHosts : [];
     const needsApproval = meetingData.accessPolicy === "approval";
+
+    // Inclure également les utilisateurs présents en RAM dans room_waiting_<meetingId>
+    const waitingRoomId = `room_waiting_${meetingId}`;
+    const waitingRoomInRam = roomManager.rooms.get(waitingRoomId);
+    const mergedWaitingUsers = new Set(waitingUsers);
+    if (waitingRoomInRam) {
+      for (const ramUserId of waitingRoomInRam.participants.keys()) {
+        if (ramUserId) mergedWaitingUsers.add(ramUserId);
+      }
+    }
 
     // Préparer la map des notifications pour Firestore
     const notifiedUsers = {};
-    for (const waitingUserId of waitingUsers) {
+    for (const waitingUserId of mergedWaitingUsers) {
       if (excludeUserId && waitingUserId === excludeUserId) continue;
 
-      // Mode approbation : ne PAS auto-joindre — demander l'accord de l'hôte
-      if (needsApproval) {
+      const isPrivilegedOrApproved =
+        waitingUserId === meetingData.createdBy ||
+        coHosts.includes(waitingUserId) ||
+        approvedUsers.includes(waitingUserId) ||
+        participantsList.includes(waitingUserId);
+
+      // Mode approbation : demander l'accord de l'hôte uniquement si non déjà approuvé/participant
+      if (needsApproval && !isPrivilegedOrApproved) {
         await this._addPendingRequest(meetingId, waitingUserId);
         await this._notifyHostOfPendingRequest(meetingId, waitingUserId, meetingData.createdBy || excludeUserId, title);
         const user = users.get(waitingUserId);
@@ -1564,12 +1584,9 @@ class MeetingManager {
         continue;
       }
 
-      // Mode direct : rejoindre immédiatement la salle live
+      // Basculer immédiatement de la salle d'attente vers la salle live
       if (room) {
-        // Leave this meeting's waiting room before adding the participant live.
-        const waitingRoomId = `room_waiting_${meetingId}`;
-        const waitingRoom = roomManager.rooms.get(waitingRoomId);
-        if (waitingRoom?.participants.has(waitingUserId)) {
+        if (waitingRoomInRam?.participants.has(waitingUserId)) {
           roomManager.leave(waitingRoomId, waitingUserId);
         }
         roomManager.join(roomId, waitingUserId);
@@ -1597,6 +1614,11 @@ class MeetingManager {
       } else {
         notifiedUsers[waitingUserId] = false;
       }
+    }
+
+    // Nettoyer la salle d'attente en RAM si elle est désormais vide
+    if (waitingRoomInRam && waitingRoomInRam.participants.size === 0) {
+      roomManager.rooms.delete(waitingRoomId);
     }
 
     // Mettre à jour Firestore avec le statut de notification
@@ -1646,17 +1668,22 @@ class MeetingManager {
       return { success: false, reason: "Réunion terminée" };
     }
 
-    if (meeting.status === "live" && meeting.roomId) {
-      // Déjà live, retourner la salle existante
+    if ((meeting.status === "live" || meeting.status === "active") && meeting.roomId) {
+      // Déjà live, s'assurer que la salle existe en RAM et basculer les éventuels retardataires en salle d'attente
+      let room = roomManager.rooms.get(meeting.roomId);
+      if (!room) {
+        room = roomManager.createMeetingRoom(meeting.id, meeting.isVideo, meeting.endsAt);
+      }
+      roomManager.join(room.roomId, userId);
+      await this._notifyWaitingUsersStarted(meeting.id, room.roomId, meeting.title, meeting.isVideo, userId);
       return {
         success: true,
         meetingId: meeting.id,
-        roomId: meeting.roomId,
+        roomId: room.roomId,
         isVideo: meeting.isVideo,
         title: meeting.title,
         code: meeting.code,
         createdBy: meeting.createdBy,
-        
       };
     }
 
@@ -1764,9 +1791,15 @@ class MeetingManager {
     console.log(`📅 [MEETING] - isCreator: ${meeting.createdBy === userId}`);
 
     const isCreator = meeting.createdBy === userId;
-    const canStartEarly = isCreator && now < meetingStart;
+    const coHosts = Array.isArray(meeting.coHosts) ? meeting.coHosts : [];
+    const isCoHost = coHosts.includes(userId);
+    const canStartEarly = (isCreator || isCoHost) && now < meetingStart;
     const approvedUsers = Array.isArray(meeting.approvedUsers) ? meeting.approvedUsers : [];
     const isApproved = approvedUsers.includes(userId);
+    const participantsList = Array.isArray(meeting.participants) ? meeting.participants : [];
+    const isParticipant = participantsList.includes(userId);
+    const isLive = meeting.status === "live" || meeting.status === "active";
+    const isLocked = !!(meeting.lockMeeting || meeting.alwaysWaitingRoom);
 
     // Trop tard : réunion expirée
     if (now > meeting.endsAt) {
@@ -1774,41 +1807,56 @@ class MeetingManager {
       return { success: false, reason: "Réunion expirée" };
     }
 
-    // Politique d'approbation : TOUJOURS avant la salle d'attente / join live
-    // (sauf hôte et utilisateurs déjà approuvés)
-    if (meeting.accessPolicy === "approval" && !isCreator && !isApproved) {
-      await this._addPendingRequest(meeting.id, userId);
-      await this._notifyHostOfPendingRequest(meeting.id, userId, meeting.createdBy, meeting.title);
-      console.log(`📅 [MEETING] - Demande d'approbation pour ${userId}`);
-      return {
-        success: false,
-        status: "pending_approval",
-        reason: "En attente d'approbation de l'hôte",
-        meetingId: meeting.id,
-        title: meeting.title,
-      };
-    }
+    // Règle d'admission stricte :
+    // 1. Entrée directe si hôte/co-hôte, déjà approuvé/participant, ou réunion déjà live non verrouillée.
+    // 2. Salle d'attente / approbation uniquement si réunion pas encore démarrée OU verrouillée par l'hôte.
+    const canEnterDirectly =
+      isCreator ||
+      isCoHost ||
+      isApproved ||
+      isParticipant ||
+      (isLive && !isLocked);
 
-    // TROP TÔT (mode direct uniquement, ou déjà approuvé) : salle d'attente
-    if (now < meetingStart && !isCreator) {
-      const waitTimeMs = meetingStart - now;
+    if (!canEnterDirectly) {
+      // Politique d'approbation manuelle par l'hôte
+      if (meeting.accessPolicy === "approval") {
+        await this._addPendingRequest(meeting.id, userId);
+        await this._notifyHostOfPendingRequest(meeting.id, userId, meeting.createdBy, meeting.title);
+        console.log(`📅 [MEETING] - Demande d'approbation pour ${userId}`);
+        return {
+          success: false,
+          status: "pending_approval",
+          reason: "En attente d'approbation de l'hôte",
+          meetingId: meeting.id,
+          title: meeting.title,
+        };
+      }
+
+      // Salle d'attente (réunion pas encore démarrée ou verrouillée)
+      const waitTimeMs = Math.max(0, meetingStart - now);
       const waitTimeMin = Math.ceil(waitTimeMs / 60000);
       await this._addWaitingUser(meeting.id, userId);
-      // Salle temporaire r?serv?e aux visiteurs; son identifiant n'est jamais
-      // transmis ? l'h?te, qui ne peut donc pas voir leurs flux vid?o.
       const waitingRoomId = `room_waiting_${meeting.id}`;
       if (!roomManager.rooms.has(waitingRoomId)) {
-        roomManager.rooms.set(waitingRoomId, { roomId: waitingRoomId, creatorId: null, isVideo: meeting.isVideo, isMeeting: true, isWaitingRoom: true, createdAt: now, endsAt: meeting.endsAt, participants: new Map() });
+        roomManager.rooms.set(waitingRoomId, {
+          roomId: waitingRoomId,
+          creatorId: null,
+          isVideo: meeting.isVideo,
+          isMeeting: true,
+          isWaitingRoom: true,
+          createdAt: now,
+          endsAt: meeting.endsAt,
+          participants: new Map(),
+        });
       }
-      console.log(`📅 [MEETING] - En attente de démarrage : ${waitTimeMin}min restantes`);
+      console.log(`📅 [MEETING] - En attente (${isLocked ? "verrouillée" : `${waitTimeMin}min restantes`})`);
       return {
         success: false,
         status: "waiting",
-        reason: "Réunion pas encore commencée",
+        reason: isLocked ? "Réunion verrouillée par l'hôte" : "Réunion pas encore commencée",
         waitTimeMs,
         waitTimeMin,
         scheduledAt: meeting.scheduledAt,
-        code: meeting.code,
         meetingId: meeting.id,
         code: meeting.code,
         createdBy: meeting.createdBy,
@@ -1818,12 +1866,12 @@ class MeetingManager {
         waitingRoomId,
         isVideo: meeting.isVideo,
         title: meeting.title,
-        createdBy: meeting.createdBy,
+        locked: isLocked,
       };
     }
 
-    // Dans la fenêtre d'accès : ouvrir ou utiliser la salle live
-    if (meeting.status === "scheduled") {
+    // Dans la fenêtre d'accès ou entrée directe autorisée : ouvrir ou utiliser la salle live
+    if (meeting.status === "scheduled" || meeting.status === "waiting") {
       // Si le créateur démarre tôt, recalculer endsAt
       let finalEndsAt = meeting.endsAt;
       if (canStartEarly) {
@@ -1895,22 +1943,29 @@ class MeetingManager {
     }
 
     // Status déjà live : vérifier si la salle existe en RAM
-    if (meeting.status === "live" && meeting.roomId) {
+    if (isLive) {
       // Vérifier si endsAt est dépassé
       if (now > meeting.endsAt) {
         await this._updateStatus(meeting.id, "ended");
         return { success: false, reason: "Réunion expirée" };
       }
-      
-      let room = roomManager.rooms.get(meeting.roomId);
-      
+
+      const liveRoomId = meeting.roomId || `room_meeting_${meeting.id}`;
+      let room = roomManager.rooms.get(liveRoomId);
+
       // Si la salle n'existe pas en RAM (redémarrage serveur), la recréer
       if (!room) {
-        console.log(`📅 Salle ${meeting.roomId} introuvable en RAM, recréation...`);
+        console.log(`📅 Salle ${liveRoomId} introuvable en RAM, recréation...`);
         room = roomManager.createMeetingRoom(meeting.id, meeting.isVideo, meeting.endsAt);
-        // roomId est déjà dans Firestore, pas besoin de mettre à jour
       }
-      
+
+      // S'assurer que le participant quitte une éventuelle salle d'attente
+      const waitingRoomId = `room_waiting_${meeting.id}`;
+      const waitingRoom = roomManager.rooms.get(waitingRoomId);
+      if (waitingRoom?.participants.has(userId)) {
+        roomManager.leave(waitingRoomId, userId);
+      }
+
       return {
         success: true,
         meetingId: meeting.id,
