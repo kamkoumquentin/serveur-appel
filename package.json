@@ -15,7 +15,7 @@
   "license": "Apache-2.0",
   "dependencies": {
     "express": "^4.18.2",
-    "firebase-admin": "^11.11.0",
+    "firebase-admin": "^14.5.1",
     "livekit-server-sdk": "^2.20.1",
     "ws": "^8.14.2"
   },
@@ -23,7 +23,7 @@
     "@havesource/cordova-plugin-push": "^7.0.0",
     "cordova-android": "^15.1.0",
     "cordova-browser": "^7.0.0",
-    "cordova-ios": "^8.1.1",
+    "cordova-ios": "^8.2.0",
     "cordova-plugin-advanced-websocket": "^1.1.8",
     "cordova-plugin-android-permissions": "^1.1.5",
     "cordova-plugin-audioroute": "^0.1.2",
