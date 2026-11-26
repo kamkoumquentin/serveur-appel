@@ -29,7 +29,7 @@
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
-                <data android:scheme="https" android:host="serveur-appel.onrender.com" android:pathPrefix="/join" />
+                <data android:scheme="https" android:host="app-appel.onrender.com" android:pathPrefix="/join" />
             </intent-filter>
         </config-file>
     </platform>
@@ -59,6 +59,8 @@
 
     <!-- 2. CONFIGURATION SPÉCIFIQUE ANDROID -->
     <platform name="android">
+        <!-- TEMPORAIRE DEV LOCAL (HTTP 192.168.1.222:3000) : retirer avant build prod HTTPS -->
+        <preference name="scheme" value="http" />
 
         <!-- CONFIGURATION google pour les notification  -->
         <resource-file src="google-services.json" target="app/google-services.json" />

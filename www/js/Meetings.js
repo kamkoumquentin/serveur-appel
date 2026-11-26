@@ -41,6 +41,86 @@ Object.setPrototypeOf(window.callManager, Meetings.prototype);
 // ===== HANDLERS DES MESSAGES SERVEUR (réunions) =====
 // Ces méthodes sont ajoutées à Meetings.prototype
 
+// ===== ÉTAT MEETING CENTRALISÉ =====
+// Machine à états : idle → create → preview → waiting → (approval) → live → ended
+// Source de vérité unique : this.meetingState. Les vues restent gérées par leurs
+// close*View existantes ; ici on centralise uniquement les DONNÉES et les TIMERS.
+
+Meetings.MEETING_PHASES = {
+  IDLE: "idle",           // aucune réunion en cours (état initial)
+  CREATE: "create",       // demande de création envoyée (meetingCreateSubmitting)
+  PREVIEW: "preview",     // aperçu caméra/micro avant de rejoindre
+  WAITING: "waiting",     // dans la salle d'attente
+  APPROVAL: "approval",   // en attente d'approbation de l'hôte
+  LIVE: "live",           // réunion active
+  ENDED: "ended",         // terminée / quittée (juste avant retour IDLE)
+};
+
+/**
+ * Change la phase de réunion en cours (source de vérité unique).
+ * IDempotent : reposer la même phase ne fait rien.
+ * @param {string} phase Une valeur de Meetings.MEETING_PHASES
+ * @returns {string} La phase appliquée
+ */
+Meetings.prototype._setMeetingPhase = function(phase) {
+  // Les phases sont les VALEURS de MEETING_PHASES (minuscules), pas les clés.
+  const known = Object.values(Meetings.MEETING_PHASES || {});
+  if (!known.includes(phase)) {
+    console.warn("📅 [MEETING] Phase inconnue ignorée:", phase);
+    return this.meetingState || Meetings.MEETING_PHASES.IDLE;
+  }
+  const previous = this.meetingState || Meetings.MEETING_PHASES.IDLE;
+  if (previous === phase) return phase;
+  console.log(`📅 [MEETING] Phase: ${previous} → ${phase}`);
+  this.meetingState = phase;
+  return phase;
+};
+
+/**
+ * Réinitialise TOUT l'état métier meeting en un seul endroit.
+ * Utilisé par leaveMeeting / handleMeetingKicked / handleMeetingEnded
+ * (remplace les blocs de reset dispersés et désormais identiques).
+ * Ne touche NI aux vues DOM (close*View), NI aux streams WebRTC
+ * (endGroupCall/leaveGroupCall) : appelés séparément par les appelants.
+ * Préserve meetingPendingCode / meetingPendingMeetingId sauf si
+ * opts.clearPending = true (car un join peut être en cours).
+ */
+Meetings.prototype.resetMeetingState = function(opts) {
+  const clearPending = !!(opts && opts.clearPending);
+  // Timers de compte à rebours (salle d'attente)
+  if (this.meetingTimer) {
+    clearInterval(this.meetingTimer);
+    this.meetingTimer = null;
+  }
+  // Timers de création en attente (garde session 4)
+  this._pendingMeetingCreate = null;
+  clearTimeout(this.meetingCreateTimeout);
+  this.meetingCreateTimeout = null;
+  this.meetingCreateSubmitting = false;
+  // Retry de connexion (reconnexion auto)
+  this.meetingConnectionRetryPending = false;
+  // Identité / contrôles
+  this.groupIsMeeting = false;
+  this.groupRoomId = null;
+  this.meetingWaitingRoomId = null;
+  this.meetingApprovalPending = false;
+  this.isMeetingHost = false;
+  this.meetingCreatedBy = null;
+  this.currentMeetingId = null;
+  this.currentMeetingCode = "";
+  this.currentMeetingTitle = null;
+  if (clearPending) {
+    this.meetingPendingCode = null;
+    this.meetingPendingMeetingId = null;
+  }
+  // Musique d'attente : purge complète (aucun son résiduel)
+  this.stopWaitingMusicLocally();
+  this._destroyWaitingMusicNode();
+  this.activeMediaEngine = "none";
+  this.livekit = null;
+  this._setMeetingPhase(Meetings.MEETING_PHASES.IDLE);
+};
+
 Meetings.prototype.normalizeMeetingCode = function(code) {
   if (!code && code !== 0) return "";
   const cleaned = String(code).trim().toUpperCase().replace(/[^A-Z0-9]/g, "");
@@ -55,28 +135,28 @@ Meetings.prototype.normalizeMeetingCode = function(code) {
 };
 
 Meetings.prototype.handleMeetingCreated = function(data) {
-  console.log("📅 [MEETING] Réunion créée:", data);
+  console.log("📅 [MEETING] meeting-created reçu (meetingId:", data.meetingId, ", code:", data.code, ", requestId:", data.requestId || "-", ")");
   this.meetingCreateSubmitting = false;
-  this._meetingCreateHandled = true;
+  this._pendingMeetingCreate = null; // demande servie : pas de rejeu
   clearTimeout(this.meetingCreateTimeout);
-  clearTimeout(this.meetingCreateFallbackTimeout);
   this.meetingCreateTimeout = null;
-  this.meetingCreateFallbackTimeout = null;
   this.closeMeetingCreateView();
 
-  // Envoyer la musique d'attente APRÈS la création légère pour éviter 413 / coupure WS
-  const pendingTracks = this._pendingWaitingMusicTracks;
-  this._pendingWaitingMusicTracks = null;
-  const createdMeetingId = data?.meetingId || data?.meeting?.meetingId;
-  if (Array.isArray(pendingTracks) && pendingTracks.length && createdMeetingId) {
-    const isConnected = this.wsReadyState === WebSocket.OPEN || (this.ws && this.ws.readyState === WebSocket.OPEN);
-    if (isConnected) {
-      this.sendSignal({
-        type: "meeting-waiting-music-set",
-        meetingId: createdMeetingId,
-        tracks: pendingTracks.map((t) => ({ dataUrl: t.dataUrl, name: t.name })),
-      });
-    }
+  // Upload HTTP de la musique planifiée (fichiers mis de côté à l'écran de
+  // création) : hors WebSocket, ne peut plus bloquer quoi que ce soit.
+  const pendingFiles = this._pendingWaitingMusicFiles;
+  this._pendingWaitingMusicFiles = null;
+  if (data.meetingId && pendingFiles?.length) {
+    setTimeout(() => {
+      console.log(`⬆️ [MEETING] Téléversement HTTP de ${pendingFiles.length} morceau(x) de musique d'attente…`);
+      this._uploadWaitingMusicFiles(data.meetingId, pendingFiles);
+    }, 400);
+  }
+
+  // Ancien canal (serveur pas encore à jour) : musique ignorée par le serveur.
+  if (data.musicSkipped && data.musicSkippedReason) {
+    console.warn("📅 [MEETING]", data.musicSkippedReason);
+    if (typeof this.showCallToast === "function") this.showCallToast(data.musicSkippedReason);
   }
 
   // Réunion instantanée : on va directement à l'aperçu caméra, sans écran intermédiaire
@@ -87,6 +167,94 @@ Meetings.prototype.handleMeetingCreated = function(data) {
   }
 
   this.showMeetingCreatedView(data);
+};
+
+// Téléverse des FICHIERS bruts (File objects) après la création d'une réunion.
+// Détaché de _uploadWaitingMusicPlaylist car ici on n'a que des File, pas de
+// dataUrls. Échec non bloquant : la réunion existe déjà.
+Meetings.prototype._uploadWaitingMusicFiles = async function(meetingId, files) {
+  const base = (CallManager.HTTP_SERVER_URL || "").replace(/\/$/, "");
+  for (let i = 0; i < files.length; i++) {
+    const file = files[i];
+    try {
+      const bytes = await file.arrayBuffer();
+      const query = new URLSearchParams({
+        userId: this.myId || "",
+        token: this.authToken || "",
+        name: file.name || "Musique d'attente",
+        mime: file.type || "audio/mpeg",
+      });
+      const response = await fetch(
+        `${base}/api/meeting/${encodeURIComponent(meetingId)}/waiting-music-upload?${query.toString()}`,
+        { method: "POST", headers: { "Content-Type": "application/octet-stream" }, body: bytes },
+      );
+      if (!response.ok) {
+        const errText = await response.json().catch(() => ({}));
+        // Le serveur renvoie 403/404 si l'auth expire : on ne réessaie pas en boucle.
+        throw new Error(errText.error || `HTTP ${response.status}`);
+      }
+      console.log(`✅ [MEETING] Musique ${i + 1}/${files.length} « ${file.name} » téléversée`);
+    } catch (error) {
+      console.warn(`[MEETING] Téléversement « ${file.name} » impossible — musique non partagée :`, error);
+      this.showCallToast("Musique d'attente non partagée (échec envoi)");
+      return;
+    }
+  }
+  try {
+    const query = new URLSearchParams({ userId: this.myId || "", token: this.authToken || "" });
+    const response = await fetch(
+      `${base}/api/meeting/${encodeURIComponent(meetingId)}/waiting-music-finalize?${query.toString()}`,
+      { method: "POST" },
+    );
+    if (!response.ok) {
+      const errText = await response.json().catch(() => ({}));
+      throw new Error(errText.error || `HTTP ${response.status}`);
+    }
+    console.log(`🎧 [MEETING] Musique d'attente active pour ${files.length} morceau(x)`);
+  } catch (error) {
+    console.warn("[MEETING] Finalisation musique impossible :", error);
+    this.showCallToast("Musique d'attente non diffusée (finalisation échouée)");
+  }
+};
+
+// Rejoue la demande de création perdue à cause d'une coupure WebSocket survenue
+// juste après l'envoi (appelé automatiquement après la réinscription au serveur).
+Meetings.prototype._retryPendingMeetingCreate = function() {
+  const pending = this._pendingMeetingCreate;
+  if (!pending) return;
+
+  // Volontairement retiré de la file AVANT le rejeu : si le serveur répond
+  // (created OU error), on ne doit plus le rejouer à l'infini.
+  this._pendingMeetingCreate = null;
+
+  // Trop vieux (la reconnexion a pris plus de 30 s) : abandon propre.
+  if (Date.now() - pending.sentAt > 30000) {
+    console.log("📅 [MEETING] Demande de création trop ancienne après reconnexion, abandon du rejeu");
+    return;
+  }
+
+  const isConnected = this.wsReadyState === WebSocket.OPEN || (this.ws && this.ws.readyState === WebSocket.OPEN);
+  if (!isConnected) {
+    // Toujours déconnecté : on remet la demande en file, le prochain
+    // handleRegistered la rejouera.
+    this._pendingMeetingCreate = pending;
+    return;
+  }
+
+  console.log("🔁 [MEETING] Reconnexion détectée — rejoue la demande de création de réunion");
+  this.sendSignal({
+    type: "meeting-create",
+    title: pending.title,
+    description: pending.description,
+    scheduledAt: pending.scheduledAt,
+    durationMin: pending.durationMin,
+    isVideo: pending.isVideo,
+    participants: pending.participants,
+    accessPolicy: pending.accessPolicy,
+    waitingMusicTracks: pending.waitingMusicTracks,
+    requestId: pending.requestId, // même ID : le serveur déduplique (pas de 2e réunion)
+  });
+  // Le timeout de 20 s déjà armé par createMeeting() reste valable.
 };
 
 Meetings.prototype.handleMeetingLiveReady = function(data) {
@@ -134,6 +302,9 @@ Meetings.prototype._applyPendingMeetingMediaPreferences = function() {
 Meetings.prototype.handleMeetingJoined = async function(data) {
   console.log("📅 [MEETING] Réunion jointe, salle live:", data.roomId);
   this.stopWaitingMusicLocally();
+  // Libérer aussi le nœud audio <Audio> (sinon jusqu'à ~30 Mo retenus en RAM
+  // pendant toute la réunion).
+  this._destroyWaitingMusicNode();
   const previousWaitingRoom = this.meetingWaitingRoomId;
   if (previousWaitingRoom && previousWaitingRoom !== data.roomId) {
     this.sendSignal({ type: "group-leave", roomId: previousWaitingRoom });
@@ -143,7 +314,6 @@ Meetings.prototype.handleMeetingJoined = async function(data) {
 
   // Marquer que c'est une réunion planifiée pour empêcher la bascule automatique
   // vers l'écran 1-à-1 lorsqu'il ne reste qu'un autre participant dans la salle.
-  this.groupIsLeaving = false;
   this.groupIsMeeting = true;
   this.groupDowngradingToOneToOne = false;
   this.groupRoomId = data.roomId;
@@ -159,14 +329,20 @@ Meetings.prototype.handleMeetingJoined = async function(data) {
   this.meetingCreatedBy = data.createdBy || data.hostId || null;
   this.isMeetingHost = !!(this.meetingCreatedBy && this.meetingCreatedBy === this.myId);
 
+  // Feature flag : LiveKit SFU si demandé par le serveur, sinon Mesh existant
+  const useLiveKit = data.engine === "livekit" && typeof window.LiveKitManager === "function";
+  if (useLiveKit) {
+    await this._joinMeetingViaLiveKit(data);
+    return;
+  }
+
+  this.activeMediaEngine = "mesh";
+
   // Le flux de réunion doit avoir les médias du groupe prêts avant d'ouvrir
   // la salle live et d'envoyer le group-join. Sans cela le client se retrouve
   // avec un roster mais sans peer WebRTC réel, ce qui provoque la fausse
   // sensation "personne présente" alors qu'un participant est en attente.
-  const hasLiveMedia = typeof this.hasLiveGroupMedia === "function"
-    ? this.hasLiveGroupMedia(this.groupIsVideo)
-    : !!(this.groupLocalStream && this.groupLocalStream.getTracks().some((t) => t.readyState === "live"));
-  if (!hasLiveMedia) {
+  if (!this.groupLocalStream) {
     try {
       await this.acquireGroupMedia(this.groupIsVideo, this._mediaDeviceOptionsForMeeting());
     } catch (error) {
@@ -200,16 +376,234 @@ Meetings.prototype.handleMeetingJoined = async function(data) {
 
   // Afficher l'écran de réunion spécifique (Google Meet style)
   this.showMeetingScreen(data);
-  if (typeof this.renderGroupGrid === "function") {
-    this.renderGroupGrid();
+};
+
+/**
+ * Rejoint une réunion via LiveKit (SFU) sans impacter le flux Mesh.
+ * Respecte les règles de coexistence : stopPreview(), mutuelle exclusion 1-à-1,
+ * ré-application du routage audio natif après connexion.
+ */
+Meetings.prototype._joinMeetingViaLiveKit = async function(data) {
+  console.log("🚀 [MEETING][LiveKit] Connexion SFU pour:", data.meetingId);
+
+  // 1. Arrêter impérativement la preview et un éventuel flux de salle d'attente avant LiveKit (libère caméra/micro Cordova)
+  if (typeof this.stopPreview === "function") {
+    this.stopPreview();
   }
-  if (data.meetingId) {
-    this.sendSignal({ type: "whiteboard-sync", meetingId: data.meetingId });
+  if (this.groupLocalStream) {
+    try {
+      this.groupLocalStream.getTracks().forEach((t) => t.stop());
+    } catch (_) {}
+    this.groupLocalStream = null;
+  }
+
+  // 2. Mutuelle exclusion : raccrocher un éventuel appel 1-à-1 en cours
+  if (this.peerConnection || this.currentCallId) {
+    try {
+      if (typeof this.hangUp === "function") {
+        this.hangUp(false);
+      }
+    } catch (e) {
+      console.warn("[LiveKit] Erreur fermeture appel 1-à-1:", e);
+    }
+  }
+
+  this.activeMediaEngine = "livekit";
+
+  // 3. Récupérer le JWT LiveKit auprès du serveur
+  let tokenData;
+  try {
+    const resp = await fetch(`${CallManager.HTTP_SERVER_URL}/api/livekit-token`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${this.authToken || ""}`,
+        "X-User-Id": this.myId || "",
+      },
+      body: JSON.stringify({
+        meetingId: data.meetingId,
+        code: this.currentMeetingCode,
+        userId: this.myId,
+      }),
+    });
+    if (!resp.ok) {
+      const errBody = await resp.json().catch(() => ({}));
+      throw new Error(errBody.error || `HTTP ${resp.status}`);
+    }
+    tokenData = await resp.json();
+  } catch (error) {
+    console.error("❌ [MEETING][LiveKit] Échec récupération token:", error);
+    this.showCallToast(error.message || "Connexion LiveKit impossible");
+    this.activeMediaEngine = "none";
+    this.groupIsMeeting = false;
+    this.pendingMeetingMediaPreferences = null;
+    return;
+  }
+
+  // 4. Préparer les préférences média (micro / caméra)
+  const prefs = this.pendingMeetingMediaPreferences || {};
+  const initialAudio = prefs.micMuted !== undefined ? !prefs.micMuted : true;
+  const initialVideo = prefs.camOff !== undefined ? !prefs.camOff : this.groupIsVideo;
+  this.groupIsMuted = !initialAudio;
+  this.groupIsCamOff = !initialVideo;
+  this.pendingMeetingMediaPreferences = null;
+
+  // 5. Afficher l'écran de réunion et préparer les conteneurs DOM LiveKit
+  this.showMeetingScreen(data);
+  const grid = document.getElementById("meeting-video-grid");
+  if (grid) grid.innerHTML = "";
+
+  // Tuile locale
+  let localVideoEl = null;
+  if (grid) {
+    const localTile = document.createElement("div");
+    localTile.className = "video-tile group-tile is-self self" + (initialVideo ? " has-video" : "");
+    localTile.id = `lk-tile-${this.myId}`;
+    localVideoEl = document.createElement("video");
+    localVideoEl.className = "group-video";
+    localVideoEl.autoplay = true;
+    localVideoEl.playsInline = true;
+    localVideoEl.muted = true;
+    const info = document.createElement("div");
+    info.className = "group-tile-info video-tile-info";
+    info.innerHTML = `<span class="group-tile-name user-name">${window.escapeHtml(this.myId || "Moi")} (Vous)</span>`;
+    localTile.appendChild(localVideoEl);
+    localTile.appendChild(info);
+    grid.appendChild(localTile);
+  }
+
+  // Conteneur audio dédié pour les flux audio distants (ne pas utiliser display:none pour éviter le blocage audio WebView)
+  let audioContainer = document.getElementById("meeting-livekit-audio");
+  if (!audioContainer) {
+    audioContainer = document.createElement("div");
+    audioContainer.id = "meeting-livekit-audio";
+    audioContainer.style.cssText = "position:absolute;width:0;height:0;overflow:hidden;pointer-events:none;";
+    document.body.appendChild(audioContainer);
+  }
+
+  const updateCount = () => {
+    const total = this.livekit ? 1 + this.livekit.getRemoteParticipants().length : 1;
+    const countEl = document.getElementById("participant-count");
+    if (countEl) {
+      countEl.textContent = String(total);
+    }
+    if (grid) {
+      for (let n = 1; n <= 6; n++) grid.classList.remove(`count-${n}`);
+      grid.classList.add(`count-${Math.max(1, Math.min(total, 6))}`);
+    }
+  };
+  updateCount();
+
+  this.livekit = new window.LiveKitManager({
+    localVideoEl,
+    remoteContainerEl: null,
+    onParticipantJoined: () => updateCount(),
+    onParticipantLeft: ({ identity }) => {
+      document.querySelectorAll(`[id^="lk-tile-${identity}-"]`).forEach((el) => el.remove());
+      updateCount();
+    },
+    onTrackSubscribed: ({ track, publication, participant, element }) => {
+      console.log("🎥 [MEETING][LiveKit] TrackSubscribed:", track.kind, participant.identity);
+      if (track.kind === "audio") {
+        element.muted = false;
+        element.volume = 1.0;
+        element.autoplay = true;
+        audioContainer.appendChild(element);
+        if (typeof element.play === "function") {
+          element.play().catch((err) => {
+            console.warn("🔇 [MEETING][LiveKit] Lecture audio bloquée par autoplay:", err);
+            this.showCallToast("Touchez l'écran pour activer le son");
+          });
+        }
+        return;
+      }
+      if (track.kind === "video" && grid) {
+        const sourceKey = String(publication?.source || "camera");
+        const tileId = `lk-tile-${participant.identity}-${sourceKey}`;
+        let tile = document.getElementById(tileId);
+        if (!tile) {
+          tile = document.createElement("div");
+          tile.className = "video-tile group-tile has-video";
+          tile.id = tileId;
+          const info = document.createElement("div");
+          info.className = "group-tile-info video-tile-info";
+          info.innerHTML = `<span class="group-tile-name user-name">${window.escapeHtml(participant.name || participant.identity)}</span>`;
+          tile.appendChild(info);
+          grid.appendChild(tile);
+        } else {
+          tile.classList.add("has-video");
+        }
+        element.className = "group-video";
+        element.style.display = "block";
+        tile.insertBefore(element, tile.firstChild);
+        if (typeof element.play === "function") {
+          element.play().catch(() => {});
+        }
+        updateCount();
+      }
+    },
+    onTrackUnsubscribed: ({ track, publication, participant }) => {
+      if (track.kind === "video") {
+        const sourceKey = String(publication?.source || "camera");
+        const tile = document.getElementById(`lk-tile-${participant.identity}-${sourceKey}`);
+        if (tile) tile.remove();
+      }
+    },
+    onConnectionStateChanged: (state) => {
+      if (state === "disconnected" && this.activeMediaEngine === "livekit") {
+        this.leaveMeeting();
+      }
+    },
+    onAudioPlaybackBlocked: () => {
+      console.warn("🔇 [MEETING][LiveKit] AudioPlaybackBlocked — attente d'un clic utilisateur");
+      this.showCallToast("Touchez l'écran pour activer le son");
+    },
+    onError: (err) => {
+      console.error("❌ [MEETING][LiveKit] Erreur:", err);
+      this.showCallToast("Erreur média LiveKit");
+    },
+  });
+
+  // Débloquer l'audio LiveKit au premier toucher/clic sur l'écran de réunion
+  const meetingScreenEl = document.getElementById("meeting-screen");
+  if (meetingScreenEl && !meetingScreenEl.dataset.lkAudioUnlockBound) {
+    meetingScreenEl.dataset.lkAudioUnlockBound = "1";
+    meetingScreenEl.addEventListener("click", () => {
+      if (this.activeMediaEngine === "livekit" && this.livekit) {
+        this.livekit.startAudio().catch(() => {});
+        document.querySelectorAll("#meeting-livekit-audio audio").forEach((a) => {
+          if (a.paused && typeof a.play === "function") a.play().catch(() => {});
+        });
+      }
+    });
+  }
+
+  try {
+    await this.livekit.join({
+      url: tokenData.url,
+      token: tokenData.token,
+      video: initialVideo,
+      audio: initialAudio,
+    });
+    updateCount();
+
+    // 6. Réappliquer le routage audio natif APRES livekit.join()
+    if (typeof this.setAudioRoute === "function") {
+      this.setAudioRoute(this.groupIsVideo ? "speaker" : "earpiece");
+    }
+  } catch (error) {
+    console.error("❌ [MEETING][LiveKit] Échec join():", error);
+    this.showCallToast("Impossible de rejoindre la réunion LiveKit");
+    this.leaveMeeting();
   }
 };
 
 Meetings.prototype.handleMeetingReconnect = async function(data) {
   console.log("📅 [MEETING] Reconnexion à la réunion demandée:", data.roomId);
+  if (data.engine === "livekit" && typeof window.LiveKitManager === "function") {
+    await this._joinMeetingViaLiveKit(data);
+    return;
+  }
   this.showCallToast("Reconnexion à la réunion en cours...");
 
   // Fermer l'écran actuel si existant
@@ -217,7 +611,6 @@ Meetings.prototype.handleMeetingReconnect = async function(data) {
   this.closeMeetingWaitingView();
 
   // Marquer que c'est une réunion planifiée
-  this.groupIsLeaving = false;
   this.groupIsMeeting = true;
   this.groupDowngradingToOneToOne = false;
   this.groupRoomId = data.roomId;
@@ -233,10 +626,7 @@ Meetings.prototype.handleMeetingReconnect = async function(data) {
   this.isMeetingHost = !!(this.meetingCreatedBy && this.meetingCreatedBy === this.myId);
 
   // Acquérir les médias
-  const hasLiveMedia = typeof this.hasLiveGroupMedia === "function"
-    ? this.hasLiveGroupMedia(this.groupIsVideo)
-    : !!(this.groupLocalStream && this.groupLocalStream.getTracks().some((t) => t.readyState === "live"));
-  if (!hasLiveMedia) {
+  if (!this.groupLocalStream) {
     try {
       await this.acquireGroupMedia(this.groupIsVideo, this._mediaDeviceOptionsForMeeting());
     } catch (error) {
@@ -269,29 +659,17 @@ Meetings.prototype.handleMeetingReconnect = async function(data) {
 
 Meetings.prototype.handleMeetingWaiting = async function(data) {
   console.log("📅 [MEETING] Réunion en attente, temps restant:", data.waitTimeMin, "min");
+  this._setMeetingPhase(Meetings.MEETING_PHASES.WAITING);
 
   // Ne PAS écraser l'écran live si on est déjà dans la réunion
-  if (this.groupIsMeeting && this.groupRoomId && !this.meetingWaitingRoomId) {
+  if (this.groupIsMeeting && this.groupRoomId) {
     console.log("📅 [MEETING] Déjà en réunion live, on ignore meeting-waiting");
-    return;
-  }
-
-  // Si la réunion est déjà live/active et non verrouillée, ne jamais forcer la salle d'attente
-  const current = window.meetingService?.currentMeeting;
-  const serverReportsLive = data.status === "live" || data.status === "active";
-  const currentIsLive = current && (current.status === "live" || current.status === "active");
-  const isLocked = !!(data.locked || data.lockMeeting || data.alwaysWaitingRoom || current?.lockMeeting || current?.alwaysWaitingRoom);
-  if ((serverReportsLive || currentIsLive) && !isLocked) {
-    console.log("📅 [MEETING] Réunion déjà live et non verrouillée — pas de salle d'attente");
-    if (data.roomId) {
-      await this.handleMeetingJoined(data);
-    }
     return;
   }
 
   this.meetingPendingCode = data.code;
   this.meetingPendingMeetingId = data.meetingId;
-  if (data.waitingRoomId && !this.meetingWaitingRoomId) {
+  if (data.waitingRoomId && data.waitingRoomId !== this.meetingWaitingRoomId) {
     this.groupIsMeeting = true;
     this.groupIsVideo = !!data.isVideo;
     this.groupRoomId = data.waitingRoomId;
@@ -330,9 +708,22 @@ Meetings.prototype.handleMeetingWaiting = async function(data) {
 // - synchronisation approximative via syncAt (horodatage serveur) + clockOffset
 // - libération complète des ressources audio à l'arrêt
 Meetings.prototype.receiveWaitingMusic = function(music) {
-  const tracks = Array.isArray(music?.tracks) && music.tracks.length
+  // DEUX FORMATS ACCEPTÉS :
+  // - ancien : tracks[].dataUrl (data:audio/...;base64) — ne circule plus
+  //   depuis que le serveur diffuse des URLs légères (anti-blocage).
+  // - nouveau : tracks[].url (chemin relatif du flux HTTP) : on le résout
+  //   en URL absolue pour la lecture Audio.
+  const HTTP_BASE = (CallManager.HTTP_SERVER_URL || "").replace(/\/$/, "");
+  const rawTracks = Array.isArray(music?.tracks) && music.tracks.length
     ? music.tracks
     : (music?.dataUrl ? [{ dataUrl: music.dataUrl, name: music.name }] : []);
+  const tracks = rawTracks.map((t) => {
+    let src = t && (t.dataUrl || t.url || "");
+    if (src && !/^(data:|https?:)/.test(src)) {
+      src = `${HTTP_BASE}${src.startsWith("/") ? src : "/" + src}`;
+    }
+    return src ? { dataUrl: src, name: t.name, duration: t.duration || 0 } : null;
+  }).filter(Boolean);
   if (!tracks.length || this.waitingMusicStoppedForMeeting) return;
   // Nouvelle playlist (ou arrivée tardive) : repartir du début proprement
   this._destroyWaitingMusicNode();
@@ -509,8 +900,8 @@ Meetings.prototype.toggleWaitingMusicLocally = function() {
 
 // Sélection des musiques par l'hôte : validation type / taille / décodage,
 // ajout à la playlist, lecture locale et diffusion aux participants.
-Meetings.WAITING_MUSIC_MAX_PER_FILE_BYTES = 10 * 1024 * 1024; // 10 Mo / morceau
-Meetings.WAITING_MUSIC_MAX_TOTAL_BYTES = 30 * 1024 * 1024;    // 30 Mo total
+Meetings.WAITING_MUSIC_MAX_PER_FILE_BYTES = 30 * 1024 * 1024;  // 30 Mo / morceau (MP3 320 kbps ≈ 4 min, WAV courts)
+Meetings.WAITING_MUSIC_MAX_TOTAL_BYTES = 100 * 1024 * 1024;    // 100 Mo total (≈ 10 MP3)
 Meetings.prototype.selectWaitingMusic = async function(fileList) {
   const files = Array.from(fileList || []);
   if (!files.length) return;
@@ -526,7 +917,7 @@ Meetings.prototype.selectWaitingMusic = async function(fileList) {
   // 2) Validation de la taille (évite de saturer la WS et la RAM du serveur)
   for (const file of files) {
     if (file.size > Meetings.WAITING_MUSIC_MAX_PER_FILE_BYTES) {
-      this.showCallToast(`« ${file.name} » dépasse 10 Mo — non ajouté`);
+      this.showCallToast(`« ${file.name} » dépasse 30 Mo — non ajouté`);
       return;
     }
   }
@@ -534,7 +925,7 @@ Meetings.prototype.selectWaitingMusic = async function(fileList) {
     .reduce((sum, track) => sum + (track.dataUrl ? track.dataUrl.length * 0.75 : 0), 0);
   const newBytes = files.reduce((sum, file) => sum + file.size, 0);
   if (currentBytes + newBytes > Meetings.WAITING_MUSIC_MAX_TOTAL_BYTES) {
-    this.showCallToast("Playlist trop lourde (max 30 Mo au total)");
+    this.showCallToast("Playlist trop lourde (max 100 Mo au total)");
     return;
   }
 
@@ -601,12 +992,14 @@ Meetings.prototype.selectWaitingMusic = async function(fileList) {
 Meetings.prototype.handleWaitingMusicMessage = function(data) {
   if (data.meetingId && this.meetingPendingMeetingId && data.meetingId !== this.meetingPendingMeetingId) return;
   if (data.type === "meeting-waiting-music-set") {
-    // L'hôte reçoit son propre écho : pas d'écrasement brutal si identique
+    // L'hôte reçoit son propre écho : pas d'écrasement brutal si identique.
+    // NB : l'écho du serveur contient désormais des URLs HTTP (payload léger),
+    // pas les dataUrls locaux de l'hôte — on compare donc par NOM de morceau.
     const incoming = Array.isArray(data.tracks) ? data.tracks : [];
     const current = this.waitingMusicTracks || [];
     if (data.clientOnly) return;
     if (incoming.length && incoming.length === current.length &&
-        incoming.every((t, i) => t.dataUrl === current[i]?.dataUrl) &&
+        incoming.every((t, i) => (t.name || "") === (current[i]?.name || "")) &&
         data.syncAt && this.waitingMusicLastSyncAt === data.syncAt) {
       return;
     }
@@ -780,15 +1173,92 @@ Meetings.prototype.removeWaitingTrack = function(index) {
   this.updateWaitingMusicControls();
 };
 
-// Diffuse la playlist à jour aux participants (hôte)
+// Diffuse la playlist à jour aux participants (hôte).
+// NOUVEAU : passe par HTTP (binaire brut) au lieu de messages WS géants qui
+// saturaient le socket. Repli legacy : si le serveur ne connaît pas encore les
+// routes d'upload (ancien déploiement), on renvoie l'ancien message WS.
 Meetings.prototype._broadcastWaitingMusicPlaylist = function() {
   if (!this.waitingMusicTracks?.length) return;
+  if (this.meetingPendingMeetingId) {
+    this._uploadWaitingMusicPlaylist(this.meetingPendingMeetingId);
+    return;
+  }
+  // Sans meetingId (réunion pas encore créée), l'ancien canal WS est le seul.
+  this._broadcastWaitingMusicPlaylistLegacy();
+};
+
+// Canal historique (dataUrls en WS) — uniquement en repli.
+Meetings.prototype._broadcastWaitingMusicPlaylistLegacy = function() {
+  if (!this.waitingMusicTracks?.length) return;
+  const approxBytes = this.waitingMusicTracks.reduce((s, t) => s + (t.dataUrl || "").length, 0);
+  if (approxBytes > 4 * 1024 * 1024) {
+    console.warn("[MEETING] Playlist musique trop lourde pour la WebSocket ("
+      + Math.round(approxBytes / 1048576) + " Mo) — diffusion annulée (utilise la montée HTTP)");
+    this.showCallToast("Musique trop lourde pour le canal de repli");
+    return;
+  }
   this.sendSignal({
     type: "meeting-waiting-music-set",
     meetingId: this.meetingPendingMeetingId,
     syncAt: Date.now() + (this.clockOffset || 0),
     tracks: this.waitingMusicTracks.map((t) => ({ dataUrl: t.dataUrl, name: t.name })),
   });
+};
+
+// dataURL -> ArrayBuffer (pour l'upload binaire HTTP).
+Meetings.prototype._dataUrlToBytes = async function(dataUrl) {
+  const response = await fetch(dataUrl);
+  return response.arrayBuffer();
+};
+
+// Téléverse la playlist courante (dataUrls locaux) vers le serveur en HTTP,
+// puis la finalise : le serveur la diffuse en payload léger aux visiteurs.
+// Ne JAMAIS jeter d'erreur bloquante : la musique est un confort, pas vital.
+Meetings.prototype._uploadWaitingMusicPlaylist = async function(meetingId) {
+  const tracks = (this.waitingMusicTracks || []).filter((t) => t && t.dataUrl);
+  if (!meetingId || !tracks.length) return;
+  const base = (CallManager.HTTP_SERVER_URL || "").replace(/\/$/, "");
+  for (let i = 0; i < tracks.length; i++) {
+    const track = tracks[i];
+    try {
+      console.log(`⬆️ [MEETING] Musique ${i + 1}/${tracks.length} — téléversement de « ${track.name} »…`);
+      const bytes = await this._dataUrlToBytes(track.dataUrl);
+      const query = new URLSearchParams({
+        userId: this.myId || "",
+        token: this.authToken || "",
+        name: track.name || "Musique d'attente",
+        mime: /^data:(audio\/[a-zA-Z0-9.+-]+);/.exec(track.dataUrl)?.[1] || "audio/mpeg",
+      });
+      const url = `${base}/api/meeting/${encodeURIComponent(meetingId)}/waiting-music-upload?${query.toString()}`;
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/octet-stream" },
+        body: bytes,
+      });
+      if (!response.ok) {
+        const errText = await response.json().catch(() => ({}));
+        throw new Error(errText.error || `HTTP ${response.status}`);
+      }
+      console.log(`✅ [MEETING] Musique ${i + 1}/${tracks.length} téléversée (${bytes.byteLength} octets)`);
+    } catch (error) {
+      console.warn(`[MEETING] Échec téléversement « ${track.name} », repli WS legacy :`, error);
+      // Repli : ancien canal si le déploiement serveur n'a pas les routes.
+      this._broadcastWaitingMusicPlaylistLegacy();
+      return;
+    }
+  }
+  try {
+    const query = new URLSearchParams({ userId: this.myId || "", token: this.authToken || "" });
+    const response = await fetch(`${base}/api/meeting/${encodeURIComponent(meetingId)}/waiting-music-finalize?${query.toString()}`, { method: "POST" });
+    if (!response.ok) {
+      const errText = await response.json().catch(() => ({}));
+      throw new Error(errText.error || `HTTP ${response.status}`);
+    }
+    console.log(`🎧 [MEETING] Musique d'attente finalisée (${tracks.length} morceau(x)) — diffusion aux visiteurs`);
+  } catch (error) {
+    console.warn("[MEETING] Échec finalisation musique, repli WS legacy :", error);
+    this._broadcastWaitingMusicPlaylistLegacy();
+  }
 };
 
 // Arrête la musique chez tout le monde (hôte) — y compris chez l'hôte lui-même.
@@ -852,6 +1322,8 @@ Meetings.prototype.handleMeetingError = function(data) {
   console.error("📅 [MEETING] Erreur:", data.reason);
   this.meetingCreateSubmitting = false;
   this.instantMeetingPending = false;
+  // Le serveur a répondu explicitement : la demande n'est plus à rejouer.
+  this._pendingMeetingCreate = null;
   clearTimeout(this.meetingCreateTimeout);
   this.meetingCreateTimeout = null;
   this.pendingMeetingMediaPreferences = null;
@@ -863,19 +1335,22 @@ Meetings.prototype.handleMeetingError = function(data) {
 Meetings.prototype.handleMeetingApprovalGranted = async function(data) {
   console.log("📅 [MEETING] Accès accordé:", data);
   this.meetingApprovalPending = false;
+  // La phase passe à LIVE via showMeetingScreen/handleMeetingJoined (même flux)
   this.showCallToast("Accès accepté — connexion…");
   this.closeMeetingWaitingView();
   if (typeof this.closeMeetingPreviewView === "function") {
     try { this.closeMeetingPreviewView(); } catch (e) {}
   }
 
-  // Même flux que handleMeetingJoined
+  // Même flux que handleMeetingJoined (propage engine pour Approche A LiveKit)
   await this.handleMeetingJoined({
     meetingId: data.meetingId,
     roomId: data.roomId,
     isVideo: data.isVideo,
     title: data.title,
+    code: data.code,
     createdBy: data.createdBy || data.hostId,
+    engine: data.engine,
   });
 };
 
@@ -889,6 +1364,7 @@ Meetings.prototype.handleMeetingApprovalDenied = function(data) {
 
 Meetings.prototype.handleMeetingPendingApproval = function(data) {
   console.log("📅 [MEETING] En attente d'approbation:", data);
+  this._setMeetingPhase(Meetings.MEETING_PHASES.APPROVAL);
   this.meetingApprovalPending = true; // bloque l'auto-join du compte à rebours
   this.showCallToast("Demande d'accès envoyée à l'hôte");
   // Fermer prévisualisation / attente classique
@@ -957,8 +1433,6 @@ Meetings.prototype.handleMeetingKicked = function(data) {
   console.log("📅 [MEETING] Expulsé de la réunion:", data);
   this.showCallToast(data.reason || "Vous avez été retiré de la réunion");
   // Nettoyage complet : apreinte hôte effacée, panneaux fermés, médias libérés
-  this.stopWaitingMusicLocally();
-  this._destroyWaitingMusicNode();
   this.meetingChat?.reset?.();
   this.meetingParticipants?.reset?.();
   if (this.groupRoomId || this.groupIsMeeting) {
@@ -967,23 +1441,8 @@ Meetings.prototype.handleMeetingKicked = function(data) {
     } catch (e) { console.warn("kicked cleanup:", e); }
   }
   this.closeMeetingScreen();
-  if (this.groupLocalStream) {
-    this.groupLocalStream.getTracks().forEach((track) => { try { track.stop(); } catch (e) {} });
-    this.groupLocalStream = null;
-  }
-  if (this.localStream) {
-    this.localStream.getTracks().forEach((track) => { try { track.stop(); } catch (e) {} });
-    this.localStream = null;
-  }
-  this.groupIsLeaving = false;
-  this.groupIsMeeting = false;
-  this.groupRoomId = null;
-  this.isMeetingHost = false;
-  this.meetingCreatedBy = null;
-  this.meetingWaitingRoomId = null;
-  this.currentMeetingId = null;
-  this.currentMeetingCode = "";
-  this.currentMeetingTitle = null;
+  // ÉTAT CENTRALISÉ : tous les champs + timers + musique en un seul appel
+  this.resetMeetingState();
 };
 
 /**
@@ -992,6 +1451,11 @@ Meetings.prototype.handleMeetingKicked = function(data) {
  * Utilisée par handleMeetingEnded, handleMeetingKicked et l'adaptateur média.
  */
 Meetings.prototype.endGroupCall = function(message) {
+  if (this.activeMediaEngine === "livekit" && this.livekit) {
+    this._stopNativeLiveKitScreenShare?.();
+    this.livekit.leave().catch((e) => console.warn("endGroupCall LiveKit:", e));
+    document.getElementById("meeting-livekit-audio")?.remove();
+  }
   if (this.groupRoomId) {
     this.sendSignal({ type: "group-leave", roomId: this.groupRoomId });
   }
@@ -1017,15 +1481,6 @@ Meetings.prototype.endGroupCall = function(message) {
   } catch (e) {
     console.warn("endGroupCall cleanup:", e);
   }
-  if (this.groupLocalStream) {
-    this.groupLocalStream.getTracks().forEach((track) => { try { track.stop(); } catch (e) {} });
-    this.groupLocalStream = null;
-  }
-  if (this.localStream) {
-    this.localStream.getTracks().forEach((track) => { try { track.stop(); } catch (e) {} });
-    this.localStream = null;
-  }
-  this.groupIsLeaving = false;
   this.pendingMeetingMediaPreferences = null;
 };
 
@@ -1147,12 +1602,13 @@ Meetings.prototype.broadcastParticipantState = function(state) {
   });
 };
 
-Meetings.prototype.toggleMeetingMic = function() {
+Meetings.prototype.toggleMeetingMic = async function() {
   const btn = document.getElementById("meeting-mic-btn");
   if (!btn) return;
 
-  // Utilise la même logique que les appels de groupe
-  if (typeof this.toggleGroupMic === "function") {
+  if (this.activeMediaEngine === "livekit" && this.livekit) {
+    this.groupIsMuted = await this.livekit.toggleMute();
+  } else if (typeof this.toggleGroupMic === "function") {
     this.toggleGroupMic();
   }
 
@@ -1175,7 +1631,11 @@ Meetings.prototype.toggleMeetingCam = async function() {
   const btn = document.getElementById("meeting-cam-btn");
   if (!btn) return;
 
-  if (typeof this.toggleGroupCamera === "function") {
+  if (this.activeMediaEngine === "livekit" && this.livekit) {
+    this.groupIsCamOff = await this.livekit.toggleCamera();
+    const localTile = document.getElementById(`lk-tile-${this.myId}`);
+    if (localTile) localTile.classList.toggle("has-video", !this.groupIsCamOff);
+  } else if (typeof this.toggleGroupCamera === "function") {
     await this.toggleGroupCamera();
   }
 
@@ -1198,8 +1658,14 @@ Meetings.prototype.leaveMeeting = function() {
   // Purge musique d'attente (aucun son ne doit continuer en arrière-plan)
   this.stopWaitingMusicLocally();
   this._destroyWaitingMusicNode();
-  // Quitter proprement la salle de groupe (peers WebRTC + médias + signal)
-  if (this.groupRoomId || this.groupIsMeeting) {
+
+  if (this.activeMediaEngine === "livekit" && this.livekit) {
+    this._stopNativeLiveKitScreenShare?.();
+    this.livekit.leave().catch((e) => console.warn("leaveMeeting LiveKit:", e));
+    const audioBox = document.getElementById("meeting-livekit-audio");
+    if (audioBox) audioBox.remove();
+  } else if (this.groupRoomId || this.groupIsMeeting) {
+    // Quitter proprement la salle de groupe Mesh (peers WebRTC + médias + signal)
     try {
       if (typeof this.leaveGroupCall === "function") {
         this.leaveGroupCall("Vous avez quitté la réunion");
@@ -1215,28 +1681,11 @@ Meetings.prototype.leaveMeeting = function() {
   }
   this.stopMeetingTimer?.();
   this.closeMeetingScreen();
-  // Fermer les panneaux chat/participants/tableau blanc (sinon résidus pour la prochaine réunion)
+  // Fermer les panneaux chat/participants (sinon résidus pour la prochaine réunion)
   this.meetingChat?.reset?.();
   this.meetingParticipants?.reset?.();
-  this.resetWhiteboard?.();
-  if (this.groupLocalStream) {
-    this.groupLocalStream.getTracks().forEach((track) => { try { track.stop(); } catch (e) {} });
-    this.groupLocalStream = null;
-  }
-  if (this.localStream) {
-    this.localStream.getTracks().forEach((track) => { try { track.stop(); } catch (e) {} });
-    this.localStream = null;
-  }
-  this.groupIsLeaving = false;
-  this.groupIsMeeting = false;
-  this.groupRoomId = null;
-  this.meetingWaitingRoomId = null;
-  this.meetingApprovalPending = false;
-  this.isMeetingHost = false;
-  this.meetingCreatedBy = null;
-  this.currentMeetingId = null;
-  this.currentMeetingCode = "";
-  this.currentMeetingTitle = null;
+  // ÉTAT CENTRALISÉ : tous les champs + timers + musique en un seul appel
+  this.resetMeetingState();
 };
 
 Meetings.prototype.endMeetingForEveryone = async function() {
@@ -1266,6 +1715,7 @@ Meetings.prototype.handleMeetingChatMessage = function(data) {
  */
 Meetings.prototype.showMeetingScreen = function(data) {
   console.log("📅 [MEETING] Affichage écran de réunion:", data);
+  this._setMeetingPhase(Meetings.MEETING_PHASES.LIVE);
 
   if (this.meetingScreen) {
     this.meetingScreen.classList.add("active");
@@ -1306,45 +1756,6 @@ Meetings.prototype.showMeetingScreen = function(data) {
         <!-- Overlay réactions flottantes -->
         <div id="meeting-reaction-overlay" class="meeting-reaction-overlay" aria-hidden="true"></div>
 
-        <!-- Panneau Tableau blanc collaboratif -->
-        <div id="meeting-whiteboard-panel" class="meeting-whiteboard-panel" style="display:none;" aria-label="Tableau blanc collaboratif">
-          <div class="whiteboard-header">
-            <span><i class="fa-solid fa-chalkboard"></i> Tableau blanc</span>
-            <div class="whiteboard-header-actions">
-              ${this.isMeetingHost ? `
-                <label class="wb-perm-toggle" title="Autoriser les participants à dessiner">
-                  <input type="checkbox" id="wb-allow-draw" checked />
-                  <span>Participants</span>
-                </label>
-              ` : `<span id="wb-readonly-badge" class="wb-readonly-badge" style="display:none;">Lecture seule</span>`}
-              <button type="button" class="wb-close-btn" onclick="window.toggleMeetingWhiteboard()" aria-label="Fermer le tableau">
-                <i class="fa-solid fa-xmark"></i>
-              </button>
-            </div>
-          </div>
-          <div class="whiteboard-toolbar" id="whiteboard-toolbar">
-            <button type="button" class="wb-tool-btn active" id="wb-tool-pen" data-tool="pen" title="Crayon"><i class="fa-solid fa-pen"></i></button>
-            <button type="button" class="wb-tool-btn" id="wb-tool-eraser" data-tool="eraser" title="Gomme"><i class="fa-solid fa-eraser"></i></button>
-            <div class="wb-colors">
-              <button type="button" class="wb-color-btn active" data-color="#111827" style="background:#111827;" aria-label="Noir"></button>
-              <button type="button" class="wb-color-btn" data-color="#ef4444" style="background:#ef4444;" aria-label="Rouge"></button>
-              <button type="button" class="wb-color-btn" data-color="#3b82f6" style="background:#3b82f6;" aria-label="Bleu"></button>
-              <button type="button" class="wb-color-btn" data-color="#22c55e" style="background:#22c55e;" aria-label="Vert"></button>
-            </div>
-            <select id="wb-size" class="wb-size-select" aria-label="Épaisseur du trait">
-              <option value="2">Fin</option>
-              <option value="4" selected>Moyen</option>
-              <option value="8">Épais</option>
-              <option value="14">Large</option>
-            </select>
-            ${this.isMeetingHost ? `<button type="button" class="wb-action-btn" id="wb-clear" title="Effacer tout"><i class="fa-solid fa-trash"></i></button>` : ""}
-            <button type="button" class="wb-action-btn" id="wb-export" title="Exporter en PNG"><i class="fa-solid fa-download"></i></button>
-          </div>
-          <div class="whiteboard-canvas-wrap">
-            <canvas id="meeting-whiteboard-canvas" class="whiteboard-canvas"></canvas>
-          </div>
-        </div>
-
         <!-- Barre de contrôle (plus haute, style Meet) -->
         <div class="meeting-controls meeting-controls-raised">
           <div class="meeting-time-display" id="meeting-time-display">00:00:00</div>
@@ -1357,9 +1768,6 @@ Meetings.prototype.showMeetingScreen = function(data) {
             </button>
             <button class="meeting-control-btn" id="meeting-screen-btn" aria-label="Partager l\u2019\u00e9cran" onclick="window.toggleMeetingScreenShare()" title="Partager l'écran">
               <i class="fa-solid fa-desktop"></i>
-            </button>
-            <button class="meeting-control-btn" id="meeting-whiteboard-btn" aria-label="Tableau blanc" onclick="window.toggleMeetingWhiteboard()" title="Tableau">
-              <i class="fa-solid fa-chalkboard"></i>
             </button>
             <button class="meeting-control-btn" id="meeting-hand-btn" aria-label="Lever ou baisser la main" onclick="window.toggleMeetingHand()" title="Lever la main">
               <i class="fa-solid fa-hand"></i>
@@ -1423,281 +1831,6 @@ Meetings.prototype.showMeetingScreen = function(data) {
   }
 
   this.updateMeetingParticipantCount();
-  this._initWhiteboardCanvas();
-};
-
-// ===== TABLEAU BLANC COLLABORATIF (WHITEBOARD) =====
-
-Meetings.prototype._initWhiteboardCanvas = function() {
-  const panel = document.getElementById("meeting-whiteboard-panel");
-  const canvas = document.getElementById("meeting-whiteboard-canvas");
-  if (!panel || !canvas) return;
-
-  this.whiteboardState = this.whiteboardState || {
-    isOpen: false,
-    allowParticipantsDraw: true,
-    strokes: [],
-    tool: "pen",
-    color: "#111827",
-    size: 4,
-    drawing: false,
-    lastX: 0,
-    lastY: 0,
-  };
-
-  const resizeCanvas = () => {
-    const wrap = canvas.parentElement;
-    if (!wrap) return;
-    const rect = wrap.getBoundingClientRect();
-    if (rect.width <= 0 || rect.height <= 0) return;
-    canvas.width = Math.floor(rect.width);
-    canvas.height = Math.floor(rect.height);
-    this._redrawWhiteboard();
-  };
-  this._wbResizeHandler = resizeCanvas;
-  window.addEventListener("resize", resizeCanvas);
-
-  const canDraw = () => this.isMeetingHost || !!this.whiteboardState.allowParticipantsDraw;
-
-  const getNormPos = (e) => {
-    const rect = canvas.getBoundingClientRect();
-    if (!rect.width || !rect.height) return { x: 0, y: 0 };
-    return {
-      x: Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width)),
-      y: Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height)),
-    };
-  };
-
-  canvas.addEventListener("pointerdown", (e) => {
-    if (!this.whiteboardState.isOpen || !canDraw()) return;
-    e.preventDefault();
-    canvas.setPointerCapture?.(e.pointerId);
-    const pos = getNormPos(e);
-    this.whiteboardState.drawing = true;
-    this.whiteboardState.lastX = pos.x;
-    this.whiteboardState.lastY = pos.y;
-  });
-
-  canvas.addEventListener("pointermove", (e) => {
-    if (!this.whiteboardState.drawing || !this.whiteboardState.isOpen || !canDraw()) return;
-    e.preventDefault();
-    const pos = getNormPos(e);
-    const stroke = {
-      x0: this.whiteboardState.lastX,
-      y0: this.whiteboardState.lastY,
-      x1: pos.x,
-      y1: pos.y,
-      color: this.whiteboardState.color,
-      size: this.whiteboardState.size,
-      tool: this.whiteboardState.tool,
-    };
-    this.whiteboardState.lastX = pos.x;
-    this.whiteboardState.lastY = pos.y;
-    this.whiteboardState.strokes.push(stroke);
-    this._drawWhiteboardSegment(stroke);
-
-    if (this.currentMeetingId) {
-      this.sendSignal({
-        type: "whiteboard-draw",
-        meetingId: this.currentMeetingId,
-        ...stroke,
-      });
-    }
-  });
-
-  const stopDraw = () => {
-    this.whiteboardState.drawing = false;
-  };
-  canvas.addEventListener("pointerup", stopDraw);
-  canvas.addEventListener("pointercancel", stopDraw);
-
-  const penBtn = document.getElementById("wb-tool-pen");
-  const eraserBtn = document.getElementById("wb-tool-eraser");
-  [penBtn, eraserBtn].forEach((btn) => {
-    if (!btn) return;
-    btn.addEventListener("click", () => {
-      this.whiteboardState.tool = btn.dataset.tool || "pen";
-      penBtn?.classList.toggle("active", this.whiteboardState.tool === "pen");
-      eraserBtn?.classList.toggle("active", this.whiteboardState.tool === "eraser");
-    });
-  });
-
-  panel.querySelectorAll(".wb-color-btn").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      this.whiteboardState.color = btn.dataset.color || "#111827";
-      this.whiteboardState.tool = "pen";
-      penBtn?.classList.add("active");
-      eraserBtn?.classList.remove("active");
-      panel.querySelectorAll(".wb-color-btn").forEach((b) => b.classList.toggle("active", b === btn));
-    });
-  });
-
-  const sizeSelect = document.getElementById("wb-size");
-  if (sizeSelect) {
-    sizeSelect.addEventListener("change", () => {
-      this.whiteboardState.size = Number(sizeSelect.value) || 4;
-    });
-  }
-
-  const clearBtn = document.getElementById("wb-clear");
-  if (clearBtn) {
-    clearBtn.addEventListener("click", () => {
-      if (!this.isMeetingHost || !this.currentMeetingId) return;
-      this.whiteboardState.strokes = [];
-      this._redrawWhiteboard();
-      this.sendSignal({ type: "whiteboard-clear", meetingId: this.currentMeetingId });
-    });
-  }
-
-  const exportBtn = document.getElementById("wb-export");
-  if (exportBtn) {
-    exportBtn.addEventListener("click", () => {
-      try {
-        const link = document.createElement("a");
-        link.download = `tableau-${this.currentMeetingCode || "reunion"}.png`;
-        link.href = canvas.toDataURL("image/png");
-        link.click();
-      } catch (err) {
-        this.showCallToast("Export PNG impossible");
-      }
-    });
-  }
-
-  const allowToggle = document.getElementById("wb-allow-draw");
-  if (allowToggle) {
-    allowToggle.addEventListener("change", () => {
-      if (!this.isMeetingHost || !this.currentMeetingId) return;
-      this.whiteboardState.allowParticipantsDraw = allowToggle.checked;
-      this.sendSignal({
-        type: "whiteboard-toggle",
-        meetingId: this.currentMeetingId,
-        isOpen: this.whiteboardState.isOpen,
-        allowParticipantsDraw: allowToggle.checked,
-      });
-    });
-  }
-};
-
-Meetings.prototype._drawWhiteboardSegment = function(s) {
-  const canvas = document.getElementById("meeting-whiteboard-canvas");
-  if (!canvas || !canvas.width || !canvas.height) return;
-  const ctx = canvas.getContext("2d");
-  if (!ctx) return;
-
-  ctx.save();
-  ctx.lineCap = "round";
-  ctx.lineJoin = "round";
-  ctx.lineWidth = s.size || 4;
-  ctx.strokeStyle = s.tool === "eraser" ? "#ffffff" : (s.color || "#111827");
-  ctx.beginPath();
-  ctx.moveTo(s.x0 * canvas.width, s.y0 * canvas.height);
-  ctx.lineTo(s.x1 * canvas.width, s.y1 * canvas.height);
-  ctx.stroke();
-  ctx.restore();
-};
-
-Meetings.prototype._redrawWhiteboard = function() {
-  const canvas = document.getElementById("meeting-whiteboard-canvas");
-  if (!canvas || !canvas.width || !canvas.height) return;
-  const ctx = canvas.getContext("2d");
-  if (!ctx) return;
-  ctx.fillStyle = "#ffffff";
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
-  const strokes = this.whiteboardState?.strokes || [];
-  for (const s of strokes) {
-    this._drawWhiteboardSegment(s);
-  }
-};
-
-Meetings.prototype._applyWhiteboardUI = function() {
-  const panel = document.getElementById("meeting-whiteboard-panel");
-  const btn = document.getElementById("meeting-whiteboard-btn");
-  const badge = document.getElementById("wb-readonly-badge");
-  const toolbar = document.getElementById("whiteboard-toolbar");
-  const allowToggle = document.getElementById("wb-allow-draw");
-  const isOpen = !!this.whiteboardState?.isOpen;
-  const canDraw = this.isMeetingHost || !!this.whiteboardState?.allowParticipantsDraw;
-
-  if (panel) panel.style.display = isOpen ? "flex" : "none";
-  if (btn) btn.classList.toggle("active", isOpen);
-  if (badge) badge.style.display = canDraw ? "none" : "inline-block";
-  if (toolbar) toolbar.style.display = canDraw ? "flex" : "none";
-  if (allowToggle) allowToggle.checked = !!this.whiteboardState?.allowParticipantsDraw;
-
-  if (isOpen && this._wbResizeHandler) {
-    requestAnimationFrame(() => this._wbResizeHandler());
-  }
-};
-
-Meetings.prototype.toggleMeetingWhiteboard = function() {
-  if (!this.whiteboardState) return;
-  if (this.isMeetingHost && this.currentMeetingId) {
-    const nextOpen = !this.whiteboardState.isOpen;
-    this.whiteboardState.isOpen = nextOpen;
-    this._applyWhiteboardUI();
-    this.sendSignal({
-      type: "whiteboard-toggle",
-      meetingId: this.currentMeetingId,
-      isOpen: nextOpen,
-      allowParticipantsDraw: this.whiteboardState.allowParticipantsDraw,
-    });
-    return;
-  }
-
-  // Un participant peut masquer/afficher localement le tableau s'il est actif
-  if (!this.whiteboardState.isOpen && this.currentMeetingId) {
-    this.sendSignal({ type: "whiteboard-sync", meetingId: this.currentMeetingId });
-  } else {
-    this.whiteboardState.isOpen = false;
-    this._applyWhiteboardUI();
-  }
-};
-
-Meetings.prototype.handleWhiteboardState = function(data) {
-  if (!this.whiteboardState) this._initWhiteboardCanvas();
-  if (!this.whiteboardState) return;
-  this.whiteboardState.isOpen = !!data.isOpen;
-  this.whiteboardState.allowParticipantsDraw = data.allowParticipantsDraw !== false;
-  if (Array.isArray(data.strokes)) {
-    this.whiteboardState.strokes = data.strokes.slice();
-  }
-  this._applyWhiteboardUI();
-  this._redrawWhiteboard();
-};
-
-Meetings.prototype.handleWhiteboardDraw = function(data) {
-  if (!this.whiteboardState) return;
-  const stroke = {
-    x0: data.x0,
-    y0: data.y0,
-    x1: data.x1,
-    y1: data.y1,
-    color: data.color,
-    size: data.size,
-    tool: data.tool,
-  };
-  this.whiteboardState.strokes.push(stroke);
-  this._drawWhiteboardSegment(stroke);
-};
-
-Meetings.prototype.handleWhiteboardCleared = function() {
-  if (!this.whiteboardState) return;
-  this.whiteboardState.strokes = [];
-  this._redrawWhiteboard();
-};
-
-Meetings.prototype.resetWhiteboard = function() {
-  if (this._wbResizeHandler) {
-    window.removeEventListener("resize", this._wbResizeHandler);
-    this._wbResizeHandler = null;
-  }
-  if (this.whiteboardState) {
-    this.whiteboardState.isOpen = false;
-    this.whiteboardState.strokes = [];
-    this.whiteboardState.drawing = false;
-  }
-  const panel = document.getElementById("meeting-whiteboard-panel");
-  if (panel) panel.style.display = "none";
 };
 
 /**
@@ -1863,16 +1996,67 @@ Meetings.prototype.showFloatingReaction = function(userId, emoji) {
 };
 
 /**
- * Partage d'écran (réutilise le flux groupe)
+ * Arrête proprement la capture d'écran native Cordova (MediaProjection / ReplayKit)
+ * lorsqu'elle a été ouverte pour LiveKit.
+ */
+Meetings.prototype._stopNativeLiveKitScreenShare = function() {
+  if (window.ScreenShareLive) {
+    try {
+      window.ScreenShareLive.stop(() => {}, () => {});
+    } catch (_) {}
+  }
+  if (this._screenCanvasStream) {
+    try {
+      this._screenCanvasStream.destroy();
+    } catch (_) {}
+    this._screenCanvasStream = null;
+  }
+  if (this._lkNativeScreenStream) {
+    try {
+      this._lkNativeScreenStream.getTracks().forEach((t) => t.stop());
+    } catch (_) {}
+    this._lkNativeScreenStream = null;
+  }
+};
+
+/**
+ * Partage d'écran (LiveKit navigateur/Cordova natif, ou Mesh existant)
  */
 Meetings.prototype.toggleMeetingScreenShare = async function() {
   const btn = document.getElementById("meeting-screen-btn");
   try {
-    if (typeof this.toggleScreenShare === "function") {
+    if (this.activeMediaEngine === "livekit" && this.livekit) {
+      if (!this.isScreenSharing) {
+        const useNative =
+          typeof this._useNativeScreenShare === "function" && this._useNativeScreenShare();
+        if (useNative && typeof this._startNativeScreenCapture === "function") {
+          const nativeStream = await this._startNativeScreenCapture();
+          const customTrack = nativeStream && nativeStream.getVideoTracks()[0];
+          if (!customTrack) {
+            this._stopNativeLiveKitScreenShare();
+            throw new Error("Track vidéo natif introuvable");
+          }
+          this._lkNativeScreenStream = nativeStream;
+          this.isScreenSharing = await this.livekit.toggleScreenShare({
+            forceState: true,
+            customTrack,
+          });
+        } else {
+          this.isScreenSharing = await this.livekit.toggleScreenShare({ forceState: true });
+        }
+      } else {
+        this.isScreenSharing = await this.livekit.toggleScreenShare({ forceState: false });
+        this._stopNativeLiveKitScreenShare();
+      }
+    } else if (typeof this.toggleScreenShare === "function") {
       await this.toggleScreenShare();
     }
   } catch (e) {
     console.error("screen share error", e);
+    if (this.activeMediaEngine === "livekit") {
+      this._stopNativeLiveKitScreenShare();
+      this.isScreenSharing = false;
+    }
     this.showCallToast("Partage d'écran impossible");
     return;
   }
@@ -1963,13 +2147,7 @@ Meetings.prototype.hostMuteParticipant = function(targetUserId, media, muted = t
  * Cette version demande confirmation pour le bouton "quitter".
  */
 Meetings.prototype.leaveMeetingWithConfirm = async function() {
-  const msg = this.isMeetingHost
-    ? "Vous êtes l'hôte. Quitter mettra fin à la réunion pour tous les participants. Voulez-vous vraiment quitter ?"
-    : "Voulez-vous vraiment quitter la réunion ?";
-  if (await this.confirmMeetingAction("Quitter la réunion", msg)) {
-    if (this.isMeetingHost && this.currentMeetingId) {
-      this.sendSignal({ type: "meeting-leave", meetingId: this.currentMeetingId });
-    }
+  if (await this.confirmMeetingAction("Quitter la r\u00e9union", "Voulez-vous vraiment quitter la r\u00e9union ?")) {
     this.leaveMeeting();
   }
 };
@@ -2018,21 +2196,15 @@ Meetings.prototype.handleMeetingList = function(data) {
 
 Meetings.prototype.handleMeetingEnded = function(data) {
   console.log("📅 [MEETING] Réunion terminée:", data.meetingId, "raison:", data.reason);
-  const message = data.reason === "host_left"
-    ? "L'hôte a quitté la réunion. La réunion est terminée."
-    : (data.reason || "La réunion est terminée");
-  this.showCallToast(message);
-  this.resetWhiteboard?.();
+  this.showCallToast(data.reason || "La réunion est terminée");
   // Purge musique d'attente + compte à rebours + salle d'attente
   this._broadcastWaitingMusicStop();
   this.closeMeetingWaitingView();
   this.closeMeetingCreatedView();
   // endGroupCall : leave signal + peers + médias + écran + panneaux
   this.endGroupCall(undefined);
-  this.isMeetingHost = false;
-  this.meetingCreatedBy = null;
-  this.meetingWaitingRoomId = null;
-  this.meetingApprovalPending = false;
+  // ÉTAT CENTRALISÉ : tous les champs + timers + musique en un seul appel
+  this.resetMeetingState();
 };
 
 // ===== UI LISTE DES RÉUNIONS =====
@@ -2213,6 +2385,34 @@ Meetings.prototype.openMeetingDetails = function(meetingId) {
 Meetings.prototype.createMeeting = function(title, scheduledAt, durationMin, isVideo, participants, description = "", accessPolicy = "direct", waitingMusicTracks = []) {
   console.log("📅 [MEETING] createMeeting appelé - wsReadyState:", this.wsReadyState, "wsId:", this.wsId);
 
+  // Pour Cordova : utiliser wsReadyState, pour navigateur : utiliser ws.readyState
+  const isConnected = this.wsReadyState === WebSocket.OPEN || (this.ws && this.ws.readyState === WebSocket.OPEN);
+
+  if (!isConnected) {
+    if (this.meetingConnectionRetryPending) return;
+    this.meetingConnectionRetryPending = true;
+    this.showCallToast("Connexion au serveur…");
+    console.log("📅 [MEETING] WebSocket non connecté, tentative de connexion...");
+    this.connectWebSocket();
+
+    const deadline = Date.now() + 20000;
+    const retryCreate = () => {
+      const nowConnected = this.wsReadyState === WebSocket.OPEN || (this.ws && this.ws.readyState === WebSocket.OPEN);
+      if (nowConnected) {
+        this.meetingConnectionRetryPending = false;
+        this.createMeeting(title, scheduledAt, durationMin, isVideo, participants, description, accessPolicy, waitingMusicTracks);
+      } else if (Date.now() < deadline) {
+        setTimeout(retryCreate, 200);
+      } else {
+        this.meetingConnectionRetryPending = false;
+        console.error("📅 [MEETING] WebSocket toujours non connecté après tentative");
+        this.showCallToast("Connexion au serveur impossible. Réessayez.");
+      }
+    };
+    setTimeout(retryCreate, 150);
+    return;
+  }
+
   if (!this.myId) {
     this.showCallToast("ID utilisateur requis - veuillez patienter");
     return;
@@ -2224,87 +2424,94 @@ Meetings.prototype.createMeeting = function(title, scheduledAt, durationMin, isV
     return;
   }
 
-  // Garder les pistes audio en attente pour les envoyer APRÈS meeting-created
-  // (le payload initial de création reste < 2 Ko pour éviter 413 / coupure WS 1006).
-  this._pendingWaitingMusicTracks = Array.isArray(waitingMusicTracks) && waitingMusicTracks.length
-    ? waitingMusicTracks
-    : null;
-
-  const payload = {
+  // Mémoriser la demande pour pouvoir la REJOUER si la connexion WebSocket
+  // tombe juste après l'envoi (le socket natif peut se fermer pendant que
+  // wsReadyState vaut encore OPEN — log observable « Erreur WebSocket :
+  // closed » juste après l'envoi). La demande est rejouée automatiquement
+  // après la reconnexion (voir _retryPendingMeetingCreate), tant qu'elle a
+  // moins de 30 s ; sinon elle est abandonnée proprement.
+  this._createRequestIdSeq = (this._createRequestIdSeq || 0) + 1;
+  const createRequestId = `mc_${Date.now()}_${this._createRequestIdSeq}_${Math.random().toString(36).slice(2, 8)}`;
+  this._setMeetingPhase(Meetings.MEETING_PHASES.CREATE);
+  this._pendingMeetingCreate = {
     title,
     description,
     scheduledAt: scheduledAtTimestamp,
-    durationMin: parseInt(durationMin, 10),
+    durationMin: parseInt(durationMin),
     isVideo: !!isVideo,
     participants: participants || [],
     accessPolicy: accessPolicy || "direct",
+    waitingMusicTracks,
+    requestId: createRequestId,
+    sentAt: Date.now(),
   };
 
-  this._meetingCreateHandled = false;
-  clearTimeout(this.meetingCreateTimeout);
-  clearTimeout(this.meetingCreateFallbackTimeout);
-
-  const createViaHttpFallback = async () => {
-    if (this._meetingCreateHandled) return;
-    console.log("🌐 [MEETING] Bascule création via API HTTP REST POST /api/meeting");
-    this.showCallToast("Planification via HTTP en cours…");
-    try {
-      const authToken = this.authToken || window.localStorage?.getItem("app_auth_token") || "";
-      const headers = { "Content-Type": "application/json" };
-      if (authToken) {
-        headers["Authorization"] = `Bearer ${authToken}`;
-      }
-      const response = await fetch(`${CallManager.HTTP_SERVER_URL}/api/meeting`, {
-        method: "POST",
-        headers,
-        body: JSON.stringify({ ...payload, createdBy: this.myId }),
-      });
-      const result = await response.json().catch(() => ({}));
-      if (!response.ok || result.success === false) {
-        throw new Error(result.error || result.reason || `Erreur HTTP ${response.status}`);
-      }
-      if (!this._meetingCreateHandled) {
-        this.handleMeetingCreated(result);
-      }
-    } catch (err) {
-      console.error("❌ [MEETING] Échec création HTTP:", err);
-      this.meetingCreateSubmitting = false;
-      this.instantMeetingPending = false;
-      this.showCallToast(err.message || "Impossible de planifier la réunion. Réessayez.");
-    }
-  };
-
-  const isConnected = this.wsReadyState === WebSocket.OPEN || (this.ws && this.ws.readyState === WebSocket.OPEN);
-
-  if (!isConnected) {
-    // Socket déconnecté ou en reconnexion : bascule directe sur l'API HTTP REST
-    createViaHttpFallback();
-    if (!this.isReconnecting) {
-      this.connectWebSocket();
-    }
-    return;
+  // DIAGNOSTIC : une musique embarquée en dataUrl fait des dizaines de Mo et
+  // tue le WebSocket. Elle ne doit plus passer par ce message (upload HTTP).
+  const musicBytes = (waitingMusicTracks || []).reduce((s, t) => s + ((t && t.dataUrl) ? t.dataUrl.length : 0), 0);
+  if (musicBytes > 0) {
+    console.warn(`📅 [MEETING] meeting-create contient ${(musicBytes / 1048576).toFixed(1)} Mo de musique en WebSocket — à ne plus faire (utiliser l'upload HTTP)`);
   }
 
   this.sendSignal({
     type: "meeting-create",
-    ...payload,
+    title,
+    description,
+    scheduledAt: scheduledAtTimestamp,
+    durationMin: parseInt(durationMin),
+    isVideo: !!isVideo,
+    participants: participants || [],
+    accessPolicy: accessPolicy || "direct",
+    waitingMusicTracks,
+    requestId: createRequestId,
   });
 
-  // Fallback automatique vers HTTP REST si aucune réponse WS sous 5 secondes
-  this.meetingCreateFallbackTimeout = setTimeout(() => {
-    this.meetingCreateFallbackTimeout = null;
-    if (!this._meetingCreateHandled) {
-      createViaHttpFallback();
-    }
-  }, 5000);
-
-  this.meetingCreateTimeout = setTimeout(() => {
+  clearTimeout(this.meetingCreateTimeout);
+  const showCreateTimeoutToast = () => {
     this.meetingCreateTimeout = null;
-    if (!this._meetingCreateHandled) {
-      this.meetingCreateSubmitting = false;
-      this.instantMeetingPending = false;
-      this.showCallToast("Aucune réponse du serveur. Vérifie ta connexion puis réessaie.");
+    this.meetingCreateSubmitting = false;
+    this.instantMeetingPending = false;
+    const connected = this.wsReadyState === WebSocket.OPEN || (this.ws && this.ws.readyState === WebSocket.OPEN);
+    this.showCallToast(connected
+      ? "Aucune réponse du serveur. Vérifie ta connexion puis réessaie."
+      : "Connexion au serveur interrompue. Vérifie ta connexion puis réessaie.");
+  };
+  this.meetingCreateTimeout = setTimeout(() => {
+    // DIAGNOSTIC COMPLET : expliquer POURQUOI aucune réponse n'est arrivée
+    // (socket ouvert ? demande encore en file ? réponse perdue en route ?).
+    const connectedNow = this.wsReadyState === WebSocket.OPEN || (this.ws && this.ws.readyState === WebSocket.OPEN);
+    const pending = this._pendingMeetingCreate;
+    console.error("⏰ [MEETING] meeting-create : AUCUNE réponse du serveur après 20 s.", JSON.stringify({
+      wsReadyState: this.wsReadyState,
+      nativeReadyState: this.ws ? this.ws.readyState : null,
+      connected: connectedNow,
+      requestId: pending ? pending.requestId : null,
+      ageSec: pending ? Math.round((Date.now() - pending.sentAt) / 1000) : null,
+      myId: this.myId || null,
+      musicInWSMb: +(musicBytes / 1048576).toFixed(1),
+    }));
+    // Auto-récupération UNE FOIS : si toujours connecté et demande < 30 s,
+    // on rejoue (le serveur déduplique par requestId — pas de 2e réunion).
+    // Évite les faux « Aucune réponse » quand le message s'est perdu en route.
+    if (pending && connectedNow && !pending._replayed && Date.now() - pending.sentAt < 30000) {
+      pending._replayed = true;
+      console.log("🔁 [MEETING] meeting-create : réponse toujours attendue — rejoue UNE fois la demande");
+      this.sendSignal({
+        type: "meeting-create",
+        title: pending.title,
+        description: pending.description,
+        scheduledAt: pending.scheduledAt,
+        durationMin: pending.durationMin,
+        isVideo: pending.isVideo,
+        participants: pending.participants,
+        accessPolicy: pending.accessPolicy,
+        waitingMusicTracks: pending.waitingMusicTracks,
+        requestId: pending.requestId,
+      });
+      this.meetingCreateTimeout = setTimeout(showCreateTimeoutToast, 20000);
+      return;
     }
+    showCreateTimeoutToast();
   }, 20000);
 
   console.log("📅 [MEETING] Demande de création de réunion envoyée avec politique:", accessPolicy);
@@ -2686,10 +2893,6 @@ Meetings.prototype.confirmCreateMeeting = async function() {
     this.showCallToast("Choisis des fichiers audio valides");
     return;
   }
-  const MAX_MUSIC_FILE_BYTES = 5 * 1024 * 1024;
-  if (musicFiles.some((file) => file.size > MAX_MUSIC_FILE_BYTES)) {
-    this.showCallToast("⚠️ Un fichier audio dépasse 5 Mo et risque d'être ignoré lors de l'envoi.");
-  }
   this.meetingCreateSubmitting = true;
   let waitingMusicTracks;
   try {
@@ -2710,8 +2913,13 @@ Meetings.prototype.confirmCreateMeeting = async function() {
   this.waitingMusicDataUrl = waitingMusicTracks[0]?.dataUrl || null;
   this.waitingMusicTitle = waitingMusicTracks.map((track) => track.name).join(" • ");
 
-  // Mode création
-  this.createMeeting(title, datetime, duration, isVideo, [], description, accessPolicy, waitingMusicTracks);
+  // ANTI-SATURATION WS : les dataUrls de la musique ne passent PLUS dans le
+  // message meeting-create (un message de dizaines de Mo faisait mourir le
+  // socket => « Aucune réponse du serveur » répétée + création impossible).
+  // Les fichiers sont téléversés en HTTP après la création (voir
+  // handleMeetingCreated) ; on garde ici un aperçu LOCAL pour l'hôte.
+  this._pendingWaitingMusicFiles = musicFiles.filter(Boolean);
+  this.createMeeting(title, datetime, duration, isVideo, [], description, accessPolicy, []);
 };
 
 Meetings.prototype.cancelMeeting = async function() {
@@ -3012,6 +3220,7 @@ Meetings.prototype.closeMeetingJoinView = function() {
 // ===== ÉCRAN DE PRÉVISUALISATION (NOUVEAU) =====
 
 Meetings.prototype.showMeetingPreviewView = async function(code, meetingIsVideo) {
+  this._setMeetingPhase(Meetings.MEETING_PHASES.PREVIEW);
   if (this.meetingPreviewView) {
     this.meetingPreviewView.classList.add("active");
     return;
@@ -3376,7 +3585,7 @@ Meetings.prototype.showMeetingWaitingView = function(data) {
             <div class="waiting-room-participants-heading">
               <div>
                 <h2>Les participants</h2>
-                <p>Vous pouvez d&eacute;j&agrave; vous voir en attendant l'h&ocirc;te.</p>
+                <p>Vid&eacute;o et audio actifs entre vous en attendant l&rsquo;h&ocirc;te.</p>
               </div>
               <span class="waiting-room-live"><i class="fa-solid fa-circle"></i> EN ATTENTE · <span id="waiting-participant-count">1</span></span>
             </div>
@@ -3741,15 +3950,9 @@ window.copyMeetingCode = function(code) { window.callManager.copyMeetingCode(cod
 window.closePendingRequestDialog = function() { window.callManager.closePendingRequestDialog(); };
 window.approveMeetingRequest = function(meetingId, userId) { window.callManager.approveMeetingRequest(meetingId, userId); };
 window.rejectMeetingRequest = function(meetingId, userId) { window.callManager.rejectMeetingRequest(meetingId, userId); };
-// Bouton "quitter" : demande confirmation à l'hôte car son départ termine la réunion.
-window.leaveMeeting = function() {
-  if (window.callManager?.isMeetingHost && typeof window.callManager.leaveMeetingWithConfirm === "function") {
-    window.callManager.leaveMeetingWithConfirm();
-    return;
-  }
-  window.callManager.leaveMeeting ? window.callManager.leaveMeeting() : window.callManager.leaveMeetingWithConfirm();
-};
-window.toggleMeetingWhiteboard = function() { window.callManager.toggleMeetingWhiteboard?.(); };
+// Bouton "quitter" : quitte directement (style WhatsApp). La confirmation
+// détaillée reste disponible via leaveMeetingWithConfirm pour le Web.
+window.leaveMeeting = function() { window.callManager.leaveMeeting ? window.callManager.leaveMeeting() : window.callManager.leaveMeetingWithConfirm(); };
 window.endMeetingForEveryone = function() { window.callManager.endMeetingForEveryone(); };
 window.toggleMeetingMic = function() { window.callManager.toggleMeetingMic(); };
 window.toggleMeetingCam = function() { window.callManager.toggleMeetingCam(); };

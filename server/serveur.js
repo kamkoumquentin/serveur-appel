@@ -1,6 +1,23 @@
 const express = require("express");
 const http = require("http");
+const crypto = require("crypto");
+const path = require("path");
 const { WebSocketServer, WebSocket } = require("ws");
+const { AccessToken } = require("livekit-server-sdk");
+
+// Charger server/.env en local (Node 20.12+ / 22+), sans échouer en prod (Render)
+if (typeof process.loadEnvFile === "function") {
+  try {
+    process.loadEnvFile(path.join(__dirname, ".env"));
+  } catch (_) {}
+}
+
+// Configuration LiveKit (SFU) depuis variables d'environnement
+const LIVEKIT_URL = process.env.LIVEKIT_URL || "";
+const LIVEKIT_HTTP_URL = process.env.LIVEKIT_HTTP_URL || "";
+const LIVEKIT_API_KEY = process.env.LIVEKIT_API_KEY || "";
+const LIVEKIT_API_SECRET = process.env.LIVEKIT_API_SECRET || "";
+const MEETINGS_ENGINE = process.env.MEETINGS_ENGINE === "livekit" ? "livekit" : "mesh";
 
 // Imports Firebase Admin v10+ / v11+
 const { initializeApp, cert } = require("firebase-admin/app");
@@ -60,25 +77,22 @@ initializeApp({
 
 // Initialisation de Firestore pour la persistance des réunions
 const db = getFirestore();
-db.settings({ ignoreUndefinedProperties: true });
 
 const app = express();
 
-// Middleware CORS permissif placé AVANT express.json() pour qu'aucune erreur
-// 413/400/500 ne soit masquée par un blocage CORS côté navigateur.
+// Nettoie les schémas PATCH/POST REST (qui étaient cassés : req.body undefined → 500)
+app.use(express.json({ limit: "2mb" }));
+
+// Middleware CORS permissif pour wake-up Render + tests
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
-  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-User-Id, X-Auth-Token");
   if (req.method === "OPTIONS") {
     return res.sendStatus(200);
   }
   next();
 });
-
-// Nettoie les schémas PATCH/POST REST avec limite relevée à 15mb
-app.use(express.json({ limit: "15mb" }));
-app.use(express.urlencoded({ extended: true, limit: "15mb" }));
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
@@ -100,20 +114,20 @@ const userAuthTokens = new Map();
 const TOKEN_VALIDITY_MS = 24 * 60 * 60 * 1000;
 
 /**
- * Génère un token d'authentification unique pour un utilisateur
- * Format sécurisé : 32 caractères hexadécimaux
+ * Génère un token d'authentification cryptographiquement aléatoire pour un utilisateur
+ * (64 caractères hexadécimaux / 256 bits d'entropie).
  */
 function generateAuthToken(userId) {
-  const timestamp = Date.now().toString(16);
-  const random = Math.random().toString(16).substring(2, 10);
-  const userHash = userId.split('').reduce((acc, char) => acc + char.charCodeAt(0).toString(16), '').substring(0, 16);
-  return `${timestamp}-${random}-${userHash}`.substring(0, 32);
+  return crypto.randomBytes(32).toString("hex");
 }
 
 /**
  * Vérifie si un token est valide (existe et n'est pas expiré)
  */
 function validateAuthToken(userId, token) {
+  if (!userId || !token) {
+    return false;
+  }
   const stored = userAuthTokens.get(userId);
   if (!stored || stored.token !== token) {
     return false;
@@ -128,6 +142,37 @@ function validateAuthToken(userId, token) {
   }
 
   return true;
+}
+
+/**
+ * Middleware Express d'authentification stricte via validateAuthToken.
+ * Accepte le token dans `Authorization: Bearer <token>`, `X-Auth-Token`, `req.query.token` ou `req.body.authToken`,
+ * et l'identifiant dans `X-User-Id`, `req.query.userId` ou `req.body.userId`.
+ */
+function requireAuth(req, res, next) {
+  const authHeader = String(req.headers.authorization || "");
+  const bearerToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : "";
+  const token = String(
+    bearerToken ||
+    req.headers["x-auth-token"] ||
+    req.query?.token ||
+    req.body?.authToken ||
+    ""
+  ).trim();
+
+  const userId = String(
+    req.headers["x-user-id"] ||
+    req.query?.userId ||
+    req.body?.userId ||
+    ""
+  ).trim();
+
+  if (!userId || !token || !validateAuthToken(userId, token)) {
+    return res.status(401).json({ error: "Authentification invalide ou expirée" });
+  }
+
+  req.authUserId = userId;
+  next();
 }
 
 // Stockage temporaire en mémoire RAM pour les offres d'appel (évite de surcharger FCM)
@@ -191,25 +236,6 @@ function sanitizeString(str, maxLength = 1000) {
  * @param {string} type - Type de message
  * @returns {object} {valid: boolean, reason: string}
  */
-function normalizeScheduledAt(scheduledAt) {
-  if (scheduledAt === null || scheduledAt === undefined || scheduledAt === "") {
-    return { valid: true, value: Date.now() };
-  }
-  if (typeof scheduledAt === "number") {
-    return Number.isFinite(scheduledAt)
-      ? { valid: true, value: scheduledAt }
-      : { valid: false, reason: "Date invalide" };
-  }
-  if (typeof scheduledAt === "string") {
-    const trimmed = scheduledAt.trim();
-    const parsed = /^\d+$/.test(trimmed) ? Number(trimmed) : Date.parse(trimmed);
-    return Number.isFinite(parsed)
-      ? { valid: true, value: parsed }
-      : { valid: false, reason: "Date invalide" };
-  }
-  return { valid: false, reason: "Date invalide" };
-}
-
 function validateMeetingMessage(data, type) {
   if (!data || typeof data !== 'object') {
     return { valid: false, reason: 'Données invalides' };
@@ -217,21 +243,17 @@ function validateMeetingMessage(data, type) {
 
   switch (type) {
     case 'meeting-create':
-    case 'create-meeting':
-      if (!data.title || typeof data.title !== 'string' || data.title.trim().length === 0 || data.title.length > 100) {
-        return { valid: false, reason: 'Titre invalide (1 à 100 caractères)' };
+      if (!data.title || typeof data.title !== 'string' || data.title.length > 100) {
+        return { valid: false, reason: 'Titre invalide (max 100 caractères)' };
       }
       if (data.description && typeof data.description === 'string' && data.description.length > 500) {
         return { valid: false, reason: 'Description trop longue (max 500 caractères)' };
       }
-      if (!normalizeScheduledAt(data.scheduledAt).valid) {
+      if (data.scheduledAt && typeof data.scheduledAt !== 'number') {
         return { valid: false, reason: 'Date invalide' };
       }
-      if (data.durationMin !== undefined && data.durationMin !== null && data.durationMin !== '') {
-        const dur = Number(data.durationMin);
-        if (!Number.isFinite(dur) || dur < 15 || dur > 480) {
-          return { valid: false, reason: 'Durée invalide (entre 15 et 480 minutes)' };
-        }
+      if (data.durationMin && (typeof data.durationMin !== 'number' || data.durationMin < 15 || data.durationMin > 480)) {
+        return { valid: false, reason: 'Durée invalide (entre 15 et 480 minutes)' };
       }
       break;
 
@@ -356,7 +378,9 @@ class RoomManager {
     this.rooms = new Map();
     
     // Maximum de participants par salle (JOINED + RINGING)
-    this.MAX_PARTICIPANTS = 15;
+    // Aligné sur le client (CallManager.GROUP_MAX_PARTICIPANTS = 6)
+    // Limite pratique du maillage WebRTC (mesh) pour garder de bonnes performances
+    this.MAX_PARTICIPANTS = 6;
     
     // Délai d'expiration d'une invitation (45 secondes comme WhatsApp)
     this.INVITE_TIMEOUT_MS = 45000;
@@ -1183,7 +1207,7 @@ class RoomManager {
  * - Fenêtre d'accès : 15 minutes avant scheduledAt jusqu'à endsAt
  * - Host = créateur (seul peut annuler)
  * - Code unique non devinable (9 caractères alphanumériques)
- * - MAX participants = 15 (comme les groupes actuels)
+ * - MAX participants = 6 (aligné sur CallManager.GROUP_MAX_PARTICIPANTS, mesh WebRTC)
  * - Transition scheduled→live automatique à l'heure ou premier join
  */
 class MeetingManager {
@@ -1217,7 +1241,7 @@ class MeetingManager {
    * =========================================================
    *
    * Génère un code court de 9 caractères (format: XXX-XXX-XXX)
-   * Utilise Math.random() pour simplifier (suffisant pour ce cas d'usage)
+   * Utilise crypto.randomBytes (cryptographiquement sécurisé)
    * Caractères sans ambiguïté : pas de 0/O/1/I
    *
    * @returns {string} Code unique (ex: "ABC-123-XYZ")
@@ -1229,11 +1253,14 @@ class MeetingManager {
     const maxAttempts = 100;
 
     do {
+      // 9 octets aléatoires cryptographiquement sûrs : 1 octet par caractère
+      const bytes = crypto.randomBytes(9);
       const parts = [];
       for (let i = 0; i < 3; i++) {
         let part = "";
         for (let j = 0; j < 3; j++) {
-          part += chars.charAt(Math.floor(Math.random() * chars.length));
+          // Modulo 32 : sans biais notable car 256 % 32 === 0
+          part += chars.charAt(bytes[i * 3 + j] % chars.length);
         }
         parts.push(part);
       }
@@ -1266,9 +1293,9 @@ class MeetingManager {
    * @param {Array<string>} params.participants - Liste des participants invités
    * @returns {Promise<object>} Réunion créée avec meetingId, code, link
    */
-  async create({ title, description, scheduledAt, durationMin, isVideo, createdBy, hostName, participants, accessPolicy }) {
+  async create({ title, description, scheduledAt, durationMin, isVideo, createdBy, participants, accessPolicy }) {
     // Validation des paramètres
-    if (!title || typeof title !== "string" || title.trim().length === 0) {
+    if (!title || title.trim().length === 0) {
       return { success: false, reason: "Le titre est requis" };
     }
 
@@ -1280,20 +1307,13 @@ class MeetingManager {
       return { success: false, reason: "La description ne peut pas dépasser 500 caractères" };
     }
 
-    const parsedSchedule = normalizeScheduledAt(scheduledAt);
-    if (!parsedSchedule.valid) {
-      return { success: false, reason: "Date invalide" };
-    }
-    const normalizedScheduledAt = parsedSchedule.value;
-
     // Validation de la date: doit être dans le futur OU dans les 5 dernières secondes (réunion immédiate)
     const now = Date.now();
-    if (normalizedScheduledAt <= now - 5000 && normalizedScheduledAt < now + 60000) {
+    if (!scheduledAt || (scheduledAt <= now - 5000 && scheduledAt < now + 60000)) {
       return { success: false, reason: "L'heure doit être dans le futur (au moins 1 minute)" };
     }
 
-    const normalizedDuration = (durationMin === undefined || durationMin === null || durationMin === "") ? 60 : Number(durationMin);
-    if (!Number.isFinite(normalizedDuration) || normalizedDuration < 15 || normalizedDuration > 480) {
+    if (!durationMin || durationMin < 15 || durationMin > 480) {
       return { success: false, reason: "La durée doit être entre 15 et 480 minutes" };
     }
 
@@ -1303,22 +1323,22 @@ class MeetingManager {
     
     const meetingId = `meeting_${Date.now()}_${createdBy}`;
     const code = await this._generateCode();
-    const endsAt = normalizedScheduledAt + (normalizedDuration * 60 * 1000);
-    const link = `https://serveur-appel.onrender.com/join/${code}`;
+    const endsAt = scheduledAt + (durationMin * 60 * 1000);
+    const link = `https://app-appel.onrender.com/join/${code}`;
 
     const meeting = {
       meetingId,
       code,
       title: title.trim(),
       description: description ? description.trim() : "",
-      scheduledAt: normalizedScheduledAt,
-      durationMin: normalizedDuration,
+      scheduledAt,
+      durationMin,
       endsAt,
       isVideo: !!isVideo,
       createdBy,
-      hostName: typeof hostName === "string" && hostName.trim() ? sanitizeString(hostName, 60) : (userDisplayNames.get(createdBy) || createdBy),
       participants: participants || [],
       status: "scheduled",
+      engine: MEETINGS_ENGINE, // "mesh" | "livekit" (piloté par MEETINGS_ENGINE)
       roomId: null,
       waitingUsers: [],
       accessPolicy: accessPolicy || "direct", // "direct" ou "approval"
@@ -1575,35 +1595,15 @@ class MeetingManager {
     // Lire la politique d'accès
     const meetingSnap = await db.collection("meetings").doc(meetingId).get();
     const meetingData = meetingSnap.exists ? meetingSnap.data() : {};
-    const isLocked = !!(meetingData.lockMeeting || meetingData.alwaysWaitingRoom);
-    const approvedUsers = Array.isArray(meetingData.approvedUsers) ? meetingData.approvedUsers : [];
-    const participantsList = Array.isArray(meetingData.participants) ? meetingData.participants : [];
-    const coHosts = Array.isArray(meetingData.coHosts) ? meetingData.coHosts : [];
     const needsApproval = meetingData.accessPolicy === "approval";
-
-    // Inclure également les utilisateurs présents en RAM dans room_waiting_<meetingId>
-    const waitingRoomId = `room_waiting_${meetingId}`;
-    const waitingRoomInRam = roomManager.rooms.get(waitingRoomId);
-    const mergedWaitingUsers = new Set(waitingUsers);
-    if (waitingRoomInRam) {
-      for (const ramUserId of waitingRoomInRam.participants.keys()) {
-        if (ramUserId) mergedWaitingUsers.add(ramUserId);
-      }
-    }
 
     // Préparer la map des notifications pour Firestore
     const notifiedUsers = {};
-    for (const waitingUserId of mergedWaitingUsers) {
+    for (const waitingUserId of waitingUsers) {
       if (excludeUserId && waitingUserId === excludeUserId) continue;
 
-      const isPrivilegedOrApproved =
-        waitingUserId === meetingData.createdBy ||
-        coHosts.includes(waitingUserId) ||
-        approvedUsers.includes(waitingUserId) ||
-        participantsList.includes(waitingUserId);
-
-      // Mode approbation : demander l'accord de l'hôte uniquement si non déjà approuvé/participant
-      if (needsApproval && !isPrivilegedOrApproved) {
+      // Mode approbation : ne PAS auto-joindre — demander l'accord de l'hôte
+      if (needsApproval) {
         await this._addPendingRequest(meetingId, waitingUserId);
         await this._notifyHostOfPendingRequest(meetingId, waitingUserId, meetingData.createdBy || excludeUserId, title);
         const user = users.get(waitingUserId);
@@ -1618,9 +1618,12 @@ class MeetingManager {
         continue;
       }
 
-      // Basculer immédiatement de la salle d'attente vers la salle live
+      // Mode direct : rejoindre immédiatement la salle live
       if (room) {
-        if (waitingRoomInRam?.participants.has(waitingUserId)) {
+        // Leave this meeting's waiting room before adding the participant live.
+        const waitingRoomId = `room_waiting_${meetingId}`;
+        const waitingRoom = roomManager.rooms.get(waitingRoomId);
+        if (waitingRoom?.participants.has(waitingUserId)) {
           roomManager.leave(waitingRoomId, waitingUserId);
         }
         roomManager.join(roomId, waitingUserId);
@@ -1643,16 +1646,12 @@ class MeetingManager {
           title,
           code: meetingData.code,
           createdBy: excludeUserId,
+          engine: meetingData.engine || MEETINGS_ENGINE,
         }));
         notifiedUsers[waitingUserId] = true;
       } else {
         notifiedUsers[waitingUserId] = false;
       }
-    }
-
-    // Nettoyer la salle d'attente en RAM si elle est désormais vide
-    if (waitingRoomInRam && waitingRoomInRam.participants.size === 0) {
-      roomManager.rooms.delete(waitingRoomId);
     }
 
     // Mettre à jour Firestore avec le statut de notification
@@ -1702,22 +1701,17 @@ class MeetingManager {
       return { success: false, reason: "Réunion terminée" };
     }
 
-    if ((meeting.status === "live" || meeting.status === "active") && meeting.roomId) {
-      // Déjà live, s'assurer que la salle existe en RAM et basculer les éventuels retardataires en salle d'attente
-      let room = roomManager.rooms.get(meeting.roomId);
-      if (!room) {
-        room = roomManager.createMeetingRoom(meeting.id, meeting.isVideo, meeting.endsAt);
-      }
-      roomManager.join(room.roomId, userId);
-      await this._notifyWaitingUsersStarted(meeting.id, room.roomId, meeting.title, meeting.isVideo, userId);
+    if (meeting.status === "live" && meeting.roomId) {
+      // Déjà live, retourner la salle existante
       return {
         success: true,
         meetingId: meeting.id,
-        roomId: room.roomId,
+        roomId: meeting.roomId,
         isVideo: meeting.isVideo,
         title: meeting.title,
         code: meeting.code,
         createdBy: meeting.createdBy,
+        
       };
     }
 
@@ -1745,29 +1739,18 @@ class MeetingManager {
     });
 
     await this._removeWaitingUser(meeting.id, userId);
-    notifyWaitingMusicStopped(meeting.id, waitingUsers, userId);
-    await this._notifyWaitingUsersStarted(meeting.id, room.roomId, meeting.title, meeting.isVideo, userId, waitingUsers);
-
-    // Mode DIRECT uniquement : notifier "hôte a démarré" pour auto-join
-    // Mode APPROVAL : déjà géré via pending_approval dans _notifyWaitingUsersStarted
-    if (currentMeeting.accessPolicy !== "approval") {
-      for (const waitingUserId of waitingUsers) {
-        const user = users.get(waitingUserId);
-        if (user?.ws && user.ws.readyState === WebSocket.OPEN) {
-          user.ws.send(JSON.stringify({
-            type: "meeting-host-started",
-            meetingId: meeting.id,
-            roomId: room.roomId,
-            hostId: userId,
-            title: meeting.title,
-            isVideo: meeting.isVideo,
-          }));
-        }
-      }
-    }
+    // NOTE : notifyWaitingMusicStopped + _notifyWaitingUsersStarted +
+    // meeting-host-started sont exécutés APRÈS l'envoi de la réponse
+    // meeting-joined à l'hôte (postJoin ci-dessous) — sinon les invités
+    // basculent dans la salle live pendant que le client de l'hôte n'a pas
+    // encore de groupRoomId : ses signaux WebRTC sont jetés et il reste
+    // hors connexion (les invités, eux, se connectent entre eux).
 
     console.log(`📅 Réunion ${meeting.id} démarrée manuellement (salle ${room.roomId}), fin à ${new Date(newEndsAt).toISOString()}`);
 
+    // Le transfert des utilisateurs en attente vers la salle live n'est PAS
+    // exécuté ici : la réponse meeting-joined doit d'abord atteindre l'hôte
+    // (voir handoffWaitingUsers et le handler meeting-force-start).
     return {
       success: true,
       meetingId: meeting.id,
@@ -1776,7 +1759,61 @@ class MeetingManager {
       title: meeting.title,
       code: meeting.code,
       createdBy: meeting.createdBy,
+      // Exécuté par le handler UNIQUEMENT APRÈS l'envoi de la réponse à l'hôte
+      postJoin: {
+        meetingId: meeting.id,
+        roomId: room.roomId,
+        isVideo: meeting.isVideo,
+        title: meeting.title,
+        accessPolicy: currentMeeting.accessPolicy || meeting.accessPolicy,
+        waitingUsers,
+      },
     };
+  }
+
+  /**
+   * =========================================================
+   *   TRANSFERT DE LA SALLE D'ATTENTE VERS LA SALLE LIVE
+   * =========================================================
+   *
+   * À appeler UNIQUEMENT APRÈS que la réponse meeting-joined a été envoyée
+   * à l'hôte (ordre critique) : sinon les invités basculent dans la salle
+   * live et démarrent leur maillage WebRTC pendant que le client de l'hôte
+   * n'a pas encore de groupRoomId — ses signaux sont jetés et il reste
+   * hors connexion (les invités, eux, se connectent entre eux).
+   *
+   * @param {object} postJoin - { meetingId, roomId, isVideo, title, accessPolicy, waitingUsers }
+   * @param {string} hostUserId - ID de l'hôte
+   */
+  async handoffWaitingUsers(postJoin, hostUserId) {
+    const { meetingId, roomId, isVideo, title, accessPolicy, waitingUsers } = postJoin;
+    try {
+      // 1) Arrêter la musique d'attente chez tout le monde
+      notifyWaitingMusicStopped(meetingId, waitingUsers, hostUserId);
+
+      // 2) Notifier et/ou intégrer les utilisateurs en attente
+      //    (mode direct: les rejoint ; mode approval: demandes en attente)
+      await this._notifyWaitingUsersStarted(meetingId, roomId, title, isVideo, hostUserId, waitingUsers);
+
+      // 3) Filet de sécurité pour anciens clients : "l'hôte a démarré"
+      if (accessPolicy !== "approval") {
+        for (const waitingUserId of waitingUsers) {
+          const user = users.get(waitingUserId);
+          if (user?.ws && user.ws.readyState === WebSocket.OPEN) {
+            user.ws.send(JSON.stringify({
+              type: "meeting-host-started",
+              meetingId,
+              roomId,
+              hostId: hostUserId,
+              title,
+              isVideo,
+            }));
+          }
+        }
+      }
+    } catch (error) {
+      console.error(`❌ Erreur transfert salle d'attente -> live (${meetingId}) :`, error);
+    }
   }
 
   /**
@@ -1825,15 +1862,9 @@ class MeetingManager {
     console.log(`📅 [MEETING] - isCreator: ${meeting.createdBy === userId}`);
 
     const isCreator = meeting.createdBy === userId;
-    const coHosts = Array.isArray(meeting.coHosts) ? meeting.coHosts : [];
-    const isCoHost = coHosts.includes(userId);
-    const canStartEarly = (isCreator || isCoHost) && now < meetingStart;
+    const canStartEarly = isCreator && now < meetingStart;
     const approvedUsers = Array.isArray(meeting.approvedUsers) ? meeting.approvedUsers : [];
     const isApproved = approvedUsers.includes(userId);
-    const participantsList = Array.isArray(meeting.participants) ? meeting.participants : [];
-    const isParticipant = participantsList.includes(userId);
-    const isLive = meeting.status === "live" || meeting.status === "active";
-    const isLocked = !!(meeting.lockMeeting || meeting.alwaysWaitingRoom);
 
     // Trop tard : réunion expirée
     if (now > meeting.endsAt) {
@@ -1841,56 +1872,74 @@ class MeetingManager {
       return { success: false, reason: "Réunion expirée" };
     }
 
-    // Règle d'admission stricte :
-    // 1. Entrée directe si hôte/co-hôte, déjà approuvé/participant, ou réunion déjà live non verrouillée.
-    // 2. Salle d'attente / approbation uniquement si réunion pas encore démarrée OU verrouillée par l'hôte.
-    const canEnterDirectly =
-      isCreator ||
-      isCoHost ||
-      isApproved ||
-      isParticipant ||
-      (isLive && !isLocked);
+    // Politique d'approbation : TOUJOURS avant la salle d'attente / join live
+    // (sauf hôte et utilisateurs déjà approuvés)
+    if (meeting.accessPolicy === "approval" && !isCreator && !isApproved) {
+      await this._addPendingRequest(meeting.id, userId);
+      await this._notifyHostOfPendingRequest(meeting.id, userId, meeting.createdBy, meeting.title);
+      console.log(`📅 [MEETING] - Demande d'approbation pour ${userId}`);
+      return {
+        success: false,
+        status: "pending_approval",
+        reason: "En attente d'approbation de l'hôte",
+        meetingId: meeting.id,
+        title: meeting.title,
+      };
+    }
 
-    if (!canEnterDirectly) {
-      // Politique d'approbation manuelle par l'hôte
-      if (meeting.accessPolicy === "approval") {
-        await this._addPendingRequest(meeting.id, userId);
-        await this._notifyHostOfPendingRequest(meeting.id, userId, meeting.createdBy, meeting.title);
-        console.log(`📅 [MEETING] - Demande d'approbation pour ${userId}`);
-        return {
-          success: false,
-          status: "pending_approval",
-          reason: "En attente d'approbation de l'hôte",
-          meetingId: meeting.id,
-          title: meeting.title,
-        };
+    // RÉUNION DÉJÀ LIVE : rejoindre DIRECTEMENT la salle en cours, JAMAIS la
+    // salle d'attente. Cas principal : l'hôte a démarré en avance, et un
+    // participant arrive alors que l'heure programmée n'est pas encore
+    // atteinte — l'ancien code le renvoyait en salle d'attente jusqu'à
+    // scheduledAt alors que la réunion tournait déjà.
+    if (meeting.status === "live" && meeting.roomId && now <= meeting.endsAt) {
+      let room = roomManager.rooms.get(meeting.roomId);
+      if (!room) {
+        console.log(`📅 Salle ${meeting.roomId} introuvable en RAM, recréation...`);
+        room = roomManager.createMeetingRoom(meeting.id, meeting.isVideo, meeting.endsAt);
       }
+      // Quitter la salle d'attente éventuelle (arrivé avant l'hôte)
+      roomManager.leaveUserFromOtherRooms(userId, meeting.roomId);
+      const joinedNow = roomManager.join(meeting.roomId, userId);
+      if (!joinedNow) {
+        return { success: false, reason: "Salle pleine ou utilisateur occupé" };
+      }
+      // Nettoyer la liste d'attente Firestore (non bloquant)
+      db.collection("meetings").doc(meeting.id).update({
+        waitingUsers: FieldValue.arrayRemove(userId),
+      }).catch((error) => console.warn("⚠️ Purge waitingUsers:", error.message));
+      console.log(`📅 Réunion ${meeting.id} déjà live : ${userId} rejoint directement la salle`);
+      return {
+        success: true,
+        meetingId: meeting.id,
+        roomId: room.roomId,
+        isVideo: meeting.isVideo,
+        title: meeting.title,
+        code: meeting.code,
+        createdBy: meeting.createdBy,
+      };
+    }
 
-      // Salle d'attente (réunion pas encore démarrée ou verrouillée)
-      const waitTimeMs = Math.max(0, meetingStart - now);
+    // TROP TÔT (mode direct uniquement, ou déjà approuvé) : salle d'attente
+    if (now < meetingStart && !isCreator) {
+      const waitTimeMs = meetingStart - now;
       const waitTimeMin = Math.ceil(waitTimeMs / 60000);
       await this._addWaitingUser(meeting.id, userId);
+      // Salle temporaire r?serv?e aux visiteurs; son identifiant n'est jamais
+      // transmis ? l'h?te, qui ne peut donc pas voir leurs flux vid?o.
       const waitingRoomId = `room_waiting_${meeting.id}`;
       if (!roomManager.rooms.has(waitingRoomId)) {
-        roomManager.rooms.set(waitingRoomId, {
-          roomId: waitingRoomId,
-          creatorId: null,
-          isVideo: meeting.isVideo,
-          isMeeting: true,
-          isWaitingRoom: true,
-          createdAt: now,
-          endsAt: meeting.endsAt,
-          participants: new Map(),
-        });
+        roomManager.rooms.set(waitingRoomId, { roomId: waitingRoomId, creatorId: null, isVideo: meeting.isVideo, isMeeting: true, isWaitingRoom: true, createdAt: now, endsAt: meeting.endsAt, participants: new Map() });
       }
-      console.log(`📅 [MEETING] - En attente (${isLocked ? "verrouillée" : `${waitTimeMin}min restantes`})`);
+      console.log(`📅 [MEETING] - En attente de démarrage : ${waitTimeMin}min restantes`);
       return {
         success: false,
         status: "waiting",
-        reason: isLocked ? "Réunion verrouillée par l'hôte" : "Réunion pas encore commencée",
+        reason: "Réunion pas encore commencée",
         waitTimeMs,
         waitTimeMin,
         scheduledAt: meeting.scheduledAt,
+        code: meeting.code,
         meetingId: meeting.id,
         code: meeting.code,
         createdBy: meeting.createdBy,
@@ -1900,12 +1949,12 @@ class MeetingManager {
         waitingRoomId,
         isVideo: meeting.isVideo,
         title: meeting.title,
-        locked: isLocked,
+        createdBy: meeting.createdBy,
       };
     }
 
-    // Dans la fenêtre d'accès ou entrée directe autorisée : ouvrir ou utiliser la salle live
-    if (meeting.status === "scheduled" || meeting.status === "waiting") {
+    // Dans la fenêtre d'accès : ouvrir ou utiliser la salle live
+    if (meeting.status === "scheduled") {
       // Si le créateur démarre tôt, recalculer endsAt
       let finalEndsAt = meeting.endsAt;
       if (canStartEarly) {
@@ -1960,8 +2009,9 @@ class MeetingManager {
         throw error;
       });
 
-      notifyWaitingMusicStopped(meeting.id, waitingUsers, userId);
-      await this._notifyWaitingUsersStarted(meeting.id, room.roomId, meeting.title, meeting.isVideo, userId, waitingUsers);
+      // NOTE : le transfert des utilisateurs en attente (musique stop,
+      // _notifyWaitingUsersStarted) est différé au handler via postJoin :
+      // la réponse meeting-joined doit d'abord atteindre le demandeur.
       await this._removeWaitingUser(meeting.id, userId);
       console.log(`📅 Réunion ${meeting.id} passée à live (salle ${room.roomId})`);
 
@@ -1973,33 +2023,35 @@ class MeetingManager {
         title: meeting.title,
         code: meeting.code,
         createdBy: meeting.createdBy,
+        // Exécuté par le handler UNIQUEMENT APRÈS l'envoi de la réponse
+        postJoin: {
+          meetingId: meeting.id,
+          roomId: room.roomId,
+          isVideo: meeting.isVideo,
+          title: meeting.title,
+          accessPolicy: meeting.accessPolicy || "direct",
+          waitingUsers,
+        },
       };
     }
 
     // Status déjà live : vérifier si la salle existe en RAM
-    if (isLive) {
+    if (meeting.status === "live" && meeting.roomId) {
       // Vérifier si endsAt est dépassé
       if (now > meeting.endsAt) {
         await this._updateStatus(meeting.id, "ended");
         return { success: false, reason: "Réunion expirée" };
       }
-
-      const liveRoomId = meeting.roomId || `room_meeting_${meeting.id}`;
-      let room = roomManager.rooms.get(liveRoomId);
-
+      
+      let room = roomManager.rooms.get(meeting.roomId);
+      
       // Si la salle n'existe pas en RAM (redémarrage serveur), la recréer
       if (!room) {
-        console.log(`📅 Salle ${liveRoomId} introuvable en RAM, recréation...`);
+        console.log(`📅 Salle ${meeting.roomId} introuvable en RAM, recréation...`);
         room = roomManager.createMeetingRoom(meeting.id, meeting.isVideo, meeting.endsAt);
+        // roomId est déjà dans Firestore, pas besoin de mettre à jour
       }
-
-      // S'assurer que le participant quitte une éventuelle salle d'attente
-      const waitingRoomId = `room_waiting_${meeting.id}`;
-      const waitingRoom = roomManager.rooms.get(waitingRoomId);
-      if (waitingRoom?.participants.has(userId)) {
-        roomManager.leave(waitingRoomId, userId);
-      }
-
+      
       return {
         success: true,
         meetingId: meeting.id,
@@ -2346,6 +2398,7 @@ class MeetingManager {
             isVideo: meeting.isVideo,
             title: meeting.title,
              code: meeting.code,
+            engine: meeting.engine || MEETINGS_ENGINE,
           }));
 
           // Marquer comme notifié
@@ -2407,95 +2460,79 @@ const roomManager = new RoomManager();
 // Instance globale du MeetingManager
 const meetingManager = new MeetingManager();
 // Musique d'attente transmise en direct aux appareils (non persistée entre redémarrages).
+// ARCHITECTURE ANTI-BLOCAGE : le serveur décode les dataUrls en Buffer UNE SEULE
+// fois à la réception, puis ne transmetPLUS JAMAIS le binaire par WebSocket —
+// les clients reçoivent des URLs HTTP légères
+// (/api/meeting/:meetingId/waiting-music/:idx?token=...).
+// Avant : JSON.stringify de 30-90 Mo par destinataire gelait l'event loop,
+// _y compris pendant meeting-create d'un invité (symptôme "le serveur bloque
+// et la réunion ne se crée pas").
 const meetingWaitingMusic = new Map();
-const MAX_WAITING_MUSIC_TRANSFER_BYTES = 90 * 1024 * 1024;
-// Tableau blanc collaboratif temporaire en mémoire (indexé par meetingId)
-const meetingWhiteboards = new Map();
-const MAX_WHITEBOARD_STROKES = 2000;
-// Délai de grâce (8s) lors d'une déconnexion brutale de l'hôte
-const hostLeaveGraceTimers = new Map();
+const MAX_WAITING_MUSIC_TRANSFER_BYTES = 100 * 1024 * 1024; // aligné sur le client (Meetings.WAITING_MUSIC_MAX_TOTAL_BYTES)
 
-function cancelHostLeaveGraceTimers(userId) {
-  if (!userId) return;
-  const suffix = `:${userId}`;
-  for (const [key, timer] of hostLeaveGraceTimers.entries()) {
-    if (key.endsWith(suffix)) {
-      clearTimeout(timer);
-      hostLeaveGraceTimers.delete(key);
-    }
+// Auth légère des flux audio : token éphémère, redistribué à chaque set/arrivée.
+const waitingMusicTokenCache = new Map(); // meetingId -> token
+
+function getWaitingMusicToken(meetingId) {
+  let token = waitingMusicTokenCache.get(meetingId);
+  if (!token) {
+    token = crypto.randomBytes(24).toString("hex");
+    waitingMusicTokenCache.set(meetingId, token);
   }
+  return token;
 }
 
-async function endMeetingByHost(meetingId, hostId, reason = "host_left") {
-  if (!meetingId) return;
-  const graceKey = `${meetingId}:${hostId}`;
-  const existingTimer = hostLeaveGraceTimers.get(graceKey);
-  if (existingTimer) {
-    clearTimeout(existingTimer);
-    hostLeaveGraceTimers.delete(graceKey);
+// Décode [{dataUrl, name, ...}] en buffers + métadonnées (une fois par set).
+// Lève si une piste est invalide (dataUrl malformée) ou si le total dépasse la limite.
+function decodeWaitingMusicTracks(rawTracks) {
+  const totalLen = rawTracks.reduce((s, t) => s + (t?.dataUrl?.length || 0), 0);
+  if (totalLen > MAX_WAITING_MUSIC_TRANSFER_BYTES) throw new Error("too-large");
+  const dec = [];
+  let totalBytes = 0;
+  for (const t of rawTracks) {
+    const m = /^data:(audio\/[a-zA-Z0-9.+-]+);base64,(.+)$/.exec(t.dataUrl || "");
+    if (!m) throw new Error("invalid-track");
+    const buf = Buffer.from(m[2], "base64");
+    totalBytes += buf.length;
+    if (totalBytes > MAX_WAITING_MUSIC_TRANSFER_BYTES) throw new Error("too-large");
+    dec.push({ buf, mime: m[1], name: String(t.name || "Musique d’attente").slice(0, 120) });
   }
+  return dec;
+}
 
-  try {
-    const doc = await db.collection("meetings").doc(meetingId).get();
-    if (!doc.exists) return;
-    const meeting = doc.data();
-    if (meeting.status === "ended" || meeting.status === "cancelled") return;
+// Message WS LÉGER envoyé aux clients : uniquement des URLs, aucun binaire.
+function buildWaitingMusicPayload(meetingId) {
+  const entry = meetingWaitingMusic.get(meetingId);
+  if (!entry) return null;
+  const token = getWaitingMusicToken(meetingId);
+  return {
+    syncAt: entry.syncAt,
+    tracks: entry.tracks.map((t, idx) => ({
+      idx,
+      name: t.name,
+      mime: t.mime,
+      size: t.buf.length,
+      url: `/api/meeting/${encodeURIComponent(meetingId)}/waiting-music/${idx}?token=${token}`,
+    })),
+  };
+}
 
-    const liveRoomId = meeting.roomId || `room_meeting_${meetingId}`;
-    const waitingRoomId = `room_waiting_${meetingId}`;
-
-    const recipients = new Set([
-      ...(Array.isArray(meeting.participants) ? meeting.participants : []),
-      ...(Array.isArray(meeting.waitingUsers) ? meeting.waitingUsers : []),
-    ]);
-
-    const liveRoom = roomManager.rooms.get(liveRoomId);
-    if (liveRoom) {
-      for (const pid of liveRoom.participants.keys()) recipients.add(pid);
-    }
-    const waitingRoom = roomManager.rooms.get(waitingRoomId);
-    if (waitingRoom) {
-      for (const pid of waitingRoom.participants.keys()) recipients.add(pid);
-    }
-
-    await db.collection("meetings").doc(meetingId).update({
-      status: "ended",
-      endedAt: Date.now(),
-      waitingUsers: [],
-    });
-
-    const payload = JSON.stringify({
-      type: "meeting-ended",
-      meetingId,
-      reason,
-    });
-    for (const pid of recipients) {
-      const u = users.get(pid);
-      if (u?.ws && u.ws.readyState === WebSocket.OPEN) {
-        u.ws.send(payload);
-      }
-    }
-
-    const waitingUsersEnd = Array.isArray(meeting.waitingUsers) ? meeting.waitingUsers.filter(Boolean) : [];
-    notifyWaitingMusicStopped(meetingId, waitingUsersEnd, hostId);
-    meetingWhiteboards.delete(meetingId);
-
-    if (liveRoom) {
-      roomManager.closeRoom(liveRoomId, reason);
-      roomManager.rooms.delete(liveRoomId);
-    }
-    if (waitingRoom) {
-      roomManager.closeRoom(waitingRoomId, reason);
-      roomManager.rooms.delete(waitingRoomId);
-    }
-    console.log(`📅 Réunion ${meetingId} terminée automatiquement (${reason})`);
-  } catch (error) {
-    console.error(`❌ Erreur endMeetingByHost(${meetingId}):`, error);
+// Idempotence de meeting-create : si le client rejoue une demande (reconnexion
+// WebSocket survenue juste après l'envoi), on RÉENVOIE LA MÊME réponse au
+// lieu de créer une seconde réunion. Clé = userId:requestId, TTL 60 s.
+const recentMeetingCreates = new Map();
+const MEETING_CREATE_DEDUP_TTL_MS = 60000;
+function pruneRecentMeetingCreates() {
+  const now = Date.now();
+  for (const [key, entry] of recentMeetingCreates) {
+    if (now - entry.at > MEETING_CREATE_DEDUP_TTL_MS) recentMeetingCreates.delete(key);
   }
 }
 
 function notifyWaitingMusicStopped(meetingId, waitingUsers = [], hostId = null) {
   meetingWaitingMusic.delete(meetingId);
+  waitingMusicTokenCache.delete(meetingId);
+  waitingMusicUploads.delete(meetingId); // uploads en cours : inutiles désormais
   const targets = new Set([...(Array.isArray(waitingUsers) ? waitingUsers : []), hostId].filter(Boolean));
   for (const userId of targets) {
     const user = users.get(userId);
@@ -2531,6 +2568,7 @@ async function loadMeetingsOnStartup() {
         await db.collection("meetings").doc(meeting.id).update({ status: "ended" });
         // Purger la musique d'attente éventuelle
         meetingWaitingMusic.delete(meeting.id);
+        waitingMusicTokenCache.delete(meeting.id);
         console.log(`📅 Réunion expirée nettoyée: ${meeting.id}`);
         continue;
       }
@@ -2661,7 +2699,7 @@ app.get("/join/:code", (req, res) => {
     </p>
     <a href="callapp://join/${safeLinkCode}" class="btn">Ouvrir dans l'application</a>
     <br>
-    <a href="https://serveur-appel.onrender.com" class="btn btn-secondary">Télécharger l'application</a>
+    <a href="https://app-appel.onrender.com" class="btn btn-secondary">Télécharger l'application</a>
   </div>
 </body>
 </html>
@@ -2686,92 +2724,8 @@ app.get("/.well-known/apple-app-site-association", (req, res) => {
 // API REST POUR MEETING SERVICE
 // =========================================================
 
-// Créer une réunion planifiée via HTTP REST (fallback si WebSocket instable)
-async function handleCreateMeetingHttp(req, res) {
-  try {
-    const body = req.body || {};
-    const createdBy = typeof body.createdBy === "string"
-      ? body.createdBy.trim()
-      : (typeof body.userId === "string" ? body.userId.trim() : "");
-    if (!createdBy) {
-      return res.status(400).json({ success: false, error: "createdBy (userId) requis" });
-    }
-
-    const validation = validateMeetingMessage(body, "meeting-create");
-    if (!validation.valid) {
-      return res.status(400).json({ success: false, error: validation.reason });
-    }
-
-    const scheduleCheck = normalizeScheduledAt(body.scheduledAt);
-    if (!scheduleCheck.valid) {
-      return res.status(400).json({ success: false, error: scheduleCheck.reason });
-    }
-
-    const sanitizedTitle = sanitizeString(body.title, 100);
-    const sanitizedDescription = body.description ? sanitizeString(body.description, 500) : "";
-    const policy = body.accessPolicy === "approval" ? "approval" : "direct";
-    const waitingMusicTracks = Array.isArray(body.waitingMusicTracks) ? body.waitingMusicTracks : [];
-    const validWaitingMusic = waitingMusicTracks.every((track) =>
-      track && typeof track.dataUrl === "string" && /^data:audio\/[a-zA-Z0-9.+-]+;base64,/.test(track.dataUrl)
-    ) && waitingMusicTracks.reduce((sum, track) => sum + track.dataUrl.length, 0) <= MAX_WAITING_MUSIC_TRANSFER_BYTES;
-    if (!validWaitingMusic) {
-      return res.status(400).json({ success: false, error: "Liste audio invalide ou trop volumineuse" });
-    }
-
-    const meeting = await meetingManager.create({
-      title: sanitizedTitle,
-      description: sanitizedDescription,
-      scheduledAt: scheduleCheck.value,
-      durationMin: body.durationMin,
-      isVideo: !!body.isVideo,
-      createdBy,
-      hostName: body.hostName,
-      participants: Array.isArray(body.participants) ? body.participants : [],
-      accessPolicy: policy,
-    });
-
-    if (meeting.success === false) {
-      return res.status(400).json({ success: false, error: meeting.reason || "Création refusée" });
-    }
-
-    if (waitingMusicTracks.length) {
-      meetingWaitingMusic.set(meeting.meetingId, {
-        syncAt: Date.now(),
-        tracks: waitingMusicTracks.map((track) => ({
-          dataUrl: track.dataUrl,
-          name: String(track.name || "Musique d’attente").slice(0, 120),
-        })),
-      });
-    }
-
-    res.status(201).json({
-      success: true,
-      meeting,
-      meetingId: meeting.meetingId,
-      code: meeting.code,
-      link: meeting.link,
-      title: meeting.title,
-      description: meeting.description,
-      scheduledAt: meeting.scheduledAt,
-      endsAt: meeting.endsAt,
-      durationMin: meeting.durationMin,
-      isVideo: meeting.isVideo,
-      createdBy: meeting.createdBy,
-      hostName: meeting.hostName,
-      participants: meeting.participants,
-      accessPolicy: meeting.accessPolicy,
-    });
-  } catch (error) {
-    console.error("❌ Erreur API POST /api/meeting:", error);
-    res.status(500).json({ success: false, error: error.message || "Erreur serveur" });
-  }
-}
-
-app.post("/api/meeting", handleCreateMeetingHttp);
-app.post("/api/meetings", handleCreateMeetingHttp);
-
 // Obtenir une réunion par code
-app.get("/api/meeting/by-code/:code", async (req, res) => {
+app.get("/api/meeting/by-code/:code", requireAuth, async (req, res) => {
   try {
     const { code } = req.params;
     const meeting = await meetingManager.getByCode(code);
@@ -2785,15 +2739,173 @@ app.get("/api/meeting/by-code/:code", async (req, res) => {
   }
 });
 
+// Flux audio de la musique d'attente (légère : service du Buffer décodé).
+// Auth légère : token éphémère redistribué avec chaque diffusion WS.
+app.get("/api/meeting/:meetingId/waiting-music/:idx", (req, res) => {
+  const { meetingId, idx } = req.params;
+  const token = String(req.query.token || "");
+  if (!token || token !== waitingMusicTokenCache.get(meetingId)) {
+    return res.status(403).json({ error: "Token de musique invalide ou expiré" });
+  }
+  const entry = meetingWaitingMusic.get(meetingId);
+  const i = parseInt(idx, 10);
+  if (!entry || !Number.isInteger(i) || i < 0 || i >= entry.tracks.length) {
+    return res.status(404).json({ error: "Morceau introuvable" });
+  }
+  const track = entry.tracks[i];
+  res.setHeader("Content-Type", track.mime);
+  res.setHeader("Content-Length", track.buf.length);
+  res.setHeader("Cache-Control", "private, max-age=300");
+  res.end(track.buf);
+});
+
+// ============================================================
+// UPLOAD MUSIQUE D'ATTENTE VIA HTTP (binaire brut, HORS WebSocket)
+// Pourquoi : les dataUrls de dizaines de Mo en WebSocket saturaient
+// le socket (création impossible, socket coupé, « Aucune réponse du
+// serveur » répétée). L'hôte téléverse chaque morceau en binaire
+// brut, puis finalise : le serveur diffuse ensuite le payload léger
+// (URLs) aux visiteurs en salle d'attente.
+// ============================================================
+// Staging : meetingId -> { tracks: [{name, mime, buf}], updatedAt }
+const waitingMusicUploads = new Map();
+const WAITING_MUSIC_UPLOAD_TTL_MS = 30 * 60 * 1000; // abandon si non finalisé
+const WAITING_MUSIC_MAX_TRACK_BYTES = 30 * 1024 * 1024; // aligné sur le client (30 Mo / morceau)
+function pruneWaitingMusicUploads() {
+  const now = Date.now();
+  for (const [key, entry] of waitingMusicUploads) {
+    if (now - entry.updatedAt > WAITING_MUSIC_UPLOAD_TTL_MS) waitingMusicUploads.delete(key);
+  }
+}
+
+// Auth partagée des deux routes : utilisateur enregistré + token valide + hôte.
+async function authorizeWaitingMusicUpload(req, res, meetingId) {
+  const userId = String(req.query.userId || "");
+  const token = String(req.query.token || "");
+  if (!userId || !validateAuthToken(userId, token)) {
+    res.status(403).json({ error: "Authentification invalide ou expirée" });
+    return null;
+  }
+  const doc = await db.collection("meetings").doc(meetingId).get();
+  if (!doc.exists) {
+    res.status(404).json({ error: "Réunion introuvable" });
+    return null;
+  }
+  const meeting = doc.data();
+  if (meeting.createdBy !== userId) {
+    res.status(403).json({ error: "Seul l'hôte peut déposer la musique d'attente" });
+    return null;
+  }
+  if (meeting.status === "ended" || meeting.status === "cancelled") {
+    res.status(409).json({ error: "Réunion terminée ou annulée" });
+    return null;
+  }
+  return meeting;
+}
+
+// 1) Dépôt d'un morceau (corps = octets audio bruts)
+app.post(
+  "/api/meeting/:meetingId/waiting-music-upload",
+  express.raw({ type: () => true, limit: `${WAITING_MUSIC_MAX_TRACK_BYTES}b` }),
+  async (req, res) => {
+    try {
+      const { meetingId } = req.params;
+      const meeting = await authorizeWaitingMusicUpload(req, res, meetingId);
+      if (!meeting) return;
+      pruneWaitingMusicUploads();
+      const name = String(req.query.name || "Musique d'attente").slice(0, 120);
+      const mime = String(req.query.mime || "audio/mpeg").slice(0, 60);
+      if (!/^audio\/[a-zA-Z0-9.+-]+$/.test(mime)) {
+        return res.status(400).json({ error: "Type MIME audio invalide" });
+      }
+      const buf = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+      if (!buf.length) return res.status(400).json({ error: "Corps audio vide" });
+      if (buf.length > WAITING_MUSIC_MAX_TRACK_BYTES) {
+        return res.status(413).json({ error: "Morceau trop volumineux (max 30 Mo)" });
+      }
+      const entry = waitingMusicUploads.get(meetingId) || { tracks: [], updatedAt: Date.now() };
+      const replaceIdx = parseInt(req.query.replaceIdx, 10);
+      const trackMeta = { name, mime, buf };
+      if (Number.isInteger(replaceIdx) && replaceIdx >= 0 && replaceIdx < entry.tracks.length) {
+        // Reprise : remplace le morceau partiellement envoyé
+        entry.tracks[replaceIdx] = trackMeta;
+      } else {
+        entry.tracks.push(trackMeta);
+      }
+      entry.updatedAt = Date.now();
+      const total = entry.tracks.reduce((sum, t) => sum + t.buf.length, 0);
+      if (total > MAX_WAITING_MUSIC_TRANSFER_BYTES) {
+        waitingMusicUploads.delete(meetingId);
+        return res.status(413).json({ error: "Playlist trop volumineuse (max 100 Mo au total)" });
+      }
+      waitingMusicUploads.set(meetingId, entry);
+      console.log(`[MEETING] Musique d'attente : morceau téléversé (${name}, ${buf.length} o, total ${Math.round(total / 1024)} Kio)`);
+      res.json({ ok: true, idx: entry.tracks.indexOf(trackMeta), size: buf.length });
+    } catch (error) {
+      console.error("❌ Erreur upload musique d'attente :", error);
+      res.status(500).json({ error: "Erreur serveur" });
+    }
+  },
+);
+
+// 2) Finalisation : vidéo de la playlist mémorisée + diffusion légère aux visiteurs
+app.post("/api/meeting/:meetingId/waiting-music-finalize", async (req, res) => {
+  try {
+    const { meetingId } = req.params;
+    const meeting = await authorizeWaitingMusicUpload(req, res, meetingId);
+    if (!meeting) return;
+    pruneWaitingMusicUploads();
+    const staged = waitingMusicUploads.get(meetingId);
+    if (!staged || !staged.tracks.length) {
+      return res.status(404).json({ error: "Aucun morceau téléversé pour cette réunion" });
+    }
+    const decoded = staged.tracks.map((t) => ({ buf: t.buf, mime: t.mime, name: t.name }));
+    waitingMusicUploads.delete(meetingId);
+    // syncAt : horodatage serveur pour la synchronisation de lecture.
+    meetingWaitingMusic.set(meetingId, { syncAt: Date.now(), tracks: decoded });
+    getWaitingMusicToken(meetingId);
+    const lightPayload = buildWaitingMusicPayload(meetingId);
+    const waitingUsers = Array.isArray(meeting.waitingUsers) ? meeting.waitingUsers.filter(Boolean) : [];
+    const recipients = new Set(waitingUsers);
+    for (const recipientId of recipients) {
+      const user = users.get(recipientId);
+      if (user?.ws && user.ws.readyState === WebSocket.OPEN) {
+        user.ws.send(JSON.stringify({ type: "meeting-waiting-music-set", meetingId, ...lightPayload }));
+      }
+    }
+    console.log(`[MEETING] Musique d'attente finalisée : ${decoded.length} morceau(x) diffusé(s) à ${recipients.size} visiteur(s)`);
+    res.json({ ok: true, count: decoded.length });
+  } catch (error) {
+    console.error("❌ Erreur finalisation musique d'attente :", error);
+    res.status(500).json({ error: "Erreur serveur" });
+  }
+});
+
+/**
+ * Vérifie si un utilisateur est membre autorisé d'une réunion (hôte, participant, approuvé ou présent en salle live).
+ */
+function isMeetingMember(meeting, userId) {
+  if (!meeting || !userId) return false;
+  if (meeting.createdBy === userId) return true;
+  if (Array.isArray(meeting.participants) && meeting.participants.includes(userId)) return true;
+  if (Array.isArray(meeting.approvedUsers) && meeting.approvedUsers.includes(userId)) return true;
+  if (meeting.roomId && roomManager.isJoinedInRoom(meeting.roomId, userId)) return true;
+  return false;
+}
+
 // Obtenir une réunion par ID
-app.get("/api/meeting/:meetingId", async (req, res) => {
+app.get("/api/meeting/:meetingId", requireAuth, async (req, res) => {
   try {
     const { meetingId } = req.params;
     const doc = await db.collection("meetings").doc(meetingId).get();
     if (!doc.exists) {
       return res.status(404).json({ error: "Réunion introuvable" });
     }
-    res.json({ id: doc.id, ...doc.data() });
+    const meeting = doc.data();
+    if (!isMeetingMember(meeting, req.authUserId)) {
+      return res.status(403).json({ error: "Accès refusé à cette réunion" });
+    }
+    res.json({ id: doc.id, ...meeting });
   } catch (error) {
     console.error("❌ Erreur API /api/meeting:", error);
     res.status(500).json({ error: "Erreur serveur" });
@@ -2801,7 +2913,7 @@ app.get("/api/meeting/:meetingId", async (req, res) => {
 });
 
 // Modifier une réunion
-app.patch("/api/meeting/:meetingId", async (req, res) => {
+app.patch("/api/meeting/:meetingId", requireAuth, async (req, res) => {
   try {
     const { meetingId } = req.params;
     const updates = req.body;
@@ -2813,9 +2925,8 @@ app.patch("/api/meeting/:meetingId", async (req, res) => {
     
     const meeting = doc.data();
     
-    // Vérifier que l'utilisateur est le créateur
-    const userId = req.body.userId;
-    if (meeting.createdBy !== userId) {
+    // Vérifier que l'utilisateur authentifié est bien le créateur
+    if (meeting.createdBy !== req.authUserId) {
       return res.status(403).json({ error: "Non autorisé" });
     }
     
@@ -2839,7 +2950,7 @@ app.patch("/api/meeting/:meetingId", async (req, res) => {
 });
 
 // Obtenir les participants d'une réunion
-app.get("/api/meeting/:meetingId/participants", async (req, res) => {
+app.get("/api/meeting/:meetingId/participants", requireAuth, async (req, res) => {
   try {
     const { meetingId } = req.params;
     const doc = await db.collection("meetings").doc(meetingId).get();
@@ -2879,10 +2990,13 @@ app.get("/api/meeting/:meetingId/participants", async (req, res) => {
 });
 
 // Ajouter un participant
-app.post("/api/meeting/:meetingId/participants", async (req, res) => {
+app.post("/api/meeting/:meetingId/participants", requireAuth, async (req, res) => {
   try {
     const { meetingId } = req.params;
-    const { userId } = req.body;
+    const targetUserId = String(req.body?.targetUserId || req.body?.userId || "").trim();
+    if (!targetUserId) {
+      return res.status(400).json({ error: "Identifiant participant requis" });
+    }
     
     const doc = await db.collection("meetings").doc(meetingId).get();
     if (!doc.exists) {
@@ -2890,14 +3004,17 @@ app.post("/api/meeting/:meetingId/participants", async (req, res) => {
     }
     
     const meeting = doc.data();
+    if (meeting.createdBy !== req.authUserId) {
+      return res.status(403).json({ error: "Seul l'hôte peut ajouter un participant" });
+    }
     const participants = meeting.participants || [];
     
-    if (!participants.includes(userId)) {
-      participants.push(userId);
+    if (!participants.includes(targetUserId)) {
+      participants.push(targetUserId);
       await db.collection("meetings").doc(meetingId).update({ participants });
     }
     
-    res.json({ userId, meetingId });
+    res.json({ userId: targetUserId, meetingId });
   } catch (error) {
     console.error("❌ Erreur API POST /api/meeting/participants:", error);
     res.status(500).json({ error: "Erreur serveur" });
@@ -2905,7 +3022,7 @@ app.post("/api/meeting/:meetingId/participants", async (req, res) => {
 });
 
 // Retirer un participant
-app.delete("/api/meeting/:meetingId/participants/:userId", async (req, res) => {
+app.delete("/api/meeting/:meetingId/participants/:userId", requireAuth, async (req, res) => {
   try {
     const { meetingId, userId } = req.params;
     
@@ -2915,6 +3032,9 @@ app.delete("/api/meeting/:meetingId/participants/:userId", async (req, res) => {
     }
     
     const meeting = doc.data();
+    if (meeting.createdBy !== req.authUserId && req.authUserId !== userId) {
+      return res.status(403).json({ error: "Non autorisé à retirer ce participant" });
+    }
     const participants = (meeting.participants || []).filter(id => id !== userId);
     
     await db.collection("meetings").doc(meetingId).update({ participants });
@@ -2932,39 +3052,48 @@ app.delete("/api/meeting/:meetingId/participants/:userId", async (req, res) => {
 });
 
 // Chat de réunion - Envoyer un message
-app.post("/api/meeting/:meetingId/chat", async (req, res) => {
+app.post("/api/meeting/:meetingId/chat", requireAuth, async (req, res) => {
   try {
     const { meetingId } = req.params;
-    const { message, userId, timestamp } = req.body;
+    const { message, timestamp } = req.body;
+    const cleanMessage = sanitizeString(message, 1000);
+    if (!cleanMessage) {
+      return res.status(400).json({ error: "Message invalide ou vide" });
+    }
+
+    const doc = await db.collection("meetings").doc(meetingId).get();
+    if (!doc.exists) {
+      return res.status(404).json({ error: "Réunion introuvable" });
+    }
+    const meeting = doc.data();
+    if (!isMeetingMember(meeting, req.authUserId)) {
+      return res.status(403).json({ error: "Accès refusé à cette réunion" });
+    }
     
     const chatRef = db.collection("meetings").doc(meetingId).collection("chat");
     const newMessage = {
-      message,
-      userId,
+      message: cleanMessage,
+      userId: req.authUserId,
       timestamp: timestamp || Date.now(),
-      id: `msg_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
+      id: `msg_${Date.now()}_${crypto.randomBytes(6).toString("hex")}`
     };
     
     await chatRef.doc(newMessage.id).set(newMessage);
     
     // Diffuser le message aux participants en salle live
-    const doc = await db.collection("meetings").doc(meetingId).get();
-    if (doc.exists) {
-      const meeting = doc.data();
-      if (meeting.status === "live" && meeting.roomId) {
-        const room = roomManager.rooms.get(meeting.roomId);
-        if (room) {
-          const broadcastMessage = {
-            type: "meeting-chat",
-            meetingId,
-            message: newMessage
-          };
-          for (const [userId, data] of room.participants.entries()) {
-            if (data.state === "JOINED") {
-              const user = users.get(userId);
-              if (user?.ws && user.ws.readyState === WebSocket.OPEN) {
-                user.ws.send(JSON.stringify(broadcastMessage));
-              }
+    if (meeting.status === "live" && meeting.roomId) {
+      const room = roomManager.rooms.get(meeting.roomId);
+      if (room) {
+        const broadcastMessage = {
+          type: "meeting-chat",
+          meetingId,
+          message: newMessage
+        };
+        for (const [userId, data] of room.participants.entries()) {
+          if (data.state === "JOINED") {
+            const user = users.get(userId);
+            if (user?.ws && user.ws.readyState === WebSocket.OPEN) {
+              user.ws.send(JSON.stringify(broadcastMessage));
             }
           }
         }
@@ -2979,9 +3108,16 @@ app.post("/api/meeting/:meetingId/chat", async (req, res) => {
 });
 
 // Chat de réunion - Obtenir l'historique
-app.get("/api/meeting/:meetingId/chat", async (req, res) => {
+app.get("/api/meeting/:meetingId/chat", requireAuth, async (req, res) => {
   try {
     const { meetingId } = req.params;
+    const meetingDoc = await db.collection("meetings").doc(meetingId).get();
+    if (!meetingDoc.exists) {
+      return res.status(404).json({ error: "Réunion introuvable" });
+    }
+    if (!isMeetingMember(meetingDoc.data(), req.authUserId)) {
+      return res.status(403).json({ error: "Accès refusé à cette réunion" });
+    }
     const chatRef = db.collection("meetings").doc(meetingId).collection("chat");
     const snapshot = await chatRef.orderBy("timestamp", "desc").limit(100).get();
     
@@ -2994,10 +3130,10 @@ app.get("/api/meeting/:meetingId/chat", async (req, res) => {
 });
 
 // Lever la main
-app.post("/api/meeting/:meetingId/raise-hand", async (req, res) => {
+app.post("/api/meeting/:meetingId/raise-hand", requireAuth, async (req, res) => {
   try {
     const { meetingId } = req.params;
-    const { userId } = req.body;
+    const userId = req.authUserId;
     
     const doc = await db.collection("meetings").doc(meetingId).get();
     if (!doc.exists) {
@@ -3005,6 +3141,9 @@ app.post("/api/meeting/:meetingId/raise-hand", async (req, res) => {
     }
     
     const meeting = doc.data();
+    if (!isMeetingMember(meeting, userId)) {
+      return res.status(403).json({ error: "Accès refusé à cette réunion" });
+    }
     if (meeting.status === "live" && meeting.roomId) {
       const room = roomManager.rooms.get(meeting.roomId);
       if (room) {
@@ -3032,10 +3171,10 @@ app.post("/api/meeting/:meetingId/raise-hand", async (req, res) => {
 });
 
 // Baisser la main
-app.post("/api/meeting/:meetingId/lower-hand", async (req, res) => {
+app.post("/api/meeting/:meetingId/lower-hand", requireAuth, async (req, res) => {
   try {
     const { meetingId } = req.params;
-    const { userId } = req.body;
+    const userId = req.authUserId;
     
     const doc = await db.collection("meetings").doc(meetingId).get();
     if (!doc.exists) {
@@ -3043,6 +3182,9 @@ app.post("/api/meeting/:meetingId/lower-hand", async (req, res) => {
     }
     
     const meeting = doc.data();
+    if (!isMeetingMember(meeting, userId)) {
+      return res.status(403).json({ error: "Accès refusé à cette réunion" });
+    }
     if (meeting.status === "live" && meeting.roomId) {
       const room = roomManager.rooms.get(meeting.roomId);
       if (room) {
@@ -3070,10 +3212,11 @@ app.post("/api/meeting/:meetingId/lower-hand", async (req, res) => {
 });
 
 // Envoyer une réaction
-app.post("/api/meeting/:meetingId/reaction", async (req, res) => {
+app.post("/api/meeting/:meetingId/reaction", requireAuth, async (req, res) => {
   try {
     const { meetingId } = req.params;
-    const { userId, reaction, timestamp } = req.body;
+    const { reaction, timestamp } = req.body;
+    const userId = req.authUserId;
     
     const doc = await db.collection("meetings").doc(meetingId).get();
     if (!doc.exists) {
@@ -3081,6 +3224,9 @@ app.post("/api/meeting/:meetingId/reaction", async (req, res) => {
     }
     
     const meeting = doc.data();
+    if (!isMeetingMember(meeting, userId)) {
+      return res.status(403).json({ error: "Accès refusé à cette réunion" });
+    }
     if (meeting.status === "live" && meeting.roomId) {
       const room = roomManager.rooms.get(meeting.roomId);
       if (room) {
@@ -3110,7 +3256,7 @@ app.post("/api/meeting/:meetingId/reaction", async (req, res) => {
 });
 
 // Obtenir les permissions d'un utilisateur
-app.get("/api/meeting/:meetingId/permissions/:userId", async (req, res) => {
+app.get("/api/meeting/:meetingId/permissions/:userId", requireAuth, async (req, res) => {
   try {
     const { meetingId, userId } = req.params;
     
@@ -3139,7 +3285,7 @@ app.get("/api/meeting/:meetingId/permissions/:userId", async (req, res) => {
 });
 
 // Mettre à jour les permissions
-app.patch("/api/meeting/:meetingId/permissions/:userId", async (req, res) => {
+app.patch("/api/meeting/:meetingId/permissions/:userId", requireAuth, async (req, res) => {
   try {
     const { meetingId, userId } = req.params;
     const permissions = req.body;
@@ -3150,7 +3296,7 @@ app.patch("/api/meeting/:meetingId/permissions/:userId", async (req, res) => {
     }
     
     const meeting = doc.data();
-    const isCreator = meeting.createdBy === userId;
+    const isCreator = meeting.createdBy === req.authUserId;
     
     // Seul le créateur peut modifier les permissions
     if (!isCreator) {
@@ -3165,6 +3311,113 @@ app.patch("/api/meeting/:meetingId/permissions/:userId", async (req, res) => {
   } catch (error) {
     console.error("❌ Erreur API PATCH /api/meeting/permissions:", error);
     res.status(500).json({ error: "Erreur serveur" });
+  }
+});
+
+// =========================================================
+// LIVEKIT (SFU) — GÉNÉRATION DE TOKENS
+// =========================================================
+
+/**
+ * Génère un JWT LiveKit signé pour autoriser un utilisateur à rejoindre une room.
+ * Note : `toJwt()` est asynchrone dans livekit-server-sdk v2+.
+ *
+ * @param {object} params
+ * @param {string} params.userId - Identifiant unique de l'utilisateur (identity LiveKit)
+ * @param {string} [params.displayName] - Nom affiché aux autres participants
+ * @param {string} params.roomName - Nom unique de la room LiveKit
+ * @param {boolean} [params.canPublish=true] - Droit de publier audio/vidéo/écran
+ * @returns {Promise<string>} JWT LiveKit
+ */
+async function createLiveKitToken({ userId, displayName, roomName, canPublish = true }) {
+  if (!LIVEKIT_URL || !LIVEKIT_API_KEY || !LIVEKIT_API_SECRET) {
+    throw new Error("Configuration LiveKit manquante (LIVEKIT_URL / LIVEKIT_API_KEY / LIVEKIT_API_SECRET)");
+  }
+
+  const token = new AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET, {
+    identity: userId,
+    name: displayName || userId,
+    ttl: "2h",
+  });
+
+  token.addGrant({
+    roomJoin: true,
+    room: roomName,
+    canPublish: !!canPublish,
+    canSubscribe: true,
+    canPublishData: true,
+  });
+
+  return await token.toJwt();
+}
+
+/**
+ * POST /api/livekit-token
+ * Génère un jeton LiveKit pour rejoindre une réunion existante.
+ * Body : { meetingId?, code?, userId? } (userId ou X-User-Id requis par requireAuth)
+ */
+app.post("/api/livekit-token", requireAuth, async (req, res) => {
+  try {
+    const userId = req.authUserId;
+    const rawMeetingId = String(req.body?.meetingId || "").trim();
+    const rawCode = String(req.body?.code || "").trim();
+
+    if (!rawMeetingId && !rawCode) {
+      return res.status(400).json({ error: "meetingId ou code requis" });
+    }
+
+    // Récupérer la réunion par meetingId ou par code (XXX-XXX-XXX)
+    let meeting = null;
+    if (rawMeetingId) {
+      const doc = await db.collection("meetings").doc(rawMeetingId).get();
+      if (doc.exists) {
+        meeting = { id: doc.id, ...doc.data() };
+      }
+    } else {
+      meeting = await meetingManager.getByCode(rawCode);
+    }
+
+    if (!meeting) {
+      return res.status(404).json({ error: "Réunion introuvable" });
+    }
+
+    // Vérifier que la réunion n'est pas terminée ni annulée
+    if (meeting.status === "ended" || meeting.status === "cancelled") {
+      return res.status(409).json({ error: "Cette réunion est terminée ou annulée" });
+    }
+
+    // Respecter la salle d'attente si accessPolicy === "approval"
+    const isHost = meeting.createdBy === userId;
+    if (meeting.accessPolicy === "approval" && !isHost) {
+      const isApproved =
+        Array.isArray(meeting.approvedUsers) && meeting.approvedUsers.includes(userId);
+      const isParticipant =
+        Array.isArray(meeting.participants) && meeting.participants.includes(userId);
+
+      if (!isApproved && !isParticipant) {
+        return res.status(403).json({ error: "En attente d'approbation par l'hôte" });
+      }
+    }
+
+    const roomName = meeting.id || meeting.meetingId;
+    const displayName = getUserDisplayName(userId) || userId;
+    const token = await createLiveKitToken({
+      userId,
+      displayName,
+      roomName,
+      canPublish: true,
+    });
+
+    return res.json({
+      token,
+      url: LIVEKIT_URL,
+      roomName,
+      meetingId: roomName,
+      isHost,
+    });
+  } catch (error) {
+    console.error("❌ Erreur API POST /api/livekit-token :", error);
+    return res.status(500).json({ error: "Impossible de générer le token LiveKit" });
   }
 });
 
@@ -3198,7 +3451,7 @@ const interval = setInterval(() => {
       console.error("Erreur envoi ping :", e);
     }
   });
-}, 22000);
+}, 30000);
 
 wss.on("close", () => {
   clearInterval(interval);
@@ -3238,17 +3491,9 @@ wss.on("connection", (ws) => {
         return;
       }
 
-      if (type === "ping" || data.action === "ping") {
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: "pong" }));
-        }
-        return;
-      }
-
       // 1. Enregistrement / Reconnexion de l'utilisateur
       if (type === "register-user") {
         const { authToken } = data;
-        cancelHostLeaveGraceTimers(userId);
 
         if (typeof data.displayName === "string") {
           const cleanName = data.displayName.replace(/[<>"'`]/g, "").trim().slice(0, 40);
@@ -3262,33 +3507,45 @@ wss.on("connection", (ws) => {
 
           // Vérifier le token d'authentification avec expiration
           if (storedTokenData && !validateAuthToken(userId, authToken)) {
-            console.warn(`⚠️ Token invalide ou expiré pour ${userId}, rejet de l'enregistrement`);
-            ws.send(
-              JSON.stringify({
-                type: "registration-error",
-                reason: "Token d'authentification invalide ou expiré",
-              }),
-            );
-            return;
+            // Auto-réparation : si aucune session VIVANTE n'existe pour ce
+            // compte (socket null, fermé, ou CE socket-ci), ré-émettre un
+            // token neuf au lieu d'enfermer le client dans un rejet infini.
+            // Un appareil au token périmé (vieille appli, stockage vidé,
+            // redéploiement Render) peut ainsi se réinscrire tout seul.
+            // La protection anti-usurpation est conservée : si une AUTRE
+            // socket vivante utilise déjà ce compte, le rejet reste ferme.
+            const liveSocket =
+              existingUser.ws && existingUser.ws.readyState === WebSocket.OPEN
+                ? existingUser.ws
+                : null;
+            const isHijackAttempt = !!(liveSocket && liveSocket !== ws);
+
+            if (!isHijackAttempt) {
+              const reissued = generateAuthToken(userId);
+              userAuthTokens.set(userId, { token: reissued, createdAt: Date.now() });
+              console.warn(
+                `🔁 Token inconnu/expiré pour ${userId} mais session inactive : ré-émission d'un token neuf`,
+              );
+            } else {
+              console.warn(`⚠️ Token invalide ou expiré pour ${userId}, rejet de l'enregistrement (session active ailleurs)`);
+              ws.send(
+                JSON.stringify({
+                  type: "registration-error",
+                  reason: "Token d'authentification invalide ou expiré",
+                }),
+              );
+              return;
+            }
           }
 
           console.log(
             `🔄 Utilisateur ${userId} déjà présent dans la Map. Mise à jour de la connexion...`,
           );
 
-          // Fermer proprement l'ancien socket s'il existe encore (éviter 1006 brutal)
+          // Fermer l'ancien socket s'il existe et qu'il est encore actif
           if (existingUser.ws && existingUser.ws !== ws) {
-            const oldWs = existingUser.ws;
-            oldWs.userId = null;
-            try {
-              if (oldWs.readyState === WebSocket.OPEN) {
-                oldWs.close(4001, "Replaced by new connection");
-              } else if (oldWs.readyState === WebSocket.CONNECTING) {
-                oldWs.terminate();
-              }
-            } catch (e) {
-              try { oldWs.terminate(); } catch (_) {}
-            }
+            existingUser.ws.userId = null;
+            existingUser.ws.terminate();
           }
 
           // Mise à jour : Nouveau socket + mise à jour du token
@@ -3866,6 +4123,29 @@ wss.on("connection", (ws) => {
             console.error(`[MEETING] Échec restauration salle ${roomId}:`, error);
           }
         }
+        // Restaurer une salle d'ATTENTE après redémarrage : seule la salle
+        // live était restaurée, la room_waiting_* devenait introuvable =>
+        // les visiteurs reconnectés ne rejoignaient plus la salle et ne
+        // se voyaient plus entre eux (aucun roster => aucune offre WebRTC).
+        if (!room && typeof roomId === "string" && roomId.startsWith("room_waiting_")) {
+          const meetingId = roomId.slice("room_waiting_".length);
+          try {
+            const meetingDoc = await db.collection("meetings").doc(meetingId).get();
+            if (meetingDoc.exists) {
+              const meeting = meetingDoc.data();
+              if (meeting.status === "scheduled" && (!meeting.endsAt || meeting.endsAt > Date.now())) {
+                room = roomManager.rooms.get(roomId);
+                if (!room) {
+                  roomManager.rooms.set(roomId, { roomId, creatorId: null, isVideo: !!meeting.isVideo, isMeeting: true, isWaitingRoom: true, createdAt: Date.now(), endsAt: meeting.endsAt || (Date.now() + 24 * 3600 * 1000), participants: new Map() });
+                  room = roomManager.rooms.get(roomId);
+                  console.log(`[MEETING] Salle d'attente restaurée à la demande: ${roomId}`);
+                }
+              }
+            }
+          } catch (error) {
+            console.error(`[MEETING] Échec restauration salle d'attente ${roomId}:`, error);
+          }
+        }
         if (!room) {
           ws.send(JSON.stringify({
             type: "group-error",
@@ -3899,14 +4179,23 @@ wss.on("connection", (ws) => {
           }
         }
         if (roomManager.isUserInAnyRoom(ws.userId) && !room.participants.has(ws.userId)) {
-          ws.send(
-            JSON.stringify({
-              type: "group-error",
-              roomId,
-              reason: "Occupé",
-            }),
-          );
-          return;
+          if (!room.isWaitingRoom) {
+            // Salle de groupe / réunion live : conflit réel, on refuse.
+            ws.send(
+              JSON.stringify({
+                type: "group-error",
+                roomId,
+                reason: "Occupé",
+              }),
+            );
+            return;
+          }
+          // Salle d'ATTENTE : une appartenance résiduelle (reconnexion WebSocket,
+          // crash, room RAM non nettoyée) ne doit PAS empêcher le join, sinon
+          // les visiteurs n'obtiennent jamais de roster et ne se voient pas
+          // (aucune offre WebRTC échangée). On purge les autres salles.
+          console.log(`[GROUP] ${ws.userId} nettoyage présence obsolète avant join salle d'attente ${roomId}`);
+          roomManager.leaveUserFromOtherRooms(ws.userId, roomId);
         }
 
         // Rejoindre la salle
@@ -3996,16 +4285,6 @@ wss.on("connection", (ws) => {
               reason: "Impossible de quitter",
             }),
           );
-        }
-
-        // Si l'utilisateur qui quitte volontairement est l'hôte de la réunion, terminer pour tous
-        if (String(roomId).startsWith("room_meeting_")) {
-          const meetingId = roomId.slice("room_meeting_".length);
-          const isHost = await meetingManager.isHost(meetingId, ws.userId);
-          if (isHost) {
-            await endMeetingByHost(meetingId, ws.userId, "host_left");
-            return;
-          }
         }
 
         // Notifier les autres participants du départ (pour Meeting)
@@ -4134,46 +4413,74 @@ wss.on("connection", (ws) => {
       // 16. Créer une réunion planifiée
       // Envoyé par : Utilisateur -> Reçu par : Utilisateur (confirmation)
       // Pourquoi : Créer une réunion planifiée avec un code partageable
-      if (type === "meeting-create" || type === "create-meeting") {
-        const sendMeetingError = (msg) => {
-          if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({
-              type: "meeting-error",
-              reason: msg,
-              message: msg,
-            }));
-          }
-        };
+      if (type === "meeting-create") {
         try {
           // Validation des données
           const validation = validateMeetingMessage(data, "meeting-create");
           if (!validation.valid) {
-            console.warn(`[MEETING] ${type} refusé : ${validation.reason}`);
-            sendMeetingError(validation.reason);
+            console.warn(`[MEETING] meeting-create refusé : ${validation.reason}`);
+            ws.send(
+              JSON.stringify({
+                type: "meeting-error",
+                reason: validation.reason,
+              }),
+            );
             return;
           }
 
-          const { title, description, scheduledAt, durationMin, isVideo, participants, accessPolicy, hostName } = data;
-          const scheduleCheck = normalizeScheduledAt(scheduledAt);
-          if (!scheduleCheck.valid) {
-            sendMeetingError(scheduleCheck.reason);
-            return;
+          const { title, description, scheduledAt, durationMin, isVideo, participants, accessPolicy } = data;
+
+          // Idempotence : rejeu d'une demande déjà servie (reconnexion client)
+          // -> réenvoyer la MÊME réponse au lieu de créer une 2e réunion.
+          const createRequestId = typeof data.requestId === "string" ? data.requestId.slice(0, 64) : null;
+          if (createRequestId) {
+            pruneRecentMeetingCreates();
+            const dedupKey = `${ws.userId}:${createRequestId}`;
+            const previous = recentMeetingCreates.get(dedupKey);
+            if (previous && previous.response) {
+              console.log(`[MEETING] meeting-create rejoué par ${ws.userId} (requestId connu) : réenvoi de la réponse d'origine`);
+              ws.send(JSON.stringify(previous.response));
+              return;
+            }
           }
 
           const waitingMusicTracks = Array.isArray(data.waitingMusicTracks) ? data.waitingMusicTracks : [];
-          const validWaitingMusic = waitingMusicTracks.every((track) =>
-            track && typeof track.dataUrl === "string" && /^data:audio\/[a-zA-Z0-9.+-]+;base64,/.test(track.dataUrl)
-          ) && waitingMusicTracks.reduce((sum, track) => sum + track.dataUrl.length, 0) <= MAX_WAITING_MUSIC_TRANSFER_BYTES;
-          if (!validWaitingMusic) {
-            sendMeetingError("La liste audio est trop volumineuse pour être transmise");
-            return;
+          let decodedWaitingMusic = null;
+          let waitingMusicSkipped = null;
+          if (waitingMusicTracks.length) {
+            const validWaitingMusic = waitingMusicTracks.every((track) =>
+              track && typeof track.dataUrl === "string" && /^data:audio\/[a-zA-Z0-9.+-]+;base64,/.test(track.dataUrl)
+            );
+            if (!validWaitingMusic) {
+              ws.send(JSON.stringify({ type: "meeting-error", reason: "La liste audio est invalide ou trop volumineuse pour être transmise" }));
+              return;
+            }
+            try {
+              // Décodage UNE fois ici : après ce point le serveur ne manipule
+              // plus jamais les dataUrls (le binaire ne circule plus en WS).
+              decodedWaitingMusic = decodeWaitingMusicTracks(waitingMusicTracks);
+            } catch (e) {
+              // ANTI-BLOCAGE : la musique ne doit JAMAIS empêcher la création
+              // de la réunion (régression signalée : 3 morceaux => meeting-create
+              // rejeté). On ignore la playlist et on prévient l'hôte.
+              decodedWaitingMusic = null;
+              waitingMusicSkipped = e.message === "too-large"
+                ? "Musique d'attente ignorée : liste trop volumineuse (max 100 Mo au total)"
+                : "Musique d'attente ignorée : un des morceaux est invalide";
+              console.warn(`[MEETING] ${waitingMusicSkipped}`);
+            }
           }
 
-          console.log(`[MEETING] ${type} reçu de ${ws.userId || "?"} accessPolicy=${accessPolicy || "direct"}`);
+          console.log(`[MEETING] meeting-create reçu de ${ws.userId || "?"} accessPolicy=${accessPolicy || "direct"}`);
 
           if (!ws.userId) {
-            console.error(`[MEETING] ${type} refusé : utilisateur non enregistré`);
-            sendMeetingError("Non enregistré");
+            console.error(`[MEETING] meeting-create refusé : utilisateur non enregistré`);
+            ws.send(
+              JSON.stringify({
+                type: "meeting-error",
+                reason: "Non enregistré",
+              }),
+            );
             return;
           }
 
@@ -4186,53 +4493,69 @@ wss.on("connection", (ws) => {
           const meeting = await meetingManager.create({
             title: sanitizedTitle,
             description: sanitizedDescription,
-            scheduledAt: scheduleCheck.value,
+            scheduledAt,
             durationMin,
             isVideo: !!isVideo,
             createdBy: ws.userId,
-            hostName,
             participants: participants || [],
             accessPolicy: policy,
           });
 
           // Vérifier si la création a réussi
           if (meeting.success === false) {
-            sendMeetingError(meeting.reason);
-            console.log(`[MEETING] ${type} refusé: ${meeting.reason}`);
+            ws.send(
+              JSON.stringify({
+                type: "meeting-error",
+                reason: meeting.reason,
+              }),
+            );
+            console.log(`[MEETING] meeting-create refusé: ${meeting.reason}`);
             return;
           }
 
-          if (waitingMusicTracks.length) {
+          if (decodedWaitingMusic) {
             meetingWaitingMusic.set(meeting.meetingId, {
               syncAt: Date.now(),
-              tracks: waitingMusicTracks.map((track) => ({
-                dataUrl: track.dataUrl,
-                name: String(track.name || "Musique d’attente").slice(0, 120),
-              })),
+              tracks: decodedWaitingMusic,
             });
           }
 
-          if (ws.readyState === WebSocket.OPEN) {
-            ws.send(
-              JSON.stringify({
-                type: "meeting-created",
-                meetingId: meeting.meetingId,
-                code: meeting.code,
-                link: meeting.link,
-                title: meeting.title,
-                description: meeting.description,
-                scheduledAt: meeting.scheduledAt,
-                endsAt: meeting.endsAt,
-                durationMin: meeting.durationMin,
-                isVideo: meeting.isVideo,
-                hostName: meeting.hostName,
-              }),
-            );
+
+          const createdResponse = {
+            type: "meeting-created",
+            meetingId: meeting.meetingId,
+            code: meeting.code,
+            link: meeting.link,
+            title: meeting.title,
+            description: meeting.description,
+            scheduledAt: meeting.scheduledAt,
+            endsAt: meeting.endsAt,
+            durationMin: meeting.durationMin,
+            isVideo: meeting.isVideo,
+            engine: meeting.engine || MEETINGS_ENGINE,
+            // Musique ignorée (trop volumineuse/invalide) : la réunion existe
+            // quand même, l'hôte est simplement informé.
+            ...(waitingMusicSkipped ? { musicSkipped: true, musicSkippedReason: waitingMusicSkipped } : {}),
+          };
+          ws.send(JSON.stringify(createdResponse));
+          // Mémoriser pour la déduplication d'un éventuel rejeu client.
+          if (createRequestId) {
+            recentMeetingCreates.set(`${ws.userId}:${createRequestId}`, {
+              at: Date.now(),
+              response: createdResponse,
+            });
+            // Taille bornée : on purge si la map grossit trop.
+            if (recentMeetingCreates.size > 1000) pruneRecentMeetingCreates();
           }
           console.log(`[MEETING] meeting-created envoyé à ${ws.userId}`);
         } catch (error) {
-          console.error(`[MEETING] Erreur dans ${type} :`, error);
-          sendMeetingError(error.message || "Erreur serveur");
+          console.error(`[MEETING] Erreur dans meeting-create :`, error);
+          ws.send(
+            JSON.stringify({
+              type: "meeting-error",
+              reason: error.message || "Erreur serveur",
+            }),
+          );
         }
         return;
       }
@@ -4316,9 +4639,19 @@ wss.on("connection", (ws) => {
                 title: result.title,
                 code: result.code,
                 createdBy: result.createdBy,
+                engine: result.engine || MEETINGS_ENGINE,
               }),
             );
             console.log(`[MEETING] meeting-joined envoyé à ${ws.userId} (salle ${result.roomId})`);
+
+            // ORDRE CRITIQUE : le client du demandeur est maintenant informé de
+            // la salle live. On transfère seulement maintenant les utilisateurs
+            // en attente vers la salle live (voir handoffWaitingUsers).
+            if (result.postJoin) {
+              meetingManager.handoffWaitingUsers(result.postJoin, ws.userId).catch((error) => {
+                console.error("❌ Erreur postJoin meeting-join :", error);
+              });
+            }
           } else if (result.status === "waiting") {
             // Trop tôt : afficher compte à rebours
             ws.send(
@@ -4335,7 +4668,8 @@ wss.on("connection", (ws) => {
                 isVideo: result.isVideo,
                 title: result.title,
                 createdBy: result.createdBy,
-                waitingMusic: meetingWaitingMusic.get(result.meetingId) || null,
+                // PAYLOAD LÉGER : URLs de flux, jamais le binaire (anti-blocage).
+                waitingMusic: buildWaitingMusicPayload(result.meetingId),
               }),
             );
             console.log(`[MEETING] meeting-waiting envoyé à ${ws.userId} (${result.waitTimeMin}min restantes)`);
@@ -4361,15 +4695,12 @@ wss.on("connection", (ws) => {
           }
         } catch (error) {
           console.error(`[MEETING] Erreur dans meeting-join :`, error);
-          if (ws.readyState === WebSocket.OPEN) {
-            ws.send(
-              JSON.stringify({
-                type: "meeting-error",
-                reason: error.message || "Erreur serveur",
-                message: error.message || "Erreur serveur",
-              }),
-            );
-          }
+          ws.send(
+            JSON.stringify({
+              type: "meeting-error",
+              reason: error.message || "Erreur serveur",
+            }),
+          );
         }
         return;
       }
@@ -4396,24 +4727,32 @@ wss.on("connection", (ws) => {
           const tracks = Array.isArray(data.tracks) ? data.tracks : [{ dataUrl: data.dataUrl, name: data.name }];
           const validTracks = tracks.length > 0 && tracks.every((track) =>
             track && typeof track.dataUrl === "string" && /^data:audio\/[a-zA-Z0-9.+-]+;base64,/.test(track.dataUrl)
-          ) && tracks.reduce((sum, track) => sum + track.dataUrl.length, 0) <= MAX_WAITING_MUSIC_TRANSFER_BYTES;
+          );
           if (!validTracks) {
             ws.send(JSON.stringify({ type: "meeting-error", reason: "Liste audio invalide ou trop volumineuse pour être transmise" }));
+            return;
+          }
+          // Décodage UNE fois : buffers en RAM, diffusion par URLs légères.
+          let decoded;
+          try {
+            decoded = decodeWaitingMusicTracks(tracks);
+          } catch (e) {
+            ws.send(JSON.stringify({ type: "meeting-error", reason: e.message === "too-large" ? "Liste audio trop volumineuse" : "Un des morceaux audio est invalide" }));
             return;
           }
           // syncAt : horodatage serveur => les clients calculent la position
           // de lecture (seek) via leur clockOffset pour écouter le même
           // morceau au même moment.
-          const music = { syncAt: Date.now(), tracks: tracks.map((track) => ({
-            dataUrl: track.dataUrl,
-            name: String(track.name || "Musique d’attente").slice(0, 120),
-          })) };
+          const music = { syncAt: Date.now(), tracks: decoded };
           meetingWaitingMusic.set(meetingId, music);
+          // Guardar el token para validar las peticiones HTTP posteriores
+          getWaitingMusicToken(meetingId);
+          const lightPayload = buildWaitingMusicPayload(meetingId);
           const recipients = new Set(waitingUsers);
           for (const recipientId of recipients) {
             const user = users.get(recipientId);
             if (user?.ws && user.ws.readyState === WebSocket.OPEN) {
-              user.ws.send(JSON.stringify({ type: "meeting-waiting-music-set", meetingId, ...music }));
+              user.ws.send(JSON.stringify({ type: "meeting-waiting-music-set", meetingId, ...lightPayload }));
             }
           }
         } catch (error) {
@@ -4422,63 +4761,71 @@ wss.on("connection", (ws) => {
         return;
       }
 
-      if (type === "meeting-force-start" || type === "meeting-start") {
-        const sendStartError = (msg) => {
-          if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: "meeting-error", reason: msg, message: msg }));
-          }
-        };
+      if (type === "meeting-force-start") {
         try {
           // Validation des données
           const validation = validateMeetingMessage(data, "meeting-force-start");
           if (!validation.valid) {
-            console.warn(`[MEETING] ${type} refusé : ${validation.reason}`);
-            sendStartError(validation.reason);
+            console.warn(`[MEETING] meeting-force-start refusé : ${validation.reason}`);
+            ws.send(JSON.stringify({ type: "meeting-error", reason: validation.reason }));
             return;
           }
 
           const { code } = data;
 
-          console.log(`[MEETING] ${type} reçu de ${ws.userId || "?"} pour code ${code}`);
+          console.log(`[MEETING] meeting-force-start reçu de ${ws.userId || "?"} pour code ${code}`);
 
           if (!ws.userId) {
-            sendStartError("Non enregistré");
+            ws.send(JSON.stringify({ type: "meeting-error", reason: "Non enregistré" }));
             return;
           }
 
           // Vérifier que l'utilisateur est autorisé (hôte)
           const meetingDoc = await db.collection("meetings").where("code", "==", code).limit(1).get();
           if (meetingDoc.empty) {
-            sendStartError("Réunion introuvable");
+            ws.send(JSON.stringify({ type: "meeting-error", reason: "Réunion introuvable" }));
             return;
           }
           const meeting = meetingDoc.docs[0].data();
           if (meeting.createdBy !== ws.userId) {
-            sendStartError("Non autorisé (seul l'hôte peut démarrer)");
+            ws.send(JSON.stringify({ type: "meeting-error", reason: "Non autorisé (seul l'hôte peut démarrer)" }));
             return;
           }
 
           const result = await meetingManager.forceStart(code, ws.userId);
 
           if (result.success) {
-            if (ws.readyState === WebSocket.OPEN) {
-              ws.send(JSON.stringify({
-                type: "meeting-joined",
-                meetingId: result.meetingId,
-                roomId: result.roomId,
-                isVideo: result.isVideo,
-                title: result.title,
-                code: result.code,
-                createdBy: result.createdBy || ws.userId,
-              }));
+            ws.send(JSON.stringify({
+              type: "meeting-joined",
+              meetingId: result.meetingId,
+              roomId: result.roomId,
+              isVideo: result.isVideo,
+              title: result.title,
+              code: result.code,
+              createdBy: result.createdBy || ws.userId,
+              engine: result.engine || MEETINGS_ENGINE,
+            }));
+            console.log(`[MEETING] meeting-force-start OK: ${result.roomId} pour ${ws.userId}`);
+
+            // ORDRE CRITIQUE : le client de l'hôte est maintenant informé de la
+            // salle live. On transfère THEN seulement les utilisateurs en
+            // attente (sinon leurs signaux WebRTC arrivent avant que l'hôte
+            // n'ait groupRoomId et sont jetés : les invités se connectent
+            // entre eux, l'hôte reste isolé).
+            if (result.postJoin) {
+              meetingManager.handoffWaitingUsers(result.postJoin, ws.userId).catch((error) => {
+                console.error("❌ Erreur postJoin force-start :", error);
+              });
             }
-            console.log(`[MEETING] ${type} OK: ${result.roomId} pour ${ws.userId}`);
           } else {
-            sendStartError(result.reason);
+            ws.send(JSON.stringify({
+              type: "meeting-error",
+              reason: result.reason,
+            }));
           }
         } catch (error) {
-          console.error(`[MEETING] Erreur dans ${type} :`, error);
-          sendStartError(error.message || "Erreur serveur");
+          console.error(`[MEETING] Erreur dans meeting-force-start :`, error);
+          ws.send(JSON.stringify({ type: "meeting-error", reason: error.message || "Erreur serveur" }));
         }
         return;
       }
@@ -4488,15 +4835,11 @@ wss.on("connection", (ws) => {
       // Pourquoi : Annuler une réunion planifiée (réservé à l'hôte)
       // Retirer un visiteur de la liste d'attente lorsqu'il quitte.
       if (type === "meeting-waiting-leave") {
-        try {
-          if (!ws.userId || typeof data.meetingId !== "string" || data.meetingId.length > 100) return;
-          const meetingDoc = await db.collection("meetings").doc(data.meetingId).get();
-          if (!meetingDoc.exists) return;
-          const waitingUsers = Array.isArray(meetingDoc.data().waitingUsers) ? meetingDoc.data().waitingUsers : [];
-          if (waitingUsers.includes(ws.userId)) await meetingManager._removeWaitingUser(data.meetingId, ws.userId);
-        } catch (error) {
-          console.error("[MEETING] Erreur dans meeting-waiting-leave :", error);
-        }
+        if (!ws.userId || typeof data.meetingId !== "string" || data.meetingId.length > 100) return;
+        const meetingDoc = await db.collection("meetings").doc(data.meetingId).get();
+        if (!meetingDoc.exists) return;
+        const waitingUsers = Array.isArray(meetingDoc.data().waitingUsers) ? meetingDoc.data().waitingUsers : [];
+        if (waitingUsers.includes(ws.userId)) await meetingManager._removeWaitingUser(data.meetingId, ws.userId);
         return;
       }
 
@@ -4612,6 +4955,7 @@ wss.on("connection", (ws) => {
                 title: result.title,
                 code: result.code,
                 createdBy: result.createdBy,
+                engine: result.engine || MEETINGS_ENGINE,
               }));
             }
 
@@ -4626,6 +4970,7 @@ wss.on("connection", (ws) => {
                 title: result.title,
                 code: result.code,
                 createdBy: result.createdBy,
+                engine: result.engine || MEETINGS_ENGINE,
               }));
             }
             // Confirmer à l'hôte
@@ -4767,7 +5112,7 @@ wss.on("connection", (ws) => {
         const cleanMessage = sanitizeString(message).slice(0, 1000).trim();
         if (!cleanMessage) return;
         const chatMessage = {
-          id: `msg_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`,
+          id: `msg_${Date.now()}_${crypto.randomBytes(6).toString("hex")}`,
           clientMessageId: typeof clientMessageId === "string" ? clientMessageId.slice(0, 100) : null,
           meetingId,
           message: cleanMessage,
@@ -5040,140 +5385,6 @@ wss.on("connection", (ws) => {
         return;
       }
 
-      if (type === "meeting-leave") {
-        try {
-          const meetingId = typeof data.meetingId === "string" ? data.meetingId : "";
-          if (!ws.userId || !meetingId) return;
-          const isHost = await meetingManager.isHost(meetingId, ws.userId);
-          if (isHost) {
-            await endMeetingByHost(meetingId, ws.userId, "host_left");
-          }
-        } catch (error) {
-          console.error("[MEETING] Erreur meeting-leave:", error);
-        }
-        return;
-      }
-
-      // ===== TABLEAU BLANC COLLABORATIF (WHITEBOARD) =====
-      if (
-        type === "whiteboard-toggle" ||
-        type === "whiteboard-draw" ||
-        type === "whiteboard-clear" ||
-        type === "whiteboard-sync"
-      ) {
-        try {
-          const meetingId = typeof data.meetingId === "string" ? data.meetingId.trim() : "";
-          if (!ws.userId || !meetingId || meetingId.length > 100) return;
-
-          const liveRoomId = `room_meeting_${meetingId}`;
-          const room = roomManager.rooms.get(liveRoomId);
-          const doc = await db.collection("meetings").doc(meetingId).get();
-          if (!doc.exists) return;
-          const meeting = doc.data();
-
-          const isHost = meeting.createdBy === ws.userId;
-          const isCoHost = Array.isArray(meeting.coHosts) && meeting.coHosts.includes(ws.userId);
-          const inRoom = !!(room && room.participants.has(ws.userId));
-          const isListed = Array.isArray(meeting.participants) && meeting.participants.includes(ws.userId);
-          if (!inRoom && !isHost && !isCoHost && !isListed) {
-            ws.send(JSON.stringify({ type: "meeting-error", reason: "Accès tableau blanc non autorisé" }));
-            return;
-          }
-
-          if (!meetingWhiteboards.has(meetingId)) {
-            meetingWhiteboards.set(meetingId, {
-              isOpen: false,
-              allowParticipantsDraw: true,
-              strokes: [],
-            });
-          }
-          const wb = meetingWhiteboards.get(meetingId);
-
-          const broadcastToMeeting = (payloadObj, excludeUserId = null) => {
-            if (!room) return;
-            const msg = JSON.stringify(payloadObj);
-            for (const [pid] of room.participants) {
-              if (excludeUserId && pid === excludeUserId) continue;
-              const u = users.get(pid);
-              if (u?.ws && u.ws.readyState === WebSocket.OPEN) {
-                u.ws.send(msg);
-              }
-            }
-          };
-
-          if (type === "whiteboard-sync") {
-            ws.send(JSON.stringify({
-              type: "whiteboard-state",
-              meetingId,
-              isOpen: wb.isOpen,
-              allowParticipantsDraw: wb.allowParticipantsDraw,
-              strokes: wb.strokes,
-            }));
-            return;
-          }
-
-          if (type === "whiteboard-toggle") {
-            if (!isHost && !isCoHost) {
-              ws.send(JSON.stringify({ type: "meeting-error", reason: "Seul l'hôte peut ouvrir/fermer le tableau" }));
-              return;
-            }
-            if (typeof data.isOpen === "boolean") wb.isOpen = data.isOpen;
-            if (typeof data.allowParticipantsDraw === "boolean") wb.allowParticipantsDraw = data.allowParticipantsDraw;
-            broadcastToMeeting({
-              type: "whiteboard-state",
-              meetingId,
-              isOpen: wb.isOpen,
-              allowParticipantsDraw: wb.allowParticipantsDraw,
-              strokes: wb.strokes,
-            });
-            return;
-          }
-
-          if (type === "whiteboard-clear") {
-            if (!isHost && !isCoHost) {
-              ws.send(JSON.stringify({ type: "meeting-error", reason: "Seul l'hôte peut effacer le tableau" }));
-              return;
-            }
-            wb.strokes = [];
-            broadcastToMeeting({
-              type: "whiteboard-cleared",
-              meetingId,
-              by: ws.userId,
-            });
-            return;
-          }
-
-          if (type === "whiteboard-draw") {
-            if (!wb.isOpen) return;
-            if (!isHost && !isCoHost && !wb.allowParticipantsDraw) return;
-            const clamp01 = (v) => Math.max(0, Math.min(1, Number(v) || 0));
-            const stroke = {
-              x0: clamp01(data.x0),
-              y0: clamp01(data.y0),
-              x1: clamp01(data.x1),
-              y1: clamp01(data.y1),
-              color: typeof data.color === "string" ? data.color.slice(0, 20) : "#111827",
-              size: Math.max(1, Math.min(32, Number(data.size) || 3)),
-              tool: data.tool === "eraser" ? "eraser" : "pen",
-            };
-            if (wb.strokes.length >= MAX_WHITEBOARD_STROKES) {
-              wb.strokes.shift();
-            }
-            wb.strokes.push(stroke);
-            broadcastToMeeting({
-              type: "whiteboard-draw",
-              meetingId,
-              from: ws.userId,
-              ...stroke,
-            }, ws.userId);
-            return;
-          }
-        } catch (error) {
-          console.error("[WHITEBOARD] Erreur:", error);
-        }
-        return;
-      }
-
       // 19. Lister les réunions d'un utilisateur
       // Envoyé par : Utilisateur -> Reçu par : Utilisateur (liste)
       // Pourquoi : Récupérer les réunions à venir et passées
@@ -5234,28 +5445,6 @@ wss.on("connection", (ws) => {
         // =========================================================
         // APPEL DE GROUPE — Nettoyage des salles à la déconnexion
         // =========================================================
-        // Si l'utilisateur déconnecté est hôte d'une réunion live, lancer un délai de grâce de 8s
-        for (const [roomId, room] of roomManager.rooms.entries()) {
-          if (String(roomId).startsWith("room_meeting_") && room.participants.has(ws.userId)) {
-            const meetingId = roomId.slice("room_meeting_".length);
-            const disconnectedUserId = ws.userId;
-            meetingManager.isHost(meetingId, disconnectedUserId).then((isHost) => {
-              if (!isHost) return;
-              const graceKey = `${meetingId}:${disconnectedUserId}`;
-              if (hostLeaveGraceTimers.has(graceKey)) return;
-              const timer = setTimeout(async () => {
-                hostLeaveGraceTimers.delete(graceKey);
-                const current = users.get(disconnectedUserId);
-                if (current?.ws && current.ws.readyState === WebSocket.OPEN) {
-                  return; // L'hôte s'est reconnecté entre-temps
-                }
-                await endMeetingByHost(meetingId, disconnectedUserId, "host_left");
-              }, 8000);
-              hostLeaveGraceTimers.set(graceKey, timer);
-            }).catch(() => {});
-          }
-        }
-
         // Marquer l'utilisateur comme LEFT dans toutes ses salles
         roomManager.markLeftInAllRooms(ws.userId);
       }

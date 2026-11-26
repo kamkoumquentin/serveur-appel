@@ -4,8 +4,8 @@
 
 class CallManager {
   // static SIGNALING_SERVER_URL = 'wss://api.furthermarket.com:8088';
-  static SIGNALING_SERVER_URL = "wss://serveur-appel.onrender.com";
-  static HTTP_SERVER_URL = "https://serveur-appel.onrender.com";
+  static SIGNALING_SERVER_URL = "ws://192.168.1.222:3000"; //"wss://app-appel.onrender.com";
+  static HTTP_SERVER_URL = "http://192.168.1.222:3000"; //"https://app-appel.onrender.com";
   static RECONNECT_DELAY = 5000;
 
   static RTC_CONFIG = {
@@ -1900,6 +1900,7 @@ button, [role="button"] { cursor: pointer; }
     this.pendingNativeCall = null;
     this.callToastTimer = null;
     this.currentAudioRoute = "earpiece";
+    this.activeMediaEngine = "none"; // "none" | "mesh" | "livekit"
     this.isScreenSharing = false;
     this.screenStream = null;
     this._cameraTrackBackup = null;
@@ -2273,7 +2274,7 @@ button, [role="button"] { cursor: pointer; }
       const urlObj = new URL(url);
       const pathParts = urlObj.pathname.split('/').filter(part => part);
 
-      // Format: callapp://join/ABC-123-XYZ ou https://serveur-appel.onrender.com/join/ABC-123-XYZ
+      // Format: callapp://join/ABC-123-XYZ ou https://app-appel.onrender.com/join/ABC-123-XYZ
       if (pathParts[0] === 'join' && pathParts[1]) {
         const code = pathParts[1];
         console.log("🔗 Code de réunion extrait:", code);
@@ -2460,11 +2461,12 @@ button, [role="button"] { cursor: pointer; }
 ========================================================= */
 
   initPushNotifications = () => {
-    if (window.cordova?.platformId === "browser" || typeof PushNotification === "undefined") {
-      console.debug("🔔 PushNotification ignoré (plateforme browser ou plugin absent)");
+    console.log("🔔 ===== INITIALISATION PUSH =====");
+
+    if (typeof PushNotification === "undefined") {
+      console.error("❌ PushNotification est undefined");
       return;
     }
-    console.log("🔔 ===== INITIALISATION PUSH =====");
 
     try {
       this.push = PushNotification.init({
@@ -2664,16 +2666,20 @@ button, [role="button"] { cursor: pointer; }
   connectWebSocket = async () => {
     if (
       this.wsReadyState === WebSocket.OPEN ||
-      this.wsReadyState === WebSocket.CONNECTING ||
-      this._isConnectingSocket
+      this.wsReadyState === WebSocket.CONNECTING
     ) {
       return;
     }
 
-    this._isConnectingSocket = true;
-    this.wsReadyState = WebSocket.CONNECTING;
     this.manuallyClosed = false;
     this.updateStatus("Connexion au serveur...");
+
+    // Débogage : vérifier si le plugin est disponible
+    console.log("🔍 Vérification plugin WebSocket :");
+    console.log("  - window.cordova:", !!window.cordova);
+    console.log("  - window.CordovaWebsocketPlugin:", !!window.CordovaWebsocketPlugin);
+    console.log("  - cordova.plugins:", !!cordova?.plugins);
+    console.log("  - cordova.plugins.CordovaWebsocketPlugin:", !!cordova?.plugins?.CordovaWebsocketPlugin);
 
     try {
       await fetch(CallManager.HTTP_SERVER_URL, { method: "GET", cache: "no-cache" });
@@ -2687,7 +2693,6 @@ button, [role="button"] { cursor: pointer; }
       const settleOnce = () => {
         if (settled) return;
         settled = true;
-        this._isConnectingSocket = false;
         resolve();
       };
       setTimeout(settleOnce, 15000);
@@ -2791,9 +2796,7 @@ button, [role="button"] { cursor: pointer; }
       // Le transport natif était bien connecté, mais son état restait
       // CONNECTING : les écrans de réunion refusaient alors d'envoyer leurs messages.
       this.wsReadyState = WebSocket.OPEN;
-      this.isReconnecting = false;
       this.reconnectAttempts = 0; // Réinitialiser les tentatives de reconnexion
-      clearTimeout(this.reconnectTimer);
 
       // Le serveur coupe la connexion après ~30 s d'inactivité → ping JSON
       // toutes les 20 s.
@@ -2838,9 +2841,7 @@ button, [role="button"] { cursor: pointer; }
       this.ws.onopen = () => {
         console.log("✅ WebSocket natif connecté");
         this.wsReadyState = WebSocket.OPEN;
-        this.isReconnecting = false;
         this.reconnectAttempts = 0; // Réinitialiser les tentatives de reconnexion
-        clearTimeout(this.reconnectTimer);
         this.startHeartbeat();
         this.sendRegistration();
         if (typeof onSettle === "function") onSettle();
@@ -2855,18 +2856,20 @@ button, [role="button"] { cursor: pointer; }
         this.updateStatus("Erreur réseau WebSocket");
         this.wsReadyState = WebSocket.CLOSED;
         this.stopHeartbeat();
+        if (!this.manuallyClosed) {
+          this.scheduleReconnect();
+        }
         if (typeof onSettle === "function") onSettle();
       };
 
-      this.ws.onclose = (event) => {
-        console.log("🔌 WebSocket natif fermé (code:", event?.code, ")");
+      this.ws.onclose = () => {
+        console.log("🔌 WebSocket natif fermé");
         this.wsReadyState = WebSocket.CLOSED;
         this.stopHeartbeat();
         if (!this.manuallyClosed) {
           this.updateStatus("Hors ligne");
           this.scheduleReconnect();
         }
-        if (typeof onSettle === "function") onSettle();
       };
     } catch (error) {
       console.error("❌ Erreur création WebSocket natif :", error);
@@ -2939,14 +2942,14 @@ button, [role="button"] { cursor: pointer; }
       // Fallback pour le navigateur
       if (!window.cordova || !wsPlugin) {
         if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-          this.ws.send(JSON.stringify({ type: "ping", action: "ping" }));
+          this.ws.send(JSON.stringify({ action: "ping" }));
         }
       } else {
         // Utiliser le plugin Cordova
         if (this.wsId != null) {
           wsPlugin.wsSend(
             this.wsId,
-            JSON.stringify({ type: "ping", action: "ping" }),
+            JSON.stringify({ action: "ping" }),
           );
         }
       }
@@ -2993,6 +2996,9 @@ button, [role="button"] { cursor: pointer; }
       localStorage.setItem("app_auth_token", data.authToken);
       console.log("🔐 Token d'authentification stocké");
     }
+
+    // Inscription réussie : réarmer la retentative automatique anti-boucle
+    this._registerRetryDone = false;
     
     this.wsReadyState = WebSocket.OPEN;
     this.updateStatus("En ligne");
@@ -3031,11 +3037,33 @@ button, [role="button"] { cursor: pointer; }
       case "registered":
         this.handleRegistered(data);
         this.onGroupSocketRegistered(); // GROUPE : re-jonction éventuelle de la salle
+        // RÉUNION : rejouer une demande de création perdue par une coupure
+        // WebSocket juste après l'envoi (no-op si rien en attente).
+        if (typeof this._retryPendingMeetingCreate === "function") {
+          this._retryPendingMeetingCreate();
+        }
         break;
 
       case "registration-error":
         console.error("❌ Erreur d'inscription :", data.reason);
         this.showCallToast("Erreur d'inscription: " + data.reason);
+        // Auto-réparation : si le serveur refuse à cause du token (périmé,
+        // inconnu, après redéploiement du serveur...), on efface le token
+        // local et on retente UNE seule inscription. Le serveur, de son
+        // côté, ré-émet un token neuf si aucune session vivante n'existe
+        // pour ce compte. Garde anti-boucle : une seule retentative par
+        // inscription réussie.
+        if (!this._registerRetryDone && /token/i.test(data.reason || "")) {
+          this._registerRetryDone = true;
+          this.authToken = null;
+          try {
+            localStorage.removeItem("app_auth_token");
+          } catch (e) { /* stockage indisponible : ignorer */ }
+          console.warn("🔁 Token local effacé, nouvelle tentative d'inscription dans 1,5 s...");
+          setTimeout(() => {
+            this.sendRegistration();
+          }, 1500);
+        }
         break;
 
       case "ice-servers":
@@ -3176,24 +3204,6 @@ button, [role="button"] { cursor: pointer; }
         }
         break;
 
-      case "whiteboard-state":
-        if (window.callManager && window.callManager.handleWhiteboardState) {
-          window.callManager.handleWhiteboardState(data);
-        }
-        break;
-
-      case "whiteboard-draw":
-        if (window.callManager && window.callManager.handleWhiteboardDraw) {
-          window.callManager.handleWhiteboardDraw(data);
-        }
-        break;
-
-      case "whiteboard-cleared":
-        if (window.callManager && window.callManager.handleWhiteboardCleared) {
-          window.callManager.handleWhiteboardCleared(data);
-        }
-        break;
-
       case "meeting-kicked":
         if (window.callManager && window.callManager.handleMeetingKicked) {
           window.callManager.handleMeetingKicked(data);
@@ -3282,13 +3292,9 @@ button, [role="button"] { cursor: pointer; }
   };
 
   scheduleReconnect = () => {
-    if (this.manuallyClosed || this.isReconnecting) {
-      return;
-    }
-    this.isReconnecting = true;
     clearTimeout(this.reconnectTimer);
 
-    // Backoff exponentiel: 1s, 2s, 4s, 8s, max 15s
+    // Backoff exponentiel: 1s, 2s, 4s, 8s, 16s, max 30s
     if (!this.reconnectAttempts) {
       this.reconnectAttempts = 0;
     }
@@ -3296,7 +3302,7 @@ button, [role="button"] { cursor: pointer; }
 
     const delay = Math.min(
       Math.pow(2, this.reconnectAttempts - 1) * 1000,
-      15000
+      30000
     );
 
     console.log(`🔄 Reconnexion WebSocket dans ${delay}ms (tentative ${this.reconnectAttempts})`);
@@ -3304,10 +3310,10 @@ button, [role="button"] { cursor: pointer; }
     // Afficher indicateur visuel de reconnexion
     this.updateStatus(`Reconnexion en cours... (${this.reconnectAttempts})`);
 
-    this.reconnectTimer = setTimeout(() => {
-      this.isReconnecting = false;
-      this.connectWebSocket();
-    }, delay);
+    this.reconnectTimer = setTimeout(
+      () => this.connectWebSocket(),
+      delay,
+    );
   };
 
   sendSignal = (data, _retries = 0) => {
@@ -3756,9 +3762,9 @@ button, [role="button"] { cursor: pointer; }
   handleIncomingCall = (data) => {
     console.log("📞 Appel entrant reçu de :", data.from);
 
-    // GROUPE : déjà dans un appel de groupe -> on refuse l'appel 1-à-1
-    if (this.groupRoomId || this.groupCreating || this.groupPendingInvite) {
-      this.sendSignal({ type: "call-refused", targetId: data.from });
+    // GROUPE / LIVEKIT : déjà dans un appel de groupe ou réunion LiveKit -> on refuse l'appel 1-à-1 en busy
+    if (this.activeMediaEngine === "livekit" || this.groupRoomId || this.groupCreating || this.groupPendingInvite) {
+      this.sendSignal({ type: "call-refused", targetId: data.from, reason: "busy" });
       return;
     }
 
@@ -4892,7 +4898,8 @@ showLocalStorageOnScreen = () => {
 
   // Écoute les changements automatiques (Bluetooth connecté/déconnecté)
   startAudioRouteListening = () => {
-    if (!window.cordova || cordova.platformId === "browser" || !cordova.exec) {
+    if (!window.cordova || !cordova.exec) {
+      console.warn("⚠️ AudioRoute: cordova.exec indisponible");
       return;
     }
 
@@ -6990,6 +6997,7 @@ showLocalStorageOnScreen = () => {
   groupPeers = new Map(); // Connexions WebRTC : userId -> { pc, stream, pendingCandidates, remoteSet, connState, audioEl, isInitiator }
   groupPeerStates = new Map(); // États annoncés par les autres participants : userId -> { micMuted, camOff }
   groupRetryCount = new Map(); // Compteur de tentatives de reconnexion : userId -> nombre de relances
+  _groupPeerWatchdogs = new Map(); // Filet de sécurité : userId -> timer (offre de secours si pair toujours pas connecté)
   groupTiles = new Map(); // Éléments DOM de l'interface : userId -> élément <div> de la tuile
   groupLocalStream = null; // MON flux média (micro + caméra) partagé avec tous les pairs
   groupPendingInvite = null; // Invitation reçue en attente de réponse : { roomId, from, isVideo, roster }
@@ -7071,35 +7079,10 @@ showLocalStorageOnScreen = () => {
 
   // Ouvre le micro (et la caméra si appel vidéo). Résolution volontairement
   // modeste (640x480, 24 fps) : en maillage, chaque flux est envoyé N-1 fois.
-  // Vérifie si groupLocalStream existe et possède des pistes actives (non "ended").
-  hasLiveGroupMedia = (needVideo = false) => {
-    const s = this.groupLocalStream;
-    if (!s) return false;
-    const hasLiveAudio = s.getAudioTracks().some((t) => t.readyState === "live");
-    if (!hasLiveAudio) return false;
-    if (needVideo) {
-      return s.getVideoTracks().some((t) => t.readyState === "live");
-    }
-    return true;
-  };
-
   // `options` (optionnel, module Meeting) : { cameraDeviceId, microphoneDeviceId }
   // permet d'ouvrir les périphériques choisis dans l'écran de prévisualisation.
   // Sans options, le comportement historique (facingMode "user") est conservé.
   acquireGroupMedia = async (video, options = {}) => {
-    this.groupIsLeaving = false;
-
-    // Libérer proprement un éventuel flux précédent avant d'en ouvrir un nouveau
-    if (this.groupLocalStream) {
-      this.groupLocalStream.getTracks().forEach((t) => {
-        try { t.stop(); } catch (e) {}
-      });
-      this.groupLocalStream = null;
-    }
-    if (this.localStream && this.localStream !== this.groupLocalStream) {
-      this.localStream = null;
-    }
-
     if (this.isIOS()) {
       await this.ensureMediaAuthorizedIOS();
     }
@@ -7743,6 +7726,7 @@ showLocalStorageOnScreen = () => {
 
       // Le serveur confirme que nous avons rejoint la salle.
       case "group-joined":
+        if (this.activeMediaEngine === "livekit") return;
         if (data.roomId !== this.groupRoomId) return;
         this.groupJoinPending = false;
         clearTimeout(this.groupRequestTimer);
@@ -7756,6 +7740,7 @@ showLocalStorageOnScreen = () => {
 
       // Liste des participants mise à jour (diffusée à chaque changement).
       case "group-roster":
+        if (this.activeMediaEngine === "livekit") return;
         if (data.roomId !== this.groupRoomId) return;
         this.groupJoinPending = false;
         clearTimeout(this.groupRequestTimer);
@@ -7765,6 +7750,7 @@ showLocalStorageOnScreen = () => {
 
       // Signalisation WebRTC d'un autre participant.
       case "group-signal":
+        if (this.activeMediaEngine === "livekit") return;
         this.handleGroupSignal(data);
         break;
 
@@ -7785,6 +7771,19 @@ showLocalStorageOnScreen = () => {
         } else if (data.roomId === this.groupRoomId && (this.groupJoinPending || this.groupCreating)) {
           // Sur réception group-error pendant groupCreating : finishGroupCall immédiatement
           this.finishGroupCall(data.reason || "Impossible de rejoindre l'appel");
+        } else if (
+          // AUTO-RÉPARATION salle d'attente : salle introuvable après un
+          // redémarrage serveur, présence obsolète, coupure pendant le join…
+          // On rejoue meeting-join : le serveur renvoie meeting-waiting, qui
+          // relance proprement le group-join (et l'échange WebRTC).
+          data.roomId && data.roomId === this.meetingWaitingRoomId
+          && this.meetingPendingCode
+          && typeof this.handleMeetingWaiting === "function"
+          && Date.now() - (this._waitingRejoinLastAttempt || 0) > 15000
+        ) {
+          this._waitingRejoinLastAttempt = Date.now();
+          console.log("📅 [MEETING] Salle d'attente perdue — rejoue meeting-join :", this.meetingPendingCode);
+          this.sendSignal({ type: "meeting-join", code: this.meetingPendingCode });
         } else {
           this.showCallToast(data.reason || "Erreur d'appel de groupe");
         }
@@ -7889,22 +7888,53 @@ showLocalStorageOnScreen = () => {
         }
       });
 
-      // 4) IMPORTANT : Si on est participant existant et un nouveau arrive,
-      //    on doit renégocier pour lui envoyer nos pistes vidéo actuelles
-      //    (pour qu'il puisse voir les caméras déjà actives ET le partage d'écran)
+      // 3bis) Filet de sécurité : si un participant JOINED du roster n'a
+      //    toujours aucune connexion avec nous après un délai, créer l'offre
+      //    quand même (délai désynchronisé pour éviter le conflit d'offres
+      //    simultanées). Couvre le cas des offres initiales perdues : ex. le
+      //    serveur a fait basculer les invités en salle live avant que le
+      //    client de l'hôte n'ait reçu son meeting-joined (groupRoomId pas
+      //    encore fixé -> signaux jetés, hôte jamais connecté).
+      joinedOthers.forEach((id) => {
+        if (this.groupPeers.has(id)) return;
+        const previous = this._groupPeerWatchdogs.get(id);
+        if (previous) clearTimeout(previous);
+        const delayMs = 6000 + Math.floor(Math.random() * 5000); // 6-11 s
+        const timer = setTimeout(() => {
+          this._groupPeerWatchdogs.delete(id);
+          const rosterNow = (this.groupRoster || []).find((r) => r.userId === id);
+          if (!rosterNow || rosterNow.state !== "JOINED") return;
+          if (this.groupPeers.has(id)) return;
+          if (!this.groupLocalStream) return;
+          console.log(`🛡️ [GROUPE] Filet de sécurité : offre de secours vers ${id}`);
+          try {
+            this.createGroupPeer(id);
+            this.sendGroupOffer(id).catch((err) => {
+              console.warn(`⚠️ [GROUPE] Offre de secours échouée vers ${id}:`, err);
+            });
+          } catch (err) {
+            console.warn(`⚠️ [GROUPE] Filet de sécurité erreur ${id}:`, err);
+          }
+        }, delayMs);
+        this._groupPeerWatchdogs.set(id, timer);
+      });
+
+      // 4) NOTE IMPORTANTE : PAS de renégociation pour les nouveaux
+      //    participants. L'ancien code relançait renegotiateWithPeer()
+      //    ~100 ms après la création d'un pair TOUT NEUF : à 100 ms l'offre
+      //    initiale n'avait pas encore reçue de réponse (have-local-offer),
+      //    la 2e offre écrasait la 1re et la réponse arrivant pour l'offre 1
+      //    était rejetée (SDP incohérent) -> paire WebRTC morte. Symptôme
+      //    historique : un nouvel arrivant (ou un invité revenu) connecté
+      //    uniquement avec certains participants (ex. l'hôte) et pas les
+      //    autres. L'offre initiale contient d'ores et déjà TOUTES les pistes
+      //    actives (createGroupPeer ajoute screen/cam/mic avant l'offre), et
+      //    l'activation ultérieure de caméra/partage passe par la
+      //    renégociation dédiée du toggle correspondant. Seuls les pairs déjà
+      //    CONNECTÉS à qui une piste a été ajoutée entre-temps doivent être
+      //    renégociés (géré par toggleGroupCamera/partage d'écran).
       if (newParticipants.length > 0 && existingPeersBefore.length > 0) {
-        console.log(`📹 [GROUPE] Nouveaux participants: ${newParticipants.join(", ")} - envoi des pistes vidéo actuelles`);
-        // Pour chaque nouveau participant, renégocier pour envoyer nos pistes (asynchrone)
-        newParticipants.forEach((newId) => {
-          // Attendre un peu que la connexion soit créée avant de renégocier
-          setTimeout(() => {
-            if (this.groupPeers.has(newId)) {
-              this.renegotiateWithPeer(newId).catch(err => {
-                console.warn(`⚠️ [GROUPE] Erreur renégociation avec ${newId}:`, err);
-              });
-            }
-          }, 100);
-        });
+        console.log(`📹 [GROUPE] Nouveaux participants: ${newParticipants.join(", ")} - envoi de l'état actuel (pas de renégociation, l'offre initiale porte déjà les pistes)`);
 
         // 5) Envoi de l'état actuel (micro, caméra, partage d'écran) aux nouveaux participants
         //    pour qu'ils soient synchronisés immédiatement
@@ -8116,6 +8146,26 @@ showLocalStorageOnScreen = () => {
       console.log(`🔄 [GROUPE] Début renégociation avec ${peerId}...`);
       console.log(`🔄 [GROUPE] État signaling avant: ${peer.pc.signalingState}`);
 
+      // GARDE ANTI-ÉCRASEMENT : si une offre est déjà en attente de réponse
+      // (offre initiale ou renégociation précédente), attendre qu'elle se
+      // termine avant d'en créer une nouvelle — sinon la 2e offre écrase la
+      // 1re dans setLocalDescription et la réponse (pour l'offre 1) est
+      // rejetée, laissant une paire morte (symptôme : connecté seulement à
+      // certains participants).
+      let waited = 0;
+      while (peer.pc.signalingState === "have-local-offer" && waited < 5000) {
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        waited += 200;
+        if (this.groupPeers.get(peerId) !== peer) {
+          console.warn(`⚠️ [GROUPE] renegotiateWithPeer - pair ${peerId} remplacé pendant l'attente, abandon`);
+          return;
+        }
+      }
+      if (peer.pc.signalingState === "have-local-offer") {
+        console.warn(`⚠️ [GROUPE] renegotiateWithPeer - offre déjà en attente pour ${peerId} après 5s, renégociation abandonnée`);
+        return;
+      }
+
       // Créer une nouvelle offre avec la nouvelle piste vidéo
       const offer = await peer.pc.createOffer({
         offerToReceiveAudio: true,
@@ -8210,7 +8260,18 @@ showLocalStorageOnScreen = () => {
   handleGroupOffer = async (from, sdp) => {
     if (!this.groupLocalStream) return; // pas encore prêt
 
-    const existingPeer = this.groupPeers.get(from);
+    let existingPeer = this.groupPeers.get(from);
+
+    // Conflit d'offres (glare) : nos deux clients ont créé une offre en même
+    // temps (ex. filet de sécurité + offre initiale retardée) et l'autre
+    // côté n'a jamais répondu. On repart d'une connexion neuve plutôt que de
+    // laisser setRemoteDescription échouer en "have-local-offer".
+    if (existingPeer && existingPeer.pc.signalingState === "have-local-offer" && !existingPeer.remoteSet) {
+      console.warn(`⚠️ [GROUPE] Offres simultanées avec ${from} — reprise sur connexion neuve`);
+      this.closeGroupPeer(from);
+      existingPeer = null;
+    }
+
 
     // Détecter si l'offre contient de la vidéo (m=video dans le SDP)
     const offerHasVideo = sdp.sdp && sdp.sdp.includes('m=video');
@@ -8220,31 +8281,8 @@ showLocalStorageOnScreen = () => {
     // Si l'appel a démarré en audio, il doit rester en audio
     // L'utilisateur peut activer la vidéo manuellement via le bouton caméra
 
-    // Si une ancienne connexion existe pour ce pair (ex: reconnexion rapide après départ),
-    // vérifier si c'est une nouvelle session SDP ou une connexion morte, et la remplacer proprement.
-    if (existingPeer) {
-      const connState = this.isIOS()
-        ? existingPeer.pc.iceConnectionState
-        : (existingPeer.pc.connectionState || existingPeer.pc.iceConnectionState);
-      const isDeadPeer = ["closed", "failed", "disconnected"].includes(connState);
-      const getSdpSessionId = (sdpStr) => {
-        const m = typeof sdpStr === "string" ? sdpStr.match(/^o=\S+\s+(\S+)/m) : null;
-        return m ? m[1] : null;
-      };
-      const prevSessionId = getSdpSessionId(existingPeer.pc.remoteDescription?.sdp);
-      const nextSessionId = getSdpSessionId(sdp?.sdp);
-      const isNewPeerSession = !!(prevSessionId && nextSessionId && prevSessionId !== nextSessionId);
-
-      if (isDeadPeer || isNewPeerSession) {
-        console.log(`🔄 [GROUPE] Remplacement de l'ancien pair ${from} (state=${connState}, newSession=${isNewPeerSession})`);
-        this.closeGroupPeer(from);
-      }
-    }
-
-    const activePeer = this.groupPeers.get(from);
-
     // Si pas de connexion existante : nouvelle connexion
-    if (!activePeer) {
+    if (!existingPeer) {
       console.log(`🔗 [GROUPE] Nouvelle connexion avec ${from}`);
       // Création synchrone : les candidats ICE qui suivent seront mis en file d'attente.
       const peer = this.createGroupPeer(from);
@@ -8274,20 +8312,20 @@ showLocalStorageOnScreen = () => {
     // Renégociation : connexion existe déjà (ajout de piste vidéo par exemple)
     console.log(`🔄 [GROUPE] Renégociation reçue de ${from}`);
     try {
-      await activePeer.pc.setRemoteDescription(new RTCSessionDescription(sdp));
-      activePeer.remoteSet = true;
-      await this.flushGroupCandidates(activePeer);
+      await existingPeer.pc.setRemoteDescription(new RTCSessionDescription(sdp));
+      existingPeer.remoteSet = true;
+      await this.flushGroupCandidates(existingPeer);
 
-      const answer = await activePeer.pc.createAnswer({
+      const answer = await existingPeer.pc.createAnswer({
         offerToReceiveAudio: true,
         offerToReceiveVideo: true, // TOUJOURS accepter vidéo
       });
-      await activePeer.pc.setLocalDescription(answer);
+      await existingPeer.pc.setLocalDescription(answer);
       this.sendGroupSignal(from, {
         kind: "answer",
         sdp: { type: answer.type, sdp: answer.sdp },
       });
-      this.capGroupVideoBitrate(activePeer.pc);
+      this.capGroupVideoBitrate(existingPeer.pc);
 
       console.log(`✅ [GROUPE] Renégociation réussie avec ${from}`);
     } catch (error) {
@@ -8415,35 +8453,29 @@ showLocalStorageOnScreen = () => {
       peer.stream = event.streams[0];
       console.log(`✅ [GROUPE] Stream attaché pour ${peerId} - audio: ${peer.stream.getAudioTracks().length}, video: ${peer.stream.getVideoTracks().length}`);
     } else {
-      const existingTracks = peer.stream
-        ? peer.stream.getTracks().filter((t) => t.id !== event.track.id && t.readyState !== "ended")
-        : [];
-      peer.stream = new MediaStream([...existingTracks, event.track]);
-      console.log(`✅ [GROUPE] Track ajouté au stream pour ${peerId}`);
+      if (!peer.stream) peer.stream = new MediaStream();
+      peer.stream.addTrack(event.track);
+      console.log(`✅ [GROUPE] Track ajouté au stream existant pour ${peerId}`);
     }
 
     // Le son passe par un <audio> dédié ; l'image par le <video> (muet) de la tuile.
     if (event.track.kind === "audio") this.attachGroupAudio(peerId, peer);
     this.updateGroupTile(peerId);
-
-    // Force la réassignation/lecture sur la balise <video> si le track vidéo vient d'arriver
-    if (event.track.kind === "video") {
-      const tile = this.groupTiles.get(peerId);
-      const video = tile ? tile.querySelector("video") : null;
-      if (video && peer.stream) {
-        video.muted = true;
-        if (video.srcObject !== peer.stream) {
-          video.srcObject = peer.stream;
-        }
-        video.play().catch(() => {});
-      }
-    }
   };
 
   // Branche le son d'un participant sur un élément <audio> caché.
   attachGroupAudio = (peerId, peer) => {
-    const container = document.getElementById("group-audio-container");
-    if (!container || !peer.stream) return;
+    // Le conteneur existe dans l'écran d'appel de groupe, mais PAS dans la
+    // salle d'attente des réunions : le créer à la volée pour que les
+    // participants en attente s'entendent aussi (et pas seulement se voient).
+    let container = document.getElementById("group-audio-container");
+    if (!container) {
+      container = document.createElement("div");
+      container.id = "group-audio-container";
+      container.style.display = "none";
+      document.body.appendChild(container);
+    }
+    if (!peer.stream) return;
 
     if (!peer.audioEl) {
       peer.audioEl = document.createElement("audio");
@@ -8472,6 +8504,12 @@ showLocalStorageOnScreen = () => {
 
     if (peer.connState === "connected") {
       this.groupRetryCount.set(peerId, 0);
+      // Offre de secours plus nécessaire : la connexion est établie.
+      const watchdogTimer = this._groupPeerWatchdogs.get(peerId);
+      if (watchdogTimer) {
+        clearTimeout(watchdogTimer);
+        this._groupPeerWatchdogs.delete(peerId);
+      }
       // On annonce notre état micro/caméra/partage au nouveau venu (sinon il affiche
       // notre écran partagé comme une simple tuile caméra, voire masquée si camOff).
       this.sendGroupSignal(peerId, {
@@ -8531,6 +8569,11 @@ showLocalStorageOnScreen = () => {
     const peer = this.groupPeers.get(peerId);
     if (!peer) return;
     this.groupPeers.delete(peerId);
+    const watchdogTimer = this._groupPeerWatchdogs?.get(peerId);
+    if (watchdogTimer) {
+      clearTimeout(watchdogTimer);
+      this._groupPeerWatchdogs.delete(peerId);
+    }
 
     peer.pc.onicecandidate = null;
     peer.pc.ontrack = null;
@@ -8540,23 +8583,12 @@ showLocalStorageOnScreen = () => {
       peer.pc.close();
     } catch (e) {}
 
-    peer.pendingCandidates = [];
-    peer.remoteSet = false;
-    peer.stream = null;
-
-    const tile = this.groupTiles.get(peerId);
-    if (tile) {
-      const v = tile.querySelector("video");
-      if (v) v.srcObject = null;
-    }
-
     if (peer.audioEl) {
       try {
         peer.audioEl.pause();
       } catch (e) {}
       peer.audioEl.srcObject = null;
       peer.audioEl.remove();
-      peer.audioEl = null;
     }
     this.groupAnalysers.delete(peerId);
     // NE PAS appeler updateGroupTile ici : la tuile sera supprimée par renderGroupGrid()
@@ -8566,6 +8598,11 @@ showLocalStorageOnScreen = () => {
   // Ferme toutes les connexions (fin d'appel ou reconnexion).
   closeAllGroupPeers = () => {
     Array.from(this.groupPeers.keys()).forEach((id) => this.closeGroupPeer(id));
+    // Annuler les filets de sécurité restants (pairs jamais créés)
+    this._groupPeerWatchdogs.forEach((timer) => {
+      try { clearTimeout(timer); } catch (e) {}
+    });
+    this._groupPeerWatchdogs.clear();
   };
 
   /* =========================================================
@@ -8627,6 +8664,7 @@ showLocalStorageOnScreen = () => {
   // (Re)construit la grille : crée les tuiles manquantes, retire les obsolètes,
   // garde les <video> existantes pour ne pas couper un flux qui joue.
   renderGroupGrid = () => {
+    if (this.activeMediaEngine === "livekit") return;
     // En réunion planifiée, la grille visible est #meeting-video-grid (UI Google Meet).
     // En salle d'attente de réunion, la grille dédiée est #meeting-waiting-grid
     // (ID unique : évite la collision historique avec #meeting-video-grid).
@@ -8677,7 +8715,11 @@ showLocalStorageOnScreen = () => {
     // Appliquer la classe de layout selon le partage d'écran / nombre de participants
     const count = Math.max(1, Math.min(ids.length, 6));
     if (this.groupIsMeeting) {
-      grid.className = `video-grid count-${count}` + (screenSharerId && ids.length > 1 ? " screen-share-mode" : "");
+      // Ne pas écraser la classe dédiée de la grille d'attente (styles salle d'attente).
+      const baseClass = grid.id === "meeting-waiting-grid"
+        ? "video-grid waiting-room-grid"
+        : "video-grid";
+      grid.className = `${baseClass} count-${count}` + (screenSharerId && ids.length > 1 ? " screen-share-mode" : "");
     } else if (screenSharerId && ids.length > 1) {
       grid.className = `group-grid count-${count} screen-share-mode`;
     } else {
@@ -8752,7 +8794,7 @@ showLocalStorageOnScreen = () => {
     const micMuted = isSelf ? this.groupIsMuted : !!remoteState.micMuted;
     const camOff = isSelf ? this.groupIsCamOff : !!remoteState.camOff;
     const screenSharing = isSelf ? this.isScreenSharing : !!remoteState.screenSharing;
-    const hasVideoTrack = !!stream && stream.getVideoTracks().some((t) => t.readyState !== "ended");
+    const hasVideoTrack = !!stream && stream.getVideoTracks().length > 0;
     // Afficher la vidéo si : JOINED + piste vidéo présente + caméra non coupée
     // Indépendamment de groupIsVideo (pour permettre réception vidéo même si appel démarré en audio)
     // Un participant qui partage son écran est toujours affiché (même caméra coupée) : sa piste porte l'écran.
@@ -9111,22 +9153,9 @@ showLocalStorageOnScreen = () => {
     this.closeAllGroupPeers();
 
     if (this.groupLocalStream) {
-      this.groupLocalStream.getTracks().forEach((t) => {
-        try { t.stop(); } catch (e) {}
-      });
+      this.groupLocalStream.getTracks().forEach((t) => t.stop());
       this.groupLocalStream = null;
     }
-    if (this.localStream) {
-      this.localStream.getTracks().forEach((t) => {
-        try { t.stop(); } catch (e) {}
-      });
-      this.localStream = null;
-    }
-    if (this._groupScreenTrack) {
-      try { this._groupScreenTrack.stop(); } catch (e) {}
-      this._groupScreenTrack = null;
-    }
-    this.isScreenSharing = false;
 
     // Grille et tuiles
     this.groupTiles.forEach((tile) => {
@@ -9164,7 +9193,6 @@ showLocalStorageOnScreen = () => {
     this.groupEverHadPeer = false;
     this.groupIsMeeting = false;
     this.groupAcceptInProgress = false;
-    this.groupIsLeaving = false;
     this._groupSwitching = false;
     this.stopVibration();
   };
@@ -9361,11 +9389,8 @@ showLocalStorageOnScreen = () => {
    (compatibilité avec les attributs onclick="..." du HTML)
 ========================================================= */
 
-if (!window.__callManagerInitialized) {
-  window.__callManagerInitialized = true;
-
-  const callManager = new CallManager();
-  window.callManager = callManager;
+const callManager = new CallManager();
+window.callManager = callManager;
 
 window.makeCall = callManager.makeCall;
 window.acceptCall = callManager.acceptCall;
@@ -9447,4 +9472,3 @@ window.disconnectWebSocket = () => {
   callManager.wsReadyState = WebSocket.CLOSED;
   callManager.updateStatus("Hors ligne");
 };
-}
